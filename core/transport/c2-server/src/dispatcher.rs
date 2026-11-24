@@ -522,6 +522,8 @@ pub(crate) struct CrmRoute {
     pub(crate) method_modes: Vec<CallMode>,
     /// Method names indexed by method_idx
     pub(crate) method_names: Vec<String>,
+    /// Access declarations indexed by method, independent of scheduling mode.
+    pub(crate) method_access: Vec<AccessLevel>,
     /// Registration-scoped publish/subscribe topic channels, when declared.
     pub(crate) topics: Option<Arc<crate::topic::RouteTopics>>,
 }
@@ -532,6 +534,12 @@ impl CrmRoute {
         scheduler: Scheduler,
         callback: Arc<dyn CrmCallback>,
     ) -> Self {
+        let mut method_access = vec![AccessLevel::Write; spec.method_names.len()];
+        for (index, access) in spec.access_map {
+            if let Some(declaration) = method_access.get_mut(usize::from(index)) {
+                *declaration = access;
+            }
+        }
         Self {
             name: spec.name,
             route_uid: uuid::Uuid::new_v4().simple().to_string(),
@@ -545,6 +553,7 @@ impl CrmRoute {
             stream_callback: None,
             method_modes: vec![CallMode::Unary; spec.method_names.len()],
             method_names: spec.method_names,
+            method_access,
             topics: None,
         }
     }
@@ -601,6 +610,10 @@ impl CrmRoute {
 
     pub(crate) fn method_names(&self) -> &[String] {
         &self.method_names
+    }
+
+    pub(crate) fn method_access(&self, method_idx: u16) -> Option<AccessLevel> {
+        self.method_access.get(usize::from(method_idx)).copied()
     }
 
     pub(crate) fn scheduler_snapshot(&self) -> SchedulerSnapshot {
@@ -719,8 +732,33 @@ mod tests {
             stream_callback: None,
             method_modes: vec![CallMode::Unary; 2],
             method_names: vec!["method_a".into(), "method_b".into()],
+            method_access: vec![AccessLevel::Write; 2],
             topics: None,
         }
+    }
+
+    #[test]
+    fn declared_method_access_is_independent_of_scheduler_mode() {
+        let fixture = make_route("grid");
+        let route = CrmRoute::new(
+            RouteBuildSpec {
+                name: fixture.name,
+                crm_ns: fixture.crm_ns,
+                crm_name: fixture.crm_name,
+                crm_ver: fixture.crm_ver,
+                abi_hash: fixture.abi_hash,
+                signature_hash: fixture.signature_hash,
+                method_names: fixture.method_names,
+                access_map: HashMap::from([(0, AccessLevel::Read)]),
+                concurrency_mode: ConcurrencyMode::Exclusive,
+                limits: SchedulerLimits::default(),
+            },
+            Scheduler::new(ConcurrencyMode::Exclusive, HashMap::new()),
+            fixture.callback,
+        );
+        assert_eq!(route.method_access(0), Some(AccessLevel::Read));
+        assert_eq!(route.method_access(1), Some(AccessLevel::Write));
+        assert_eq!(route.method_access(2), None);
     }
 
     static REQUEST_POOL_SEQ: AtomicU64 = AtomicU64::new(0);

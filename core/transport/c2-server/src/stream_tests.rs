@@ -576,6 +576,7 @@ impl Harness {
                     &self.identity,
                     1,
                     CallMode::ServerStream,
+                    &c2_config::CallMetadata::empty(),
                     ValuePart::whole(ValueStorage::Inline(input)),
                 )
                 .unwrap(),
@@ -692,6 +693,7 @@ async fn stream_items_require_storage_credit_and_terminal_counts_complete_items(
                 &harness.identity,
                 0,
                 CallMode::Unary,
+                &c2_config::CallMetadata::empty(),
                 ValuePart::whole(ValueStorage::Inline(&[])),
             )
             .unwrap(),
@@ -745,6 +747,7 @@ async fn paused_stream_keeps_call_slot_but_releases_worker_for_unary() {
                 &harness.identity,
                 0,
                 CallMode::Unary,
+                &c2_config::CallMetadata::empty(),
                 ValuePart::whole(ValueStorage::Inline(&[])),
             )
             .unwrap(),
@@ -814,6 +817,7 @@ async fn unregister_cancels_published_stream_waiting_for_its_first_route_permit(
                 &harness.identity,
                 0,
                 CallMode::Unary,
+                &c2_config::CallMetadata::empty(),
                 ValuePart::whole(ValueStorage::Inline(&[])),
             )
             .unwrap(),
@@ -922,6 +926,7 @@ async fn host_close_rejects_stream_queued_before_first_resource_entry() {
                 &harness.identity,
                 0,
                 CallMode::Unary,
+                &c2_config::CallMetadata::empty(),
                 ValuePart::whole(ValueStorage::Inline(&[])),
             )
             .unwrap(),
@@ -989,6 +994,7 @@ async fn cancellation_before_resource_entry_is_not_executed() {
                 &harness.identity,
                 0,
                 CallMode::Unary,
+                &c2_config::CallMetadata::empty(),
                 ValuePart::whole(ValueStorage::Inline(&[])),
             )
             .unwrap(),
@@ -1028,6 +1034,7 @@ async fn cancellation_during_incomplete_input_refuses_without_waiting_for_contin
         &harness.identity,
         1,
         CallMode::ServerStream,
+        &c2_config::CallMetadata::empty(),
         ValuePart::first(2, ValueStorage::Inline(&[1])),
     )
     .unwrap();
@@ -1058,6 +1065,7 @@ async fn cancellation_during_incomplete_input_refuses_without_waiting_for_contin
                 &harness.identity,
                 0,
                 CallMode::Unary,
+                &c2_config::CallMetadata::empty(),
                 ValuePart::whole(ValueStorage::Inline(&[])),
             )
             .unwrap(),
@@ -1083,6 +1091,7 @@ async fn chunked_open_uses_original_stream_admission() {
                 &harness.identity,
                 1,
                 CallMode::ServerStream,
+                &c2_config::CallMetadata::empty(),
                 ValuePart::first(2, ValueStorage::Inline(&[1])),
             )
             .unwrap(),
@@ -1459,8 +1468,15 @@ async fn mismatched_open_mode_is_not_executed_and_preserves_connection() {
         harness
             .peer
             .write_all(
-                &rpc::encode_open_frame(1, &harness.identity, method_idx, call_mode, value)
-                    .unwrap(),
+                &rpc::encode_open_frame(
+                    1,
+                    &harness.identity,
+                    method_idx,
+                    call_mode,
+                    &c2_config::CallMetadata::empty(),
+                    value,
+                )
+                .unwrap(),
             )
             .await
             .unwrap();
@@ -1549,6 +1565,7 @@ async fn mismatched_open_mode_is_not_executed_and_preserves_connection() {
                     &harness.identity,
                     0,
                     CallMode::Unary,
+                    &c2_config::CallMetadata::empty(),
                     ValuePart::whole(ValueStorage::Inline(&[])),
                 )
                 .unwrap(),
@@ -1582,6 +1599,7 @@ async fn unknown_open_mode_and_cancel_cause_deactivate_but_preserve_dispatched_c
                     &harness.identity,
                     0,
                     CallMode::Unary,
+                    &c2_config::CallMetadata::empty(),
                     ValuePart::whole(ValueStorage::Inline(&[])),
                 )
                 .unwrap(),
@@ -1598,10 +1616,11 @@ async fn unknown_open_mode_and_cancel_cause_deactivate_but_preserve_dispatched_c
                 &harness.identity,
                 0,
                 CallMode::Unary,
+                &c2_config::CallMetadata::empty(),
                 ValuePart::whole(ValueStorage::Inline(&[])),
             )
             .unwrap();
-            let mode_offset = frame.len() - 3;
+            let mode_offset = frame.len() - 4;
             // IPC 18 made mode byte 3 a valid `KeyedUnary`; 7 stays unknown.
             frame[mode_offset] = 7;
             frame
@@ -1748,6 +1767,7 @@ fn resource_and_encoding_slots_do_not_starve_chunk_copy_or_stream_cleanup() {
                     &harness.identity,
                     0,
                     CallMode::Unary,
+                    &c2_config::CallMetadata::empty(),
                     ValuePart::whole(ValueStorage::Inline(b"busy")),
                 )
                 .unwrap(),
@@ -1766,6 +1786,7 @@ fn resource_and_encoding_slots_do_not_starve_chunk_copy_or_stream_cleanup() {
                     &harness.identity,
                     0,
                     CallMode::Unary,
+                    &c2_config::CallMetadata::empty(),
                     ValuePart::first(4, ValueStorage::Inline(b"x")),
                 )
                 .unwrap(),

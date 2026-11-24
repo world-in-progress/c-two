@@ -109,10 +109,18 @@ fn encoding_waits(shm: bool, shutdown: ShutdownPoint) {
         route_uid: route.route.route_uid.clone(),
         cancellation: None,
         topic_channel: None,
+        topic_route: None,
         sync_reply_failed: false,
     });
     assert!(call.queue());
     let admission = ChunkRouteAdmission {
+        context: Some(rpc_call_context(
+            &route.route,
+            1,
+            None,
+            CallMetadata::empty(),
+            None,
+        )),
         route: route.route,
         method_idx: 1,
         pending_permit: Some(route.pending_permit),

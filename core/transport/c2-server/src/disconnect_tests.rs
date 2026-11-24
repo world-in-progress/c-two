@@ -406,6 +406,7 @@ async fn handshake_flush_before_following_frame(fail_flush: usize, disconnect: b
             &identity,
             0,
             c2_wire::rpc::CallMode::Unary,
+            &c2_config::CallMetadata::empty(),
             ValuePart::whole(ValueStorage::Inline(&[])),
         )
         .unwrap()

@@ -1,7 +1,7 @@
-//! Per-subscriber IPC 17 topic driver.
+//! Per-subscriber IPC 18 topic driver.
 //!
 //! One async task owns one remote subscription without holding route
-//! concurrency permits or execution worker threads. It sends `READY(start_seq)`
+//! concurrency permits or execution worker threads. It sends `READY(start_seq, head_seq)`
 //! immediately after attach, gates each new frame on both item demand (`CREDIT`)
 //! and settlement of its prior SHM loan (at most one published SHM loan per
 //! subscriber), delivers SHM frames via 1-to-N `SharedShmLoan` or falls back to
@@ -322,7 +322,7 @@ pub(super) async fn drive_subscription(
     _flight: crate::connection::FlightGuard,
     budget: DomainBudget,
 ) {
-    let ready = match rpc::encode_ready_frame(id, attach.start_seq) {
+    let ready = match rpc::encode_ready_frame(id, attach.start_seq, attach.head_seq) {
         Ok(frame) => frame,
         Err(error) => {
             warn!(request_id=id, %error, "invalid READY frame");

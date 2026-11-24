@@ -27,12 +27,14 @@ pub(crate) struct PoolDerivation {
     pub(crate) copy_permits: usize,
     /// Stream item encoding concurrency gate `E = clamp(P, 4, 64)`.
     pub(crate) encoding_permits: usize,
-    /// Blocking pool size `T = max(512, W + C + E + 16)`.
+    /// Host admission hook concurrency gate `A = clamp(P, 4, 64)`.
+    pub(crate) admission_permits: usize,
+    /// Blocking pool size `T = max(512, W + C + E + A + 16)`.
     pub(crate) max_blocking_threads: usize,
     pub(crate) async_worker_threads: usize,
 }
 
-/// Compute host-derived copy and encoding limits with the Tokio thread cap.
+/// Compute host-derived copy, encoding, and admission limits with the Tokio thread cap.
 pub(crate) fn derive_blocking_pool(
     config: &ServerIpcConfig,
 ) -> Result<PoolDerivation, std::io::Error> {
@@ -61,9 +63,7 @@ fn derive_for_host(parallelism: usize, workers: usize) -> Result<PoolDerivation,
     let gated = parallelism.clamp(4, 64);
     let async_worker_threads = 2;
     let max_blocking_threads = workers
-        .checked_add(gated)
-        .and_then(|count| count.checked_add(gated))
-        .and_then(|count| count.checked_add(16))
+        .checked_add(3 * gated + 16)
         .ok_or_else(invalid_thread_count)?
         .max(512);
     max_blocking_threads
@@ -74,6 +74,7 @@ fn derive_for_host(parallelism: usize, workers: usize) -> Result<PoolDerivation,
         execution_workers: workers,
         copy_permits: gated,
         encoding_permits: gated,
+        admission_permits: gated,
         max_blocking_threads,
         async_worker_threads,
     })
@@ -92,7 +93,7 @@ impl ServerRuntimeBuilder {
             .worker_threads(derivation.async_worker_threads)
             .max_blocking_threads(derivation.max_blocking_threads)
             // The execution scheduler bounds resource callbacks. Encoding and
-            // carrier copies must also progress while those callbacks clean up;
+            // carrier copies and admission hooks have their own concurrency gates;
             // Tokio's blocking pool is not a second resource-execution gate.
             .enable_all()
             .build()
@@ -109,8 +110,8 @@ mod tests {
             (1usize, 1usize, 512),
             (4, 4, 512),
             (100, 8, 512),
-            (1000, 64, 1144),
-            (600, 3, 624),
+            (1000, 128, 1208),
+            (600, 3, 628),
         ] {
             let derivation = derive_for_host(parallelism, workers).unwrap();
             let gated = parallelism.clamp(4, 64);
@@ -118,9 +119,10 @@ mod tests {
             assert_eq!(derivation.execution_workers, workers);
             assert_eq!(derivation.copy_permits, gated);
             assert_eq!(derivation.encoding_permits, gated);
+            assert_eq!(derivation.admission_permits, gated);
             assert_eq!(
                 derivation.max_blocking_threads,
-                512.max(workers + gated * 2 + 16),
+                512.max(workers + gated * 3 + 16),
                 "T formula for W={workers} P={parallelism}"
             );
             assert_eq!(derivation.max_blocking_threads, expected_t);
@@ -130,7 +132,7 @@ mod tests {
 
     #[test]
     fn blocking_pool_overflow_is_rejected() {
-        for workers in [usize::MAX, usize::MAX - 32 - 1] {
+        for workers in [usize::MAX, usize::MAX - 40 - 1] {
             let error = derive_for_host(8, workers).unwrap_err();
             assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
             assert!(error.to_string().contains("overflows usize"));

@@ -1,6 +1,7 @@
 //! A physical peer end during an admitted SHM item copy preserves call order.
 
 use super::*;
+use crate::tests::EMPTY_METADATA;
 use crate::tests::memory_budget;
 use c2_wire::rpc::{RpcRecord, decode_rpc_record, encode_credit_frame, encode_item_begin_frame};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -71,6 +72,7 @@ async fn eof_during_whole_shm_copy_waits_for_item_and_loan_settlement() {
             Box::new(OperationOwner(owner_dropped.clone())),
             crate::IpcStreamCancellation::new(),
             &IpcCallControl::new(|| Ok(())),
+            &EMPTY_METADATA,
         )
         .await
         .unwrap();

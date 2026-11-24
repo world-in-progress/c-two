@@ -1,4 +1,5 @@
 use super::*;
+use crate::tests::EMPTY_METADATA;
 use c2_config::{CHUNK_SIZE, DomainLimits, LocalEndpointContext, SHM_THRESHOLD};
 use c2_local::LocalListener;
 use c2_mem::DomainBudget;
@@ -144,12 +145,16 @@ async fn expect_disconnect_eof(stream: &mut LocalStream, header: FrameHeader, pa
 }
 
 async fn accept(listener: &mut LocalListener) -> LocalStream {
+    accept_with_capabilities(listener, 0).await
+}
+
+async fn accept_with_capabilities(listener: &mut LocalListener, capabilities: u16) -> LocalStream {
     let mut stream = timeout(WAIT, listener.accept()).await.unwrap().unwrap();
     crate::tests::accept_version_preamble(&mut stream).await;
     let (_, payload) = read_frame(&mut stream).await;
     let hs = decode_handshake(&payload, false).unwrap();
     let payload = encode_server_handshake(
-        hs.capability_flags,
+        hs.capability_flags | capabilities,
         &[] as &[RouteInfo],
         "/p4peer",
         &ServerIdentity {
@@ -323,7 +328,8 @@ async fn response_does_not_release_a_request_loan_and_peer_end_does() {
                 &[7; 8193],
                 None,
                 DEFAULT_MAX_PAYLOAD_SIZE,
-                None
+                None,
+                &EMPTY_METADATA
             )
             .await
             .unwrap()
@@ -377,7 +383,7 @@ async fn high_request_bits_are_preserved_through_pending_and_delivery() {
             let client = client.clone();
             async move {
                 client
-                    .call_inline(&identity(), 0, b"pending")
+                    .call_inline(&identity(), 0, b"pending", &EMPTY_METADATA)
                     .await
                     .unwrap()
                     .into_owned_bytes()
@@ -416,7 +422,7 @@ async fn exhausted_request_ids_deactivate_without_reconnect_or_any_frame() {
         .sequence
         .store(u64::MAX, Ordering::Relaxed);
     let error = client
-        .call_inline(&identity(), 0, b"unpublished")
+        .call_inline(&identity(), 0, b"unpublished", &EMPTY_METADATA)
         .await
         .unwrap_err();
     assert_eq!(error.phase(), crate::TransportPhase::PreDispatch);
@@ -425,7 +431,7 @@ async fn exhausted_request_ids_deactivate_without_reconnect_or_any_frame() {
     );
     assert!(!client.is_connected());
     let error = client
-        .call_inline(&identity(), 0, b"again")
+        .call_inline(&identity(), 0, b"again", &EMPTY_METADATA)
         .await
         .unwrap_err();
     assert_eq!(error.phase(), crate::TransportPhase::PreDispatch);
@@ -459,7 +465,12 @@ async fn cancellation_before_writer_publication_releases_ordinary_and_stream_pre
         *conn.pause.lock() = Some((entered, resumed));
         let first = tokio::spawn({
             let client = client.clone();
-            async move { client.call_inline(&identity(), 0, b"first").await.unwrap() }
+            async move {
+                client
+                    .call_inline(&identity(), 0, b"first", &EMPTY_METADATA)
+                    .await
+                    .unwrap()
+            }
         });
         paused.await.unwrap();
         let pool = client.request_pool().unwrap();
@@ -479,6 +490,7 @@ async fn cancellation_before_writer_publication_releases_ordinary_and_stream_pre
                 8193,
                 DEFAULT_MAX_PAYLOAD_SIZE,
                 futures_util::stream::iter([Ok::<_, std::io::Error>(vec![3; 8193])]),
+                &EMPTY_METADATA,
             ));
             assert!(futures_util::poll!(call.as_mut()).is_pending());
             assert_eq!(pool.read().stats().alloc_count, 1);
@@ -492,6 +504,7 @@ async fn cancellation_before_writer_publication_releases_ordinary_and_stream_pre
                 None,
                 DEFAULT_MAX_PAYLOAD_SIZE,
                 None,
+                &EMPTY_METADATA,
             ));
             assert!(futures_util::poll!(call.as_mut()).is_pending());
             assert_eq!(pool.read().stats().alloc_count, 1);
@@ -630,7 +643,12 @@ async fn real_server_releases_request_before_slow_callback() {
     let call = tokio::spawn({
         let client = client.clone();
         let request = request.clone();
-        async move { client.call_bound(&binding, "echo", &request).await.unwrap() }
+        async move {
+            client
+                .call_bound(&binding, "echo", &request, &EMPTY_METADATA)
+                .await
+                .unwrap()
+        }
     });
     timeout(WAIT, ready).await.unwrap().unwrap();
     let released = timeout(WAIT, async {
@@ -658,7 +676,10 @@ async fn real_response_is_released_before_local_copy_is_held_and_close() {
     client.connect().await.unwrap();
     let binding = client.acquire_route(&contract()).await.unwrap();
     let payload = vec![5; SHM_THRESHOLD as usize + 1];
-    let response = client.call_bound(&binding, "echo", &payload).await.unwrap();
+    let response = client
+        .call_bound(&binding, "echo", &payload, &EMPTY_METADATA)
+        .await
+        .unwrap();
     assert!(
         matches!(response, ResponseData::Inline(_)),
         "no transport lease escapes a call"
@@ -685,7 +706,7 @@ async fn real_chunk_fallback_returns_reassembly_budget_before_delivery() {
     let data = vec![9; CHUNK_SIZE as usize + 1];
     assert_eq!(
         client
-            .call_bound(&binding, "echo", &data)
+            .call_bound(&binding, "echo", &data, &EMPTY_METADATA)
             .await
             .unwrap()
             .into_owned_bytes()
@@ -749,6 +770,7 @@ async fn cancelling_a_started_shm_write_keeps_the_driver_and_never_replays() {
                     None,
                     DEFAULT_MAX_PAYLOAD_SIZE,
                     None,
+                    &EMPTY_METADATA,
                 )
                 .await
         }
@@ -810,12 +832,15 @@ async fn r13_prepared_reply_drop_before_publication_releases_buddy_and_dedicated
     client.connect().await.unwrap();
     let binding = client.acquire_route(&contract()).await.unwrap();
     assert_eq!(
-        timeout(WAIT, client.call_bound(&binding, "echo", &[]))
-            .await
-            .expect("prepared reply must complete")
-            .unwrap()
-            .into_owned_bytes()
-            .unwrap(),
+        timeout(
+            WAIT,
+            client.call_bound(&binding, "echo", &[], &EMPTY_METADATA)
+        )
+        .await
+        .expect("prepared reply must complete")
+        .unwrap()
+        .into_owned_bytes()
+        .unwrap(),
         [1]
     );
     assert!(client.close_shared_bounded(WAIT).await);
@@ -1019,7 +1044,7 @@ async fn client_rejects_request_over_route_payload_limit_before_transport() {
         .expect("cached test route should bind");
 
     let err = client
-        .call_bound(&binding, "ping", b"12345")
+        .call_bound(&binding, "ping", b"12345", &EMPTY_METADATA)
         .await
         .expect_err("oversized bound call should be rejected before writer access");
     assert!(
@@ -1034,7 +1059,7 @@ async fn client_rejects_request_over_route_payload_limit_before_transport() {
         Ok::<&'static [u8], std::io::Error>(b"12345")
     });
     let err = client
-        .call_bound_sized_stream(&binding, "ping", 5, stream)
+        .call_bound_sized_stream(&binding, "ping", 5, stream, &EMPTY_METADATA)
         .await
         .expect_err("oversized streaming call should be rejected before body polling");
     assert!(
@@ -1125,7 +1150,7 @@ async fn controlled_prepare_rejection_is_pure_and_preserves_canonical_error() {
             });
         // Empty inline preparation needs neither OS backing nor a writer.
         let error = client
-            .call_bound_controlled_phased(&binding, "ping", &[], &control)
+            .call_bound_controlled_phased(&binding, "ping", &[], &control, &EMPTY_METADATA)
             .await
             .unwrap_err();
         assert_eq!(error.phase(), crate::TransportPhase::PreDispatch);
@@ -1145,7 +1170,7 @@ async fn controlled_method_contract_and_payload_limits_precede_preparation() {
     let control = IpcCallControl::new(|| panic!("invalid request must never dispatch"))
         .with_before_prepare(|| panic!("invalid request must never prepare"));
     let error = client
-        .call_bound_controlled_phased(&binding, "missing", &[], &control)
+        .call_bound_controlled_phased(&binding, "missing", &[], &control, &EMPTY_METADATA)
         .await
         .unwrap_err();
     assert_eq!(error.phase(), crate::TransportPhase::PreDispatch);
@@ -1154,7 +1179,7 @@ async fn controlled_method_contract_and_payload_limits_precede_preparation() {
         IpcError::MethodNotFound { .. }
     ));
     let error = client
-        .call_bound_controlled_phased(&binding, "ping", &[1; 1025], &control)
+        .call_bound_controlled_phased(&binding, "ping", &[1; 1025], &control, &EMPTY_METADATA)
         .await
         .unwrap_err();
     assert_eq!(error.phase(), crate::TransportPhase::PreDispatch);
@@ -1206,7 +1231,11 @@ async fn started_inline_cancellation_finishes_the_original_frame_once() {
     let client = Arc::new(client);
     let caller = tokio::spawn({
         let client = client.clone();
-        async move { client.call_inline(&identity(), 0, b"one side effect").await }
+        async move {
+            client
+                .call_inline(&identity(), 0, b"one side effect", &EMPTY_METADATA)
+                .await
+        }
     });
     paused.await.unwrap();
     caller.abort();
@@ -1276,7 +1305,10 @@ async fn unnegotiated_shm_reply_is_rejected_before_mapping_or_loan_admission() {
     let mut client = endpoint.client();
     client.connect().await.unwrap();
     let peer_pool = client.server_pool.lock().as_ref().unwrap().clone();
-    let error = client.call_inline(&identity(), 0, b"x").await.unwrap_err();
+    let error = client
+        .call_inline(&identity(), 0, b"x", &EMPTY_METADATA)
+        .await
+        .unwrap_err();
     assert_eq!(error.phase(), crate::TransportPhase::DispatchUncertain);
     assert!(
         matches!(error.source_error(), IpcError::ResponseFailure(error) if error.to_string().contains("not negotiated"))
@@ -1350,6 +1382,7 @@ async fn cancelled_chunk_sender_finishes_its_stream_and_preserves_other_calls() 
                     3 * CHUNK_SIZE as usize,
                     DEFAULT_MAX_PAYLOAD_SIZE,
                     chunks,
+                    &EMPTY_METADATA,
                 )
                 .await
         }
@@ -1361,7 +1394,7 @@ async fn cancelled_chunk_sender_finishes_its_stream_and_preserves_other_calls() 
     assert!(client.is_connected());
     assert_eq!(
         client
-            .call_inline(&identity(), 0, b"other")
+            .call_inline(&identity(), 0, b"other", &EMPTY_METADATA)
             .await
             .unwrap()
             .into_owned_bytes()
@@ -1587,7 +1620,7 @@ async fn framed_response_faults_remain_uncertain_and_still_settle_release_record
         let conn = client.driver.read().clone().unwrap();
         let (loan, _pool, budget) = publish_file_loan(&conn, endpoint._root.path());
         let error = client
-            .call_inline(&identity(), 0, b"execute once")
+            .call_inline(&identity(), 0, b"execute once", &EMPTY_METADATA)
             .await
             .unwrap_err();
         assert_eq!(
@@ -1642,7 +1675,11 @@ async fn materialization_failure_is_uncertain_and_refunds_local_backing_once() {
     let client = Arc::new(client);
     let other = tokio::spawn({
         let client = client.clone();
-        async move { client.call_inline(&identity(), 0, b"other").await }
+        async move {
+            client
+                .call_inline(&identity(), 0, b"other", &EMPTY_METADATA)
+                .await
+        }
     });
     request_sent.await.unwrap();
     let budget = crate::tests::memory_budget(1024);
@@ -1715,7 +1752,11 @@ async fn abandoned_waiter_keeps_partial_reply_storage_until_peer_end() {
     let client = Arc::new(client);
     let caller = tokio::spawn({
         let client = client.clone();
-        async move { client.call_inline(&identity(), 0, b"partial").await }
+        async move {
+            client
+                .call_inline(&identity(), 0, b"partial", &EMPTY_METADATA)
+                .await
+        }
     });
     eventually(|| client.domain_snapshot().file_spill.used_bytes > 0).await;
     assert_eq!(client.domain_snapshot().memory.used_bytes, 2);
@@ -1766,7 +1807,7 @@ async fn inline_unary_has_one_rpc_record_in_each_direction() {
     let mut client = endpoint.client();
     client.connect().await.unwrap();
     let result = client
-        .call_inline(&identity(), 0, b"one input")
+        .call_inline(&identity(), 0, b"one input", &EMPTY_METADATA)
         .await
         .unwrap();
     assert_eq!(result.into_owned_bytes().unwrap(), vec![42]);
@@ -1824,10 +1865,13 @@ async fn frame_caps_are_checked_before_reading_the_payload() {
             );
         } else {
             assert!(
-                timeout(WAIT, client.call_inline(&identity(), 0, b"request"))
-                    .await
-                    .unwrap()
-                    .is_err()
+                timeout(
+                    WAIT,
+                    client.call_inline(&identity(), 0, b"request", &EMPTY_METADATA)
+                )
+                .await
+                .unwrap()
+                .is_err()
             );
         }
         let closed = observation.wait_closed(Some(WAIT)).await.unwrap();
@@ -1879,7 +1923,7 @@ async fn route_catalog_control_reply_can_exceed_the_business_frame_cap() {
     let binding = client.acquire_route(&expected).await.unwrap();
     let method = format!("method_255_{}", "a".repeat(100));
     let response = client
-        .call_bound(&binding, &method, b"healthy")
+        .call_bound(&binding, &method, b"healthy", &EMPTY_METADATA)
         .await
         .unwrap();
     assert_eq!(response.into_owned_bytes().unwrap(), b"healthy");
@@ -1917,8 +1961,8 @@ async fn oversized_business_error_preserves_concurrent_calls_on_the_connection()
     let binding = client.acquire_route(&contract()).await.unwrap();
     let (failed, healthy) = timeout(WAIT, async {
         tokio::join!(
-            client.call_bound(&binding, "echo", b"fail"),
-            client.call_bound(&binding, "echo", b"healthy")
+            client.call_bound(&binding, "echo", b"fail", &EMPTY_METADATA),
+            client.call_bound(&binding, "echo", b"healthy", &EMPTY_METADATA)
         )
     })
     .await
@@ -1967,6 +2011,7 @@ async fn discarding_subscription_during_open_or_after_ready_sends_consumer_cance
                 Box::new(budget.reserve_subscription_operation().unwrap()),
                 crate::IpcSubscribeCancellation::new(),
                 &control,
+                &EMPTY_METADATA,
             );
             tokio::pin!(opening);
             let (header, payload) = tokio::select! {
@@ -1979,7 +2024,7 @@ async fn discarding_subscription_during_open_or_after_ready_sends_consumer_cance
                 RpcRecord::OpenSubscribe { .. }
             ));
             if drop_after_ready {
-                peer.write_all(&rpc::encode_ready_frame(id, 1).unwrap())
+                peer.write_all(&rpc::encode_ready_frame(id, 1, 0).unwrap())
                     .await
                     .unwrap();
                 let sub = timeout(WAIT, opening).await.unwrap().unwrap();

@@ -1,5 +1,7 @@
 //! c2-ipc unit tests.
 
+pub(crate) static EMPTY_METADATA: c2_config::CallMetadata = c2_config::CallMetadata::empty();
+
 /// Common first exchange for manual peers that exercise ordinary IPC traffic.
 pub(crate) async fn accept_version_preamble(stream: &mut c2_local::LocalStream) {
     use c2_wire::handshake::{VersionPreambleKind, encode_version_preamble};
@@ -31,6 +33,7 @@ pub(crate) async fn close_listener(listener: c2_local::LocalListener) {
 
 #[cfg(test)]
 mod client_tests {
+    use super::EMPTY_METADATA;
     use c2_wire::buddy::BUDDY_PAYLOAD_SIZE;
     use c2_wire::flags;
     use c2_wire::frame;
@@ -66,6 +69,7 @@ mod client_tests {
             &call_identity("grid"),
             0,
             c2_wire::rpc::CallMode::Unary,
+            &EMPTY_METADATA,
             ValuePart::whole(ValueStorage::Inline(b"hello")),
         )
         .unwrap();
@@ -146,6 +150,7 @@ mod client_tests {
             &call_identity("grid"),
             3,
             c2_wire::rpc::CallMode::Unary,
+            &EMPTY_METADATA,
             ValuePart::whole(ValueStorage::Shm(descriptor)),
         )
         .unwrap();
@@ -177,6 +182,7 @@ mod client_tests {
             &call_identity("grid"),
             2,
             c2_wire::rpc::CallMode::Unary,
+            &EMPTY_METADATA,
             ValuePart::first(256, ValueStorage::Inline(&[0xab; 128])),
         )
         .unwrap();
@@ -437,7 +443,9 @@ mod endpoint_context_transport_tests {
 
     fn check_tag(client: &SyncClient, expected: u8) {
         let binding = client.acquire_route(&contract()).unwrap();
-        let response = client.call_bound(&binding, "tag", &[]).unwrap();
+        let response = client
+            .call_bound(&binding, "tag", &[], &super::EMPTY_METADATA)
+            .unwrap();
         assert_eq!(response.into_owned_bytes().unwrap(), vec![expected]);
     }
 

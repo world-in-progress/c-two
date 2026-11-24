@@ -3,6 +3,7 @@
 use super::*;
 use crate::IpcStreamCancellation;
 use crate::StreamTerminal;
+use crate::tests::EMPTY_METADATA;
 use crate::tests::memory_budget;
 use c2_error::{C2Error, ErrorCode};
 use c2_wire::rpc::{
@@ -128,6 +129,7 @@ async fn check_shm_item_copy(cancel_during_copy: bool) {
             Box::new(OperationOwner(owner_dropped.clone())),
             IpcStreamCancellation::new(),
             &IpcCallControl::new(|| Ok(())),
+            &EMPTY_METADATA,
         )
         .await
         .unwrap();
@@ -166,7 +168,11 @@ async fn check_shm_item_copy(cancel_during_copy: bool) {
         lock_done_tx.send(()).unwrap();
     });
     let lock_result = tokio::task::spawn_blocking(move || lock_done_rx.recv_timeout(WAIT)).await;
-    let unary_result = timeout(WAIT, client.call_bound(&binding, "ping", b"")).await;
+    let unary_result = timeout(
+        WAIT,
+        client.call_bound(&binding, "ping", b"", &EMPTY_METADATA),
+    )
+    .await;
     copy_release_tx.send(()).unwrap();
     lock_probe.join().unwrap();
     assert!(
@@ -241,7 +247,7 @@ async fn cancellation_and_zero_observation_do_not_wait_for_brief_receive_state_l
     let mut client = endpoint.client();
     client.connect().await.unwrap();
     let response = client
-        .stream_bound(&binding(), "items", b"", memory_budget(8))
+        .stream_bound(&binding(), "items", b"", memory_budget(8), &EMPTY_METADATA)
         .await
         .unwrap();
     let call = response.receive_call_for_test();
@@ -310,6 +316,7 @@ async fn opening_abandonment_intent_attaches_before_request_publication() {
             Box::new(()),
             cancellation,
             &control,
+            &EMPTY_METADATA,
         )
         .await
         .unwrap();
@@ -380,7 +387,7 @@ async fn topic_inline_fragments_assemble_and_partial_delivery_recycles_on_cancel
         let (open, _) = read_frame(&mut socket).await;
         let id = open.request_id;
         socket
-            .write_all(&rpc::encode_ready_frame(id, 1).unwrap())
+            .write_all(&rpc::encode_ready_frame(id, 1, 0).unwrap())
             .await
             .unwrap();
         socket
@@ -438,6 +445,7 @@ async fn topic_inline_fragments_assemble_and_partial_delivery_recycles_on_cancel
                 on_lag: rpc::WireLagPolicy::Error,
             },
             budget.clone(),
+            &EMPTY_METADATA,
         )
         .await
         .unwrap();
@@ -539,7 +547,7 @@ async fn bad_terminal(fault: u8) {
     let mut client = endpoint.client();
     client.connect().await.unwrap();
     let mut response = client
-        .stream_bound(&binding(), "items", b"", memory_budget(16))
+        .stream_bound(&binding(), "items", b"", memory_budget(16), &EMPTY_METADATA)
         .await
         .unwrap();
     if fault != 2 {
@@ -562,7 +570,7 @@ async fn bad_terminal(fault: u8) {
     assert_eq!(client.pending_len_for_test(), 0);
     assert_eq!(
         client
-            .call_inline(&identity(), 0, b"next")
+            .call_inline(&identity(), 0, b"next", &EMPTY_METADATA)
             .await
             .unwrap()
             .into_owned_bytes()
@@ -621,7 +629,7 @@ async fn complete_item_before_end(peer_ends: bool) {
     client.connect().await.unwrap();
     let budget = memory_budget(7);
     let mut response = client
-        .stream_bound(&binding(), "items", b"", budget.clone())
+        .stream_bound(&binding(), "items", b"", budget.clone(), &EMPTY_METADATA)
         .await
         .unwrap();
     // Observe END/EOF while the first item still occupies the consumer slot.
@@ -699,7 +707,7 @@ async fn check_cancel_natural_eof_race(terminal_before_eof: bool) {
     client.connect().await.unwrap();
     let observation = client.connection_observation().unwrap();
     let mut response = client
-        .stream_bound(&binding(), "items", b"", memory_budget(16))
+        .stream_bound(&binding(), "items", b"", memory_budget(16), &EMPTY_METADATA)
         .await
         .unwrap();
     let first = timeout(WAIT, response.recv())
@@ -908,6 +916,7 @@ async fn chunked_stream_open_prefers_early_not_executed_over_upload_failure() {
                     "items",
                     &vec![7; CHUNK_SIZE as usize * 2],
                     memory_budget(8192),
+                    &EMPTY_METADATA,
                 )
                 .await
         }
@@ -1000,6 +1009,7 @@ async fn early_failed_end_keeps_complete_item_in_original_stream() {
                     "items",
                     &vec![7; CHUNK_SIZE as usize * 2],
                     memory_budget(8192),
+                    &EMPTY_METADATA,
                 )
                 .await
         }

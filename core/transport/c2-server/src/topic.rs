@@ -356,6 +356,7 @@ impl fmt::Debug for TopicChannel {
 pub(crate) struct RemoteTopicAttach {
     pub(crate) channel: Arc<TopicChannel>,
     pub(crate) start_seq: u64,
+    pub(crate) head_seq: u64,
     pub(crate) options: SubscribeOptions,
     pub(crate) _guard: ActiveSubscriberGuard,
 }
@@ -624,7 +625,7 @@ impl TopicChannel {
         &self,
         state: &TopicChannelState,
         options: SubscribeOptions,
-    ) -> Result<(u64, ActiveSubscriberGuard), C2Error> {
+    ) -> Result<(u64, u64, ActiveSubscriberGuard), C2Error> {
         if state.closed.is_some() {
             return Err(resource_closed_error(&self.topic_name));
         }
@@ -647,7 +648,7 @@ impl TopicChannel {
                 )
             })?,
         };
-        Ok((start_seq, self.barrier.enter()))
+        Ok((start_seq, head, self.barrier.enter()))
     }
 
     pub(crate) fn subscribe_local(
@@ -661,7 +662,7 @@ impl TopicChannel {
 
         let (start_seq, cursor) = {
             let mut state = self.state.lock();
-            let (start_seq, guard) = match self.compute_attach_locked(&state, options) {
+            let (start_seq, _, guard) = match self.compute_attach_locked(&state, options) {
                 Ok(attached) => attached,
                 Err(error) => {
                     drop(state);
@@ -698,10 +699,11 @@ impl TopicChannel {
         options: SubscribeOptions,
     ) -> Result<RemoteTopicAttach, C2Error> {
         let state = self.state.lock();
-        let (start_seq, guard) = self.compute_attach_locked(&state, options)?;
+        let (start_seq, head_seq, guard) = self.compute_attach_locked(&state, options)?;
         Ok(RemoteTopicAttach {
             channel: Arc::clone(self),
             start_seq,
+            head_seq,
             options,
             _guard: guard,
         })
@@ -863,6 +865,10 @@ impl RouteTopics {
         topic_name: &str,
         options: SubscribeOptions,
     ) -> Result<RemoteTopicAttach, C2Error> {
+        self.open_channel(topic_name)?.attach_remote(options)
+    }
+
+    pub(crate) fn open_channel(&self, topic_name: &str) -> Result<&Arc<TopicChannel>, C2Error> {
         if self.is_closed() {
             return Err(resource_closed_error(topic_name));
         }
@@ -870,7 +876,10 @@ impl RouteTopics {
             .channels
             .get(topic_name)
             .ok_or_else(|| unknown_topic_error(&self.route_name, topic_name))?;
-        channel.attach_remote(options)
+        if channel.is_closed() {
+            return Err(resource_closed_error(topic_name));
+        }
+        Ok(channel)
     }
 
     pub fn close(&self, cause: TopicCloseCause) {

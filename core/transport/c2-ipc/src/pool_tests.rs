@@ -1,4 +1,5 @@
 use super::*;
+use crate::tests::EMPTY_METADATA;
 use c2_config::{ConnectOptions, LocalEndpointContext};
 use c2_local::{ConnectionClosed, ConnectionEndReason};
 use c2_server::{
@@ -1041,7 +1042,7 @@ fn retired_pool_client_preserves_sent_reply(discard: bool, force_close: bool) {
     let old_observation = old.connection_observation().unwrap();
     let old_call = {
         let old = old.clone();
-        thread::spawn(move || old.call_bound_phased(&old_binding, "ping", b"old"))
+        thread::spawn(move || old.call_bound_phased(&old_binding, "ping", b"old", &EMPTY_METADATA))
     };
     entered_rx.recv_timeout(WAIT).unwrap();
     if discard {
@@ -1055,7 +1056,7 @@ fn retired_pool_client_preserves_sent_reply(discard: bool, force_close: bool) {
     let new_binding = replacement.acquire_route(&expected).unwrap();
     assert_eq!(
         replacement
-            .call_bound(&new_binding, "ping", b"new")
+            .call_bound(&new_binding, "ping", b"new", &EMPTY_METADATA)
             .unwrap()
             .into_owned_bytes()
             .unwrap(),

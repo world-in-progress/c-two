@@ -1094,6 +1094,7 @@ fn make_route(name: &str) -> CrmRoute {
         stream_callback: None,
         method_modes: vec![CallMode::Unary; 2],
         method_names: vec!["step".into(), "query".into()],
+        method_access: vec![crate::AccessLevel::Write; 2],
         topics: None,
     }
 }
@@ -1767,6 +1768,7 @@ async fn inline_dispatch_rejects_unknown_method_index_before_callback() {
         &call_identity("grid"),
         99,
         c2_wire::rpc::CallMode::Unary,
+        &c2_config::CallMetadata::empty(),
         c2_wire::rpc::ValuePart::whole(c2_wire::rpc::ValueStorage::Inline(&[])),
     )
     .unwrap();
@@ -1818,6 +1820,7 @@ async fn same_error_code_distinguishes_admission_from_resource_failure() {
         &call_identity("grid"),
         99,
         c2_wire::rpc::CallMode::Unary,
+        &c2_config::CallMetadata::empty(),
         c2_wire::rpc::ValuePart::whole(c2_wire::rpc::ValueStorage::Inline(&[])),
     )
     .unwrap();
@@ -1834,6 +1837,7 @@ async fn same_error_code_distinguishes_admission_from_resource_failure() {
         &call_identity("grid"),
         0,
         c2_wire::rpc::CallMode::Unary,
+        &c2_config::CallMetadata::empty(),
         c2_wire::rpc::ValuePart::whole(c2_wire::rpc::ValueStorage::Inline(&[])),
     )
     .unwrap();
@@ -1896,6 +1900,7 @@ async fn inline_dispatch_uses_current_registration_and_distinguishes_removed_nam
             &target,
             0,
             CallMode::Unary,
+            &c2_config::CallMetadata::empty(),
             c2_wire::rpc::ValuePart::whole(c2_wire::rpc::ValueStorage::Inline(&[])),
         )
         .unwrap();
@@ -3268,11 +3273,12 @@ fn open_metadata_precedes_shm_descriptor() {
         &call_identity("grid"),
         1,
         c2_wire::rpc::CallMode::Unary,
+        &c2_config::CallMetadata::empty(),
         ValuePart::whole(ValueStorage::Shm(bp)),
     )
     .unwrap();
     let (header, payload) = c2_wire::frame::decode_frame(&frame).unwrap();
-    let (_, _, _, _, storage_offset) = c2_wire::rpc::decode_open_metadata(payload).unwrap();
+    let (_, _, _, _, _, storage_offset) = c2_wire::rpc::decode_open_metadata(payload).unwrap();
     assert_eq!(&payload[storage_offset..], &encode_buddy_payload(&bp));
     match c2_wire::rpc::decode_rpc_record(&header, payload, None).unwrap() {
         RpcRecord::Open {
@@ -4418,6 +4424,7 @@ fn value_chunk_call_frame(
             &call_identity(identity),
             0,
             c2_wire::rpc::CallMode::Unary,
+            &c2_config::CallMetadata::empty(),
             value,
         )
         .unwrap()
@@ -4765,6 +4772,7 @@ async fn first_chunk_write_precedes_later_unary_on_same_connection() {
             &call_identity("grid"),
             1,
             c2_wire::rpc::CallMode::Unary,
+            &c2_config::CallMetadata::empty(),
             c2_wire::rpc::ValuePart::whole(c2_wire::rpc::ValueStorage::Inline(b"read")),
         )
         .unwrap();
@@ -5383,6 +5391,7 @@ async fn unnegotiated_buddy_chunk_frame_is_refused_with_correlated_error() {
                 &call_identity("grid"),
                 0,
                 c2_wire::rpc::CallMode::Unary,
+                &c2_config::CallMetadata::empty(),
                 c2_wire::rpc::ValuePart::first(256, c2_wire::rpc::ValueStorage::Shm(descriptor)),
             )
             .unwrap(),
@@ -5433,6 +5442,7 @@ fn inline_call_frame(request_id: u64, identity: &str, data: &[u8]) -> Vec<u8> {
         &call_identity(identity),
         0,
         c2_wire::rpc::CallMode::Unary,
+        &c2_config::CallMetadata::empty(),
         c2_wire::rpc::ValuePart::whole(c2_wire::rpc::ValueStorage::Inline(data)),
     )
     .unwrap()
@@ -5444,6 +5454,7 @@ fn shm_call_frame(request_id: u64, identity: &str, descriptor: BuddyPayload) -> 
         &call_identity(identity),
         0,
         c2_wire::rpc::CallMode::Unary,
+        &c2_config::CallMetadata::empty(),
         c2_wire::rpc::ValuePart::whole(c2_wire::rpc::ValueStorage::Shm(descriptor)),
     )
     .unwrap()
@@ -6879,6 +6890,7 @@ async fn saturated_writer_preserves_business_errors_capacity_replies_and_other_c
         &call_identity("grid"),
         1,
         c2_wire::rpc::CallMode::Unary,
+        &c2_config::CallMetadata::empty(),
         c2_wire::rpc::ValuePart::whole(c2_wire::rpc::ValueStorage::Inline(&[])),
     )
     .unwrap();
@@ -7730,6 +7742,7 @@ async fn buddy_chunk_continuations_survive_deactivation_and_shutdown() {
                         &call_identity("grid"),
                         0,
                         c2_wire::rpc::CallMode::Unary,
+                        &c2_config::CallMetadata::empty(),
                         c2_wire::rpc::ValuePart::first(
                             8,
                             c2_wire::rpc::ValueStorage::Shm(descriptor),
@@ -7829,6 +7842,7 @@ async fn whole_open_over_payload_limit_is_not_executed() {
         &call_identity("grid"),
         0,
         c2_wire::rpc::CallMode::Unary,
+        &c2_config::CallMetadata::empty(),
         c2_wire::rpc::ValuePart::first(128, c2_wire::rpc::ValueStorage::Inline(&[7; 64])),
     )
     .unwrap();
@@ -8131,6 +8145,7 @@ async fn incomplete_call_end_preserves_running_queued_calls_and_releases() {
             &call_identity("grid"),
             0,
             c2_wire::rpc::CallMode::Unary,
+            &c2_config::CallMetadata::empty(),
             ValuePart::whole(ValueStorage::Inline(input)),
         )
         .unwrap();
@@ -8283,6 +8298,7 @@ async fn mode_refused_shm_open_and_retired_continuation_release_original_loans()
                     &call_identity("grid"),
                     0,
                     CallMode::ServerStream,
+                    &c2_config::CallMetadata::empty(),
                     if chunked {
                         ValuePart::first(8, ValueStorage::Shm(descriptor))
                     } else {
@@ -8337,6 +8353,7 @@ async fn mode_refused_shm_open_and_retired_continuation_release_original_loans()
                 &call_identity("grid"),
                 0,
                 CallMode::Unary,
+                &c2_config::CallMetadata::empty(),
                 ValuePart::whole(ValueStorage::Inline(b"next")),
             )
             .unwrap(),
@@ -8954,6 +8971,7 @@ async fn subscription_open_requires_opened_registration_and_failed_sync_ends_it(
             &identity,
             "state",
             rpc::WireSubscribeOptions::default(),
+            &c2_config::CallMetadata::empty(),
         )
         .unwrap()
     };

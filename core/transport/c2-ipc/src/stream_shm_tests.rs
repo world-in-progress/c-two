@@ -1,6 +1,7 @@
 //! Whole SHM stream admission, original-connection settlement and EOF.
 
 use super::*;
+use crate::tests::EMPTY_METADATA;
 use crate::tests::memory_budget;
 use c2_wire::buddy::BuddyPayload;
 use c2_wire::connection::{ConnectionCore, ConnectionSide, WriteRequest};
@@ -218,7 +219,7 @@ async fn rejected_shm_settles_on_original_connection(fault: InvalidShm) {
     let occupied =
         matches!(fault, InvalidShm::WithoutStorage).then(|| budget.try_reserve_memory(64).unwrap());
     let mut stream = client
-        .stream_bound(&binding(), "items", b"", budget.clone())
+        .stream_bound(&binding(), "items", b"", budget.clone(), &EMPTY_METADATA)
         .await
         .unwrap();
     let mut copying = None;
@@ -234,7 +235,11 @@ async fn rejected_shm_settles_on_original_connection(fault: InvalidShm) {
     }
     let unary = tokio::spawn({
         let client = client.clone();
-        async move { client.call_bound(&binding(), "items", b"").await }
+        async move {
+            client
+                .call_bound(&binding(), "items", b"", &EMPTY_METADATA)
+                .await
+        }
     });
     send_data.send(()).unwrap();
     if let Some(entered) = copying {

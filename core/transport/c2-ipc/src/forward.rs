@@ -91,7 +91,7 @@ fn topic_opening_terminal_error(terminal: &stream::StreamTerminal) -> crate::Ipc
 struct ForwardState {
     id: Option<u64>,
     begin: Option<(Option<u64>, u64)>,
-    ready: Option<u64>,
+    ready: Option<(u64, u64)>,
     next_seq: Option<u64>,
     sequence_exhausted: bool,
     total: Option<u64>,
@@ -384,17 +384,31 @@ impl IpcForwardStream {
 /// independently releasable windows instead of a whole-item allocation.
 pub struct IpcForwardTopic {
     stream: IpcForwardStream,
+    budget: DomainBudget,
     start_seq: u64,
+    head_seq: u64,
 }
 
 /// Independent control handle so source confirmation can run while the
 /// forwarding task is waiting for or copying a topic item.
 #[derive(Clone)]
-pub struct IpcTopicSynchronizer(Arc<ForwardReceive>);
+pub struct IpcTopicSynchronizer {
+    call: Arc<ForwardReceive>,
+    budget: DomainBudget,
+}
 
 impl IpcForwardTopic {
     pub fn start_seq(&self) -> u64 {
         self.start_seq
+    }
+
+    /// The topic head observed by the Host when it admitted this subscription.
+    pub fn head_seq(&self) -> u64 {
+        self.head_seq
+    }
+
+    pub fn requires_admission(&self) -> bool {
+        self.stream.call.conn.server_has_admission_hook
     }
 
     pub fn cancellation(&self) -> IpcForwardCancellation {
@@ -402,7 +416,10 @@ impl IpcForwardTopic {
     }
 
     pub fn synchronizer(&self) -> IpcTopicSynchronizer {
-        IpcTopicSynchronizer(self.stream.call.clone())
+        IpcTopicSynchronizer {
+            call: self.stream.call.clone(),
+            budget: self.budget.clone(),
+        }
     }
 
     /// Confirm the source's current head against this exact subscription.
@@ -471,10 +488,60 @@ impl IpcForwardTopic {
 }
 
 impl IpcTopicSynchronizer {
+    /// Ask the Host to admit one subscriber against this exact upstream
+    /// subscription and return the head observed when it admitted the join.
+    pub async fn admit_subscriber(
+        &self,
+        metadata: &CallMetadata,
+        deadline: Option<std::time::Instant>,
+    ) -> Result<u64, crate::IpcCallError> {
+        let closed = || {
+            IpcError::LocalCallRejected(C2Error::new(
+                ErrorCode::ResourceClosed,
+                "upstream subscription is closed",
+            ))
+        };
+        let subscription_id = {
+            let state = self.call.state.lock();
+            if state.ended || state.cancel.is_some() {
+                return Err(pre_dispatch_call_error(closed()));
+            }
+            state.id
+        }
+        .ok_or_else(|| pre_dispatch_call_error(closed()))?;
+        let _permit = reserve_control_operation(&self.budget).map_err(|error| {
+            pre_dispatch_call_error(if matches!(error, IpcError::Closed) {
+                closed()
+            } else {
+                error
+            })
+        })?;
+        let frame = rpc::encode_admit_topic_draft_frame(subscription_id, metadata)
+            .map_err(|error| pre_dispatch_call_error(IpcError::Protocol(error.to_string())))?;
+        match self
+            .call
+            .conn
+            .control_request(frame, deadline, "admit_subscriber")
+            .await
+        {
+            Ok(ControlResponse::AdmitTopic(rpc::WireAdmitTopicResult::Allowed { head_seq })) => {
+                Ok(head_seq)
+            }
+            Ok(ControlResponse::AdmitTopic(rpc::WireAdmitTopicResult::Error(error))) => {
+                Err(pre_dispatch_call_error(IpcError::CallRejected(error)))
+            }
+            Ok(ControlResponse::QueryCall(_)) => {
+                Err(dispatch_uncertain_call_error(unexpected_control_response()))
+            }
+            Err(IpcError::Closed) => Err(pre_dispatch_call_error(closed())),
+            Err(error) => Err(dispatch_uncertain_call_error(error)),
+        }
+    }
+
     pub async fn sync_head_seq(&self) -> Result<u64, crate::IpcCallError> {
         let (tx, rx) = oneshot::channel();
         let queued = {
-            let mut state = self.0.state.lock();
+            let mut state = self.call.state.lock();
             if state.ended || state.cancel.is_some() {
                 false
             } else {
@@ -485,7 +552,7 @@ impl IpcTopicSynchronizer {
         if !queued {
             return self.sync_terminal_error().await;
         }
-        self.0.conn.wake.notify_one();
+        self.call.conn.wake.notify_one();
         match rx.await {
             Ok(head_seq) => Ok(head_seq),
             Err(_) => self.sync_terminal_error().await,
@@ -494,11 +561,11 @@ impl IpcTopicSynchronizer {
 
     async fn sync_terminal_error(&self) -> Result<u64, crate::IpcCallError> {
         loop {
-            let notified = self.0.changed.notified();
+            let notified = self.call.changed.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
             let outcome = {
-                let state = self.0.state.lock();
+                let state = self.call.state.lock();
                 if let Some(terminal) = &state.terminal {
                     Some(if terminal.status != CallStatus::Success {
                         stream::terminal_failure(terminal)
@@ -652,12 +719,12 @@ impl ForwardReceive {
         cause.map(|cause| rpc::encode_cancel_frame(id, cause).expect("published request ID"))
     }
 
-    pub(crate) fn ready(&self, start_seq: u64) -> Result<(), IpcError> {
+    pub(crate) fn ready(&self, start_seq: u64, head_seq: u64) -> Result<(), IpcError> {
         let mut state = self.state.lock();
         if !self.subscription || start_seq == 0 || state.ready.is_some() {
             return Err(IpcError::Protocol("invalid subscription READY".into()));
         }
-        state.ready = Some(start_seq);
+        state.ready = Some((start_seq, head_seq));
         state.next_seq = Some(start_seq);
         drop(state);
         self.changed.notify_waiters();
@@ -1010,6 +1077,7 @@ impl IpcClient {
         binding: &RouteBinding,
         topic_name: &str,
         options: rpc::WireSubscribeOptions,
+        metadata: &CallMetadata,
     ) -> Result<IpcForwardTopic, crate::IpcCallError> {
         c2_contract::validate_contract_text_field("topic_name", topic_name)
             .map_err(|e| pre_dispatch_call_error(IpcError::Protocol(e.to_string())))?;
@@ -1023,8 +1091,9 @@ impl IpcClient {
             .unpublished_mut(&send.state)
             .expect("original forwarded subscription draft")
             .forward = Some(call.clone());
-        let frame = rpc::encode_open_subscribe_draft_frame(&identity, topic_name, options)
-            .map_err(|e| pre_dispatch_call_error(IpcError::Protocol(e.to_string())))?;
+        let frame =
+            rpc::encode_open_subscribe_draft_frame(&identity, topic_name, options, metadata)
+                .map_err(|e| pre_dispatch_call_error(IpcError::Protocol(e.to_string())))?;
         if let Err(error) = send
             .conn
             .submit(
@@ -1041,14 +1110,14 @@ impl IpcClient {
             });
         }
         stream.uploaded = true;
-        let start_seq = loop {
+        let (start_seq, head_seq) = loop {
             let notified = call.changed.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
             {
                 let state = call.state.lock();
-                if let Some(start_seq) = state.ready {
-                    break start_seq;
+                if let Some(ready) = state.ready {
+                    break ready;
                 }
                 if let Some(error) = &state.local_error {
                     return Err(dispatch_uncertain_call_error(
@@ -1069,7 +1138,12 @@ impl IpcClient {
             }
             notified.await;
         };
-        Ok(IpcForwardTopic { stream, start_seq })
+        Ok(IpcForwardTopic {
+            stream,
+            budget: self.budget.clone(),
+            start_seq,
+            head_seq,
+        })
     }
 
     /// Begin one server stream while uploading a declared-size request through
@@ -1083,6 +1157,7 @@ impl IpcClient {
         data_len: u64,
         chunks: S,
         send_reservation: MemoryReservation,
+        metadata: &CallMetadata,
     ) -> Result<IpcForwardStream, crate::IpcCallError>
     where
         S: Stream<Item = Result<B, E>> + Send + 'static,
@@ -1115,13 +1190,13 @@ impl IpcClient {
             entry.upload_stop = Some(upload_stop);
             entry.forward = Some(call.clone());
         }
-        let metadata_len = rpc::encoded_open_metadata_len(&identity)
-            .map_err(|e| pre_dispatch_call_error(IpcError::Protocol(e.to_string())))?;
-        let chunk_size = self
-            .forward_chunk_size(data_size, send_reservation.bytes(), metadata_len)
+        let metadata_len =
+            open_metadata_len(&identity, None, metadata).map_err(pre_dispatch_call_error)?;
+        let chunk_size = request_chunk_size(data_size, send_reservation.bytes(), metadata_len)
             .map_err(pre_dispatch_call_error)?;
         let (opening_tx, opening_rx) = oneshot::channel();
         let driver = send.conn.clone();
+        let metadata = metadata.clone();
         driver.spawn_send(async move {
             let conn = send.conn.clone();
             let state = send.state.clone();
@@ -1135,6 +1210,7 @@ impl IpcClient {
                 chunks,
                 stop_upload,
                 send_reservation,
+                &metadata,
             )
             .await;
             let started = send.started();
@@ -1188,6 +1264,7 @@ impl IpcClient {
         data_len: u64,
         chunks: S,
         send_reservation: MemoryReservation,
+        metadata: &CallMetadata,
     ) -> Result<ResponseData, crate::IpcCallError>
     where
         S: Stream<Item = Result<B, E>> + Send + 'static,
@@ -1201,6 +1278,7 @@ impl IpcClient {
             data_len,
             chunks,
             send_reservation,
+            metadata,
         )
         .await
     }
@@ -1216,6 +1294,7 @@ impl IpcClient {
         data_len: u64,
         chunks: S,
         send_reservation: MemoryReservation,
+        metadata: &CallMetadata,
     ) -> Result<ResponseData, crate::IpcCallError>
     where
         S: Stream<Item = Result<B, E>> + Send + 'static,
@@ -1231,13 +1310,9 @@ impl IpcClient {
             )));
         }
         let data_size = checked_payload_len_usize(data_len).map_err(pre_dispatch_call_error)?;
-        let metadata_len = match call_id {
-            Some(call_id) => rpc::encoded_keyed_open_metadata_len(&identity, call_id),
-            None => rpc::encoded_open_metadata_len(&identity),
-        }
-        .map_err(|e| pre_dispatch_call_error(IpcError::Protocol(e.to_string())))?;
-        let chunk_size = self
-            .forward_chunk_size(data_size, send_reservation.bytes(), metadata_len)
+        let metadata_len =
+            open_metadata_len(&identity, call_id, metadata).map_err(pre_dispatch_call_error)?;
+        let chunk_size = request_chunk_size(data_size, send_reservation.bytes(), metadata_len)
             .map_err(pre_dispatch_call_error)?;
         let request_block = self
             .forward_request_block(data_size)
@@ -1258,6 +1333,7 @@ impl IpcClient {
             .upload_stop = Some(upload_stop);
         let (result_tx, result_rx) = oneshot::channel();
         let driver = send.conn.clone();
+        let metadata = metadata.clone();
         driver.spawn_send(async move {
             let sent = Self::send_forward_frames(
                 send.conn.clone(),
@@ -1269,6 +1345,7 @@ impl IpcClient {
                 chunks,
                 stop_upload,
                 send_reservation,
+                &metadata,
             )
             .await;
             let result = if let Err(error) = sent {
@@ -1299,27 +1376,6 @@ impl IpcClient {
         }
     }
 
-    fn forward_chunk_size(
-        &self,
-        data_size: usize,
-        charged: u64,
-        metadata_len: usize,
-    ) -> Result<usize, IpcError> {
-        if data_size == 0 {
-            return Ok(0);
-        }
-        let frame_room = (MAX_RPC_FRAME_BYTES as usize).saturating_sub(12 + metadata_len + 8);
-        let size = (c2_config::CHUNK_SIZE as usize)
-            .min(frame_room)
-            .min(charged.min(usize::MAX as u64) as usize);
-        if size == 0 {
-            return Err(IpcError::Config(
-                "positive request send reservation required".into(),
-            ));
-        }
-        Ok(size)
-    }
-
     #[allow(clippy::too_many_arguments)]
     async fn send_forward_frames<S, B, E>(
         conn: Arc<ClientConnection>,
@@ -1331,6 +1387,7 @@ impl IpcClient {
         chunks: S,
         mut stop_upload: watch::Receiver<bool>,
         send_reservation: MemoryReservation,
+        metadata: &CallMetadata,
     ) -> Result<(), IpcError>
     where
         S: Stream<Item = Result<B, E>> + Send,
@@ -1338,13 +1395,6 @@ impl IpcClient {
         E: Display + Send,
     {
         let (identity, method_idx, mode, call_id) = open;
-        // Keyed opens carry the length-prefixed call_id after the method
-        // index; the exact width keeps chunk frames at their true maximum.
-        let metadata_len = match call_id.as_deref() {
-            Some(call_id) => rpc::encoded_keyed_open_metadata_len(&identity, call_id),
-            None => rpc::encoded_open_metadata_len(&identity),
-        }
-        .map_err(|error| IpcError::Protocol(error.to_string()))?;
         let send_reservation = Arc::new(send_reservation);
         if let Some(block) = request_block {
             // This allocation belongs to the original request pool. Fill it
@@ -1401,12 +1451,14 @@ impl IpcClient {
                     &identity,
                     method_idx,
                     call_id,
+                    metadata,
                     ValuePart::whole(ValueStorage::Shm(descriptor)),
                 ),
                 None => rpc::encode_open_draft_frame(
                     &identity,
                     method_idx,
                     mode,
+                    metadata,
                     ValuePart::whole(ValueStorage::Shm(descriptor)),
                 ),
             }
@@ -1427,12 +1479,14 @@ impl IpcClient {
                     &identity,
                     method_idx,
                     call_id,
+                    metadata,
                     ValuePart::whole(ValueStorage::Inline(&[])),
                 ),
                 None => rpc::encode_open_draft_frame(
                     &identity,
                     method_idx,
                     mode,
+                    metadata,
                     ValuePart::whole(ValueStorage::Inline(&[])),
                 ),
             }
@@ -1453,6 +1507,7 @@ impl IpcClient {
                     &identity,
                     method_idx,
                     call_id,
+                    metadata,
                     ChunkPosition::Whole,
                     data_size,
                 ),
@@ -1460,12 +1515,13 @@ impl IpcClient {
                     &identity,
                     method_idx,
                     mode,
+                    metadata,
                     ChunkPosition::Whole,
                     data_size,
                 ),
             }
             .map_err(|error| IpcError::Protocol(error.to_string()))?;
-            let frame_len = frame::HEADER_SIZE + metadata_len + data_size;
+            let frame_len = frame.len() + data_size;
             futures_util::pin_mut!(chunks);
             loop {
                 let next = loop {
@@ -1513,6 +1569,7 @@ impl IpcClient {
             data_size,
             part,
             chunk_size,
+            metadata,
         )?;
         let mut filled = 0usize;
         futures_util::pin_mut!(chunks);
@@ -1569,6 +1626,7 @@ impl IpcClient {
                             data_size,
                             part,
                             chunk_size,
+                            metadata,
                         )?
                     } else {
                         Vec::new()
@@ -1601,6 +1659,7 @@ impl IpcClient {
         data_size: usize,
         part: usize,
         chunk_size: usize,
+        metadata: &CallMetadata,
     ) -> Result<Vec<u8>, IpcError> {
         let value_bytes = chunk_size.min(data_size - part * chunk_size);
         if part == 0 {
@@ -1609,6 +1668,7 @@ impl IpcClient {
                     open.0,
                     open.1,
                     call_id,
+                    metadata,
                     ChunkPosition::First {
                         total_bytes: data_size as u64,
                     },
@@ -1618,6 +1678,7 @@ impl IpcClient {
                     open.0,
                     open.1,
                     open.2,
+                    metadata,
                     ChunkPosition::First {
                         total_bytes: data_size as u64,
                     },
