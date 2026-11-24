@@ -89,7 +89,7 @@ finally:
 
 连接的 `timeout` 是以秒为单位的单一预算，覆盖连接池等待、操作系统连接、握手、当前路由查找和 relay 获取。省略或传入 `None` 不设置调用方截止时间；零会立即过期。给了 `timeout` 时，它取代操作系统连接与握手各自固定的 5 秒守卫，命名空间门锁或命名管道的等待也以它为限；不给时保留这些守卫。负数和非有限值会被拒绝。过期时抛出 `CallDeadlineExceeded`，包含 `operation=connect`、`transport_phase=pre_dispatch` 及失败的 `stage`；资源方法尚未执行。
 
-业务调用的等待独立于连接等待。`cc.with_call_options` 返回现有连接的视图；其超时不会成为资源方法参数。调用截止时间可能在派发后结束调用方等待：已派发的调用会继续占用 `max_outstanding_calls` 调用槽直到真实终态，但请求的发送存储和 IPC SHM 借出在传输写出或拷贝完请求后即可更早释放。超时不会取消正在运行的资源方法，也不会发起重放。直接 IPC 和 relay HTTP 默认均无限等待。同进程同步调用接受继承的等待上限或无限等待。默认值和在途调用准入限制见[配置](configuration.zh-CN.md#调用等待与准入)。
+业务调用的等待与调用元数据均独立于连接获取。`cc.with_call_options(proxy, *, timeout=_UNSET, metadata=_UNSET)` 返回现有连接的可复用视图，不会给资源方法增加参数：省略参数保留父视图的值，`timeout=...` 重置为传输默认等待（`Inherit`）并保留元数据，`timeout=None` 表示无限等待，`metadata=None` 清空元数据，`metadata=Mapping[str, str]` 在父视图浅拷贝上覆盖合并并校验 `CallMetadata` 上限。调用截止时间可能在派发后结束调用方等待：已派发的调用会继续占用 `max_outstanding_calls` 调用槽直到真实终态，但请求的发送存储和 IPC SHM 借出在传输写出或拷贝完请求后即可更早释放。超时不会取消正在运行的资源方法，也不会发起重放。直接 IPC 和 relay HTTP 默认均无限等待。同进程同步调用接受继承的等待上限或无限等待。默认值和在途调用准入限制见[配置](configuration.zh-CN.md#调用等待与准入)。
 
 连接跟随路由名。C-Two 已经知道它所服务的那次注册不在了时（服务进程结束，或者之前的调用因路由不存在、已撤下、已关闭或契约不同而在派发前被拒），下一次调用在自己的截止时间内按名字重新获取路由，发往当前的注册：直接 IPC 回到原地址，经 relay 的连接通过 relay 锚点重新解析，可能在本地 IPC 与 relay 之间切换，显式 relay 连接仍走 HTTP。只能从这次调用自己的拒绝得知变化时，这次调用在派发前失败、可以安全重试，下一次调用才跟过去。同进程连接在注册被注销后也一样：下一次调用发往这个名字新的本地注册，或者经 relay 发往远程的注册；注册还在时，调用直接进入资源。服务这个名字的进程负责状态的延续；要让调用方察觉状态变了，就换一个名字。身份与协议的拒绝不会引起重新获取。
 
@@ -99,7 +99,7 @@ finally:
 
 使用 `cc.with_call_id(proxy.step, call_id)(*args, **kwargs)` 提交带调用标识（call ID）的一元调用。对同一路由的每个逻辑操作使用新的标识。调用标识是由 `[A-Za-z0-9_-]` 中的 1–128 个 ASCII 字符组成的字符串，可跨物理连接和客户端进程使用。重复提交时，如果方法和编码后输入的 SHA-256 摘要一致，就附着到当前注册中匹配的记录，或重放其调用终态。方法或摘要冲突时报 `cc.error.CallIdConflict`（721）。
 
-`cc.query_call(proxy, call_id, *, timeout=...)` 返回只读的 `cc.CallOutcome` 调用结局（call outcome）快照，无需等待资源执行结束，也不占用业务调用槽。省略 `timeout` 时沿用代理的超时策略，传入秒数可限定查询等待时间，传入 `None` 则客户端不设截止时间。
+`cc.query_call(proxy, call_id, *, timeout=...)` 返回只读的 `cc.CallOutcome` 调用结局（call outcome）快照，无需等待资源执行结束，也不占用业务调用槽。它会同时沿用代理视图的 `timeout` 与 `metadata`；显式传入 `timeout`（秒）可覆盖查询等待时间，传入 `None` 则客户端不设截止时间。
 
 | 字段 | 含义 |
 | --- | --- |
@@ -115,6 +115,24 @@ finally:
 通过同进程代理对已注册路由执行调用结局操作时，使用该 Runtime 的本机 IPC 编码路径，与远端客户端共用同一个 Host 调用结局表。无调用标识的同进程调用仍直接传递 Python 对象。手工构造且未关联 Runtime 注册路由的 `thread_local` 代理会在派发前拒绝调用结局操作。
 
 如果带调用标识的调用抛出 `cc.error.CCBaseError`，且 `transport_phase == 'dispatch_uncertain'`，可从只读属性 `err.call_id` 读取该标识。为保证至多执行一次，每个调用标识只提交一次，派发不确定时使用查询或恢复。记录可能因淘汰、注销或 Host 重启而消失。未命中记录时，重新提交可能再次执行。遇到 `unknown` 或 723，先用应用的持久化状态对账，再决定是否启动另一次操作。见[调用结局生命周期](runtime-lifecycle.md#keyed-unary-call-lifecycle)。
+
+## 调用元数据、准入钩子与调用上下文
+
+C-Two 在 `thread_local`、直连 IPC 与 `c3 relay` HTTP 三条路径上统一传递有界字符串 `metadata`，覆盖普通一元、hold、带键一元、恢复、结局查询、服务端流与主题订阅（[ADR 0007](../decisions/0007-call-metadata-and-admission-hooks.md)）。`CallMetadata` 是单值有序映射，最多 64 条且全部键与值字节总和不超过 16,384：键为 1–64 字节小写 ASCII `[a-z0-9_.-]`，值为 0–4,096 字节可打印 ASCII（`0x20..=0x7E`）且禁止首尾空格。
+
+在服务端角色冻结前，通过 `cc.set_server(admission_hook=hook)` 或 `runtime.set_server(admission_hook=hook)` 配置单一 Host 级准入钩子（冻结前传 `None` 可清除；冻结后传入完全相同的可调用对象 `is` 会幂等通过，其他修改报 `CoreError` 且 `lifecycle_kind='config_frozen'`）。钩子接收只读 `cc.AdmissionContext`（`route_name`、`crm_ns`、`crm_name`、`crm_ver`、`target`、`access`、`operation`、`transport`、`call_id`、`metadata`），返回 `None` 或 `cc.AdmissionDecision.allow(extension=...)` 放行，或返回 `cc.AdmissionDecision.deny(message, details=...)` 在派发前以 `cc.error.AdmissionDenied`（724，`transport_phase='pre_dispatch'`）拒收。任何未捕获异常（包括调用下游资源抛出的 `AdmissionDenied`）或无法识别的返回值一律 fail-closed 为 `AdmissionDenied`（`message='admission hook failed'`，`details={'reason': 'hook_error'}`）。不要在准入钩子内同步调用或查询同一个 Host。由于 `KeyedUnary` 去重摘要排除了 `metadata` 以支持重发时刷新令牌，若需要跨主体隔离，请在钩子内对 `KeyedUnary`、`Recover` 与 `QueryOutcome` 校验 `call_id` 归属。
+
+```python
+def admit(ctx: cc.AdmissionContext) -> cc.AdmissionDecision:
+    token = ctx.metadata.get('x-token')
+    if token != 'secret':
+        return cc.AdmissionDecision.deny('invalid token', details={'policy': 'token'})
+    return cc.AdmissionDecision.allow(extension={'principal': 'alice'})
+
+cc.set_server(admission_hook=admit)
+```
+
+在执行中的一元方法或 `@cc.stream` 生成器（含启动、每次 `next()` 与清理）内，`cc.current_call_context()` 返回只读 `cc.CallContext`（`route_name`、`target`、`operation`、`call_id`、`metadata`、`extension`），调用之外返回 `None`。对命中去重的 `KeyedUnary`、`Recover`、`QueryOutcome` 与 `Subscribe`，钩子附带的 `extension` 立即丢弃而不留存。同进程嵌套调用始终绑定自身的 `CallContext`（即便内层调用元数据为空且无钩子，也会遮蔽外层上下文）。`Runtime.shutdown()` 完成会话交接时会保留已配置的 `admission_hook`。见[准入错误](errors.md#admission-errors)。
 
 ## 底层服务端桥接
 
@@ -257,7 +275,7 @@ CRM 方法默认按 `@cc.write` 处理。在 `ConcurrencyConfig(mode='read_paral
 
 ### Python SDK
 
-`c_two` 根模块只容纳日常 API：契约装饰器（`crm`、`read`、`write`、`stream`、`topic`、`transfer`、`on_shutdown`）、`Stream` / `StreamCloseReceipt`、`Registration` / `Publisher` / `Subscription` / `Delivery` / `TopicCloseReceipt`、`hold` / `HeldResult`、register / connect / close / unregister / serve / shutdown、`server_address`、`with_call_options`、`with_call_id` / `recover_call` / `query_call` / `CallOutcome`、各 setter、`Runtime`、`ConcurrencyConfig` 和 `error`。端点维护、诊断与契约工具分别位于 `c_two.endpoint`、`c_two.observe` 和 `c_two.contract`；Rust SDK 在 `c_two::` 下使用相同的三个模块。不要为这些能力新增根模块名称、别名或第二种拼写；并发模式和输入生命周期等选项值使用字符串字面量。
+`c_two` 根模块只容纳日常 API：契约装饰器（`crm`、`read`、`write`、`stream`、`topic`、`transfer`、`on_shutdown`）、`Stream` / `StreamCloseReceipt`、`Registration` / `Publisher` / `Subscription` / `Delivery` / `TopicCloseReceipt`、`hold` / `HeldResult`、register / connect / close / unregister / serve / shutdown、`server_address`、`with_call_options`、`with_call_id` / `recover_call` / `query_call` / `CallOutcome`、`AdmissionContext` / `AdmissionDecision` / `CallContext` / `current_call_context`、各 setter、`Runtime`、`ConcurrencyConfig` 和 `error`。端点维护、诊断与契约工具分别位于 `c_two.endpoint`、`c_two.observe` 和 `c_two.contract`；Rust SDK 在 `c_two::` 下使用相同的三个模块。不要为这些能力新增根模块名称、别名或第二种拼写；并发模式和输入生命周期等选项值使用字符串字面量。
 
 应用以 `import c_two as cc` 开始。需要时导入专用模块：
 
@@ -277,7 +295,7 @@ use fastdb::Payload;
 契约导出不选择 Runtime。并发模式为 `'parallel'`、`'exclusive'` 和 `'read_parallel'`；注册输入生命周期为 `'materialized'` 和 `'borrowed'`。
 
 - 编写契约：`@cc.crm`、`@cc.read`、`@cc.write`、`@cc.stream`、`@cc.topic`、`@cc.on_shutdown`、`@cc.transfer`、`cc.hold`、`cc.HeldResult`、`cc.Stream`、`cc.StreamCloseReceipt`、`cc.Registration`、`cc.Publisher`、`cc.Subscription`、`cc.Delivery`、`cc.TopicCloseReceipt`
-- 调用：`cc.with_call_options`（按调用设置截止时间的视图）、`cc.with_call_id`、`cc.recover_call`、`cc.query_call` 和 `cc.CallOutcome`。见[带键一元调用与调用结局](#带键一元调用与调用结局)。
+- 调用与准入：`cc.with_call_options`（按视图设置 `timeout` 与 `metadata`）、`cc.with_call_id`、`cc.recover_call`、`cc.query_call`、`cc.CallOutcome`、`cc.AdmissionContext`、`cc.AdmissionDecision`、`cc.CallContext` 和 `cc.current_call_context`。见[带键一元调用与调用结局](#带键一元调用与调用结局)、[调用元数据、准入钩子与调用上下文](#调用元数据准入钩子与调用上下文)。
 - Runtime：`cc.Runtime`，其实例方法包括 `set_local_endpoint`、`set_server`、`set_client`、`set_relay_anchor`、`register`、`connect`、`unregister`、`start`、`server_id`、`server_address`、`server_credential`、`local_endpoint_context`、`shutdown`、`connection_events`、`lifecycle_snapshot`、`shutdown_outcome`、`memory_stats` 和 `call_execution_snapshot`
 - 默认 Runtime：`cc.register`、`cc.connect`、`cc.unregister`、`cc.serve`、`cc.shutdown`、`cc.server_address`、`cc.endpoint.server_credential`、`cc.endpoint.server_id`、`cc.set_server`、`cc.set_client`、`cc.set_relay_anchor`、`cc.endpoint.set_local_endpoint`；`cc.close(proxy)` 跟随代理自身的连接
 - 契约：`cc.contract.export_descriptor`、`cc.contract.release_ref`、`cc.contract.compile_artifacts`、`cc.contract.diagnostics`

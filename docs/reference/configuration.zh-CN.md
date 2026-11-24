@@ -34,7 +34,7 @@ Rust Core 按 **显式代码或 CLI 覆盖 > 进程环境变量 > `.env` > 默�
 
 Core Runtime 在首次远端业务连接或调用尝试时创建 `client` 域，在首次 Host 启动尝试时创建 `server` 域。冻结后启动失败仍保持冻结。Host 启动及经 relay 注册或注销路由时，业务客户端域保持未激活。Python `thread_local` 调用计入目标 Host 的 `N`。如果同一进程承载资源并远端调用下游资源，两侧各自计费和占用调用槽。两侧继承相同 `M` 时，合计记账上限为 `2M`。进程 RSS 还包含其他内存。
 
-Python `cc.set_client` 与 `cc.set_server` 接受表中的三个容量字段。`cc.set_server` 还接受 `server_id`、`startup_timeout`、`max_payload_size` 和 `max_execution_workers`。身份和启动超时只通过代码设置。显式创建的 `cc.Runtime()` 使用相应实例方法。在 Rust 中，`RuntimeOptions` 拥有客户端容量、本地端点和发现选项，`HostOptions` 拥有服务端身份、启动、承载上限和服务端容量。每个 Node 连接器拥有一个仅使用客户端域的 Core Runtime，接受 [C ABI](c-abi.md#client-domain-endpoints-and-calls) 所列的三个容量选项。
+Python `cc.set_client` 与 `cc.set_server` 接受表中的三个容量字段。`cc.set_server` 还接受 `server_id`、`startup_timeout`、`max_payload_size`、`max_execution_workers` 和 `admission_hook`。身份、启动超时与 `admission_hook` 只通过代码设置。显式创建的 `cc.Runtime()` 使用相应实例方法。在 Rust 中，`RuntimeOptions` 拥有客户端容量、本地端点和发现选项，`HostOptions` 拥有服务端身份、启动、承载上限、服务端容量与可选的准入钩子（`HostOptions::with_admission_hook` / `without_admission_hook`）。每个 Node 连接器拥有一个仅使用客户端域的 Core Runtime，接受 [C ABI](c-abi.md#client-domain-endpoints-and-calls) 所列的三个容量选项。
 
 使用 `cc.set_server(outcome_max_entries=..., outcome_max_retained_bytes=...)` 或对应的 `Runtime.set_server` 方法设置 Host 的调用结局容量。Rust 提供 `HostOptions::with_outcome_max_entries` 和 `HostOptions::with_outcome_max_retained_bytes`。条数上限计入所有已结算的调用结局，包括未保留字节的记录。保留字节预算由该 Host 的所有注册共享，默认为生效的服务端内存预算的四分之一，向下取整且最多为 64 MiB。设为 0 时，成功的空响应仍可恢复，因为它无需保留字节。见[调用结局保留](memory-policy.md#call-outcome-retention)。
 
@@ -75,7 +75,7 @@ Python `cc.set_client` 与 `cc.set_server` 接受表中的三个容量字段。`
 
 每个角色域最多复用四个空闲本地缓冲，每个至少 256 KiB。空闲缓冲的总容量受 2 GiB 和 `M` 中尚未保留的额度约束。新的保留需要空间时，域优先驱逐最早归还的空闲缓冲。空闲缓冲不计入 `used_bytes` 或 `peak_bytes`。
 
-设 `P` 为主机并行度（取不到时为 4），`W` 为配置的 `max_execution_workers`，`C = E = clamp(P, 4, 64)` 分别限制入站分片拷贝和流条目编码的并发量。服务端使用两个异步 I/O 线程，通过检查加法溢出设置 Tokio 阻塞线程上限 `T = max(512, W + C + E + 16)`。三类工作都在提交阻塞闭包前取得许可，直到闭包返回才释放，为监听器启停与收尾留出至少 16 个线程。
+设 `P` 为主机并行度（取不到时为 4），`W` 为配置的 `max_execution_workers`，`C = E = A = clamp(P, 4, 64)` 分别限制入站分片拷贝、流条目编码和 Host 准入钩子的并发量。服务端使用两个异步 I/O 线程，通过检查加法溢出设置 Tokio 阻塞线程上限 `T = max(512, W + C + E + A + 16)`。四类工作都在提交阻塞闭包前取得许可，直到闭包返回才释放，为监听器启停与收尾留出至少 16 个线程。
 
 ## 本地端点位置与平台差异
 
@@ -109,6 +109,6 @@ cc.endpoint.set_local_endpoint(root=str(ipc_dir))
 
 ## 调用等待与准入
 
-Rust 与 Python 的直接 IPC 和 relay HTTP 业务调用，以及生成的 TypeScript 直接 IPC 调用，默认均无截止时间。生成的 TypeScript 显式 relay 与 relay-aware 传输默认将 `callTimeoutMs` 设为 `300000` 毫秒（包括后者选中本机 IPC 的调用），传入 `callTimeoutMs: 0` 才取消默认期限。Python 使用 `cc.with_call_options(proxy, timeout=...)` 限制一次逻辑调用的等待，包括重新获取路由，或传入 `None` 表示无限等待。0 在派发前到期，负数和非有限值无效。同进程同步调用接受继承的等待设置或无限等待。连接截止时间独立设置。
+Rust 与 Python 的直接 IPC 和 relay HTTP 业务调用，以及生成的 TypeScript 直接 IPC 调用，默认均无截止时间。生成的 TypeScript 显式 relay 与 relay-aware 传输默认将一元调用的 `callTimeoutMs` 设为 `300000` 毫秒（包括后者选中本机 IPC 的调用），传入 `callTimeoutMs: 0` 才取消默认期限。主题订阅绝不套用 300 秒一元默认超时；生成的 TypeScript 订阅期限优先级为 `TopicSubscribeOptions.timeoutMs` > `withCallOptions` 视图 `timeoutMs` > 无时限（`null` 显式无时限，`0` 立即到期）。在 Rust（`CallOptions`，已退役 `UnaryCallOptions`）、Python（`cc.with_call_options(proxy, *, timeout=..., metadata=...)`）与生成的 TypeScript（`client.withCallOptions({ timeoutMs?, metadata? })`）三端，可复用客户端视图统一承载超时与有界 `CallMetadata`，覆盖普通一元、带键、恢复、结局查询、服务端流与主题订阅。0 在派发前到期，负数和非有限值无效。同进程同步调用接受继承的等待设置或无限等待。连接截止时间独立设置。
 
 到期结束调用方等待。已派发的调用可继续到真实终态，调用槽随之释放。只有派发前的失败可以安全重提。远端一元调用（包括 `recover_call`）与服务端流均计入 `N`，包括无截止时间的调用。`query_call` 使用独立的控制上限。见[执行准入](runtime-lifecycle.md#execution-admission)和[诊断快照](memory-policy.md#statistics-and-payload-lifetime)。
