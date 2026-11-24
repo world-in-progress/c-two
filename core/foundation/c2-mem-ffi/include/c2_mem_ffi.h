@@ -132,16 +132,18 @@ void c2_mem_ffi_endpoint_context_free(C2MemFfiEndpointContext *endpoint);
  * next may be pending. cancel/free submit stream cancellation without waiting.
  * An unkeyed call passes NULL, 0. A keyed unary borrows 1..128 ASCII
  * [A-Za-z0-9_-] bytes. A stream rejects every supplied key.
+ * metadata_json is NULL for empty metadata or a UTF-8 JSON object of strings.
  * A dispatched unary is never cancelled by dropping its facade. */
-C2MemFfiStatus c2_mem_ffi_call_begin(const C2MemFfiEndpointContext *endpoint, const char *route, const char *method, uint8_t server_stream, const uint64_t *timeout_millis, const uint8_t *call_id, size_t call_id_len, C2MemFfiCall **out, C2MemFfiError **error);
+C2MemFfiStatus c2_mem_ffi_call_begin(const C2MemFfiEndpointContext *endpoint, const char *route, const char *method, uint8_t server_stream, const uint64_t *timeout_millis, const uint8_t *call_id, size_t call_id_len, const char *metadata_json, C2MemFfiCall **out, C2MemFfiError **error);
 /* Recover attaches to a keyed unary without input. Successful completion owns
  * the same local response buffer as call_next. The recovery deadline bounds
  * the caller's wait. Endpoint close still waits for the original recovery
  * record to settle. Query uses the independent control path and returns
- * bounded outcome JSON. Both require a valid call_id and borrow all input
+ * bounded outcome JSON. Both take nullable metadata_json as in call_begin,
+ * require a valid call_id, and borrow all input
  * arguments only until this entry returns. */
-C2MemFfiStatus c2_mem_ffi_recover_call(const C2MemFfiEndpointContext *endpoint, const char *route, const char *method, const uint8_t *call_id, size_t call_id_len, const uint64_t *timeout_millis, C2MemFfiComplete complete, void *user);
-C2MemFfiStatus c2_mem_ffi_query_call(const C2MemFfiEndpointContext *endpoint, const char *route, const uint8_t *call_id, size_t call_id_len, const uint64_t *timeout_millis, C2MemFfiComplete complete, void *user);
+C2MemFfiStatus c2_mem_ffi_recover_call(const C2MemFfiEndpointContext *endpoint, const char *route, const char *method, const uint8_t *call_id, size_t call_id_len, const uint64_t *timeout_millis, const char *metadata_json, C2MemFfiComplete complete, void *user);
+C2MemFfiStatus c2_mem_ffi_query_call(const C2MemFfiEndpointContext *endpoint, const char *route, const uint8_t *call_id, size_t call_id_len, const uint64_t *timeout_millis, const char *metadata_json, C2MemFfiComplete complete, void *user);
 C2MemFfiStatus c2_mem_ffi_call_charge_input(const C2MemFfiCall *call, uint64_t nbytes, C2MemFfiComplete complete, void *user);
 /* On success, dispatch returns JSON with the original call's selected target:
  * {path,serverId,serverInstanceId,connectionId}. IPC identity fields are NULL
@@ -158,7 +160,8 @@ C2MemFfiStatus c2_mem_ffi_call_observe(const C2MemFfiCall *call, const uint64_t 
 C2MemFfiStatus c2_mem_ffi_call_check_deadline(const C2MemFfiCall *call, C2MemFfiError **error);
 void c2_mem_ffi_call_free(C2MemFfiCall *call);
 /* Open a prepared route's topic and await READY. Options are a UTF-8 JSON
- * object with optional start (latest or next) and onLag (skip or error).
+ * object with optional start (latest or next), onLag (skip or error) and
+ * metadata (a JSON object of strings as in call_begin).
  * Defaults are latest and skip. Unknown keys are rejected. The nullable
  * deadline in milliseconds covers opening and all deliveries. The result
  * owns a subscription with JSON {startSeq,topic}. Sequence numbers are decimal

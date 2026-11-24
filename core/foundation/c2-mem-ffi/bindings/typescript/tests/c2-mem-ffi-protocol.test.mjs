@@ -191,6 +191,47 @@ async function unary(endpoint, contract, bytes) {
   } finally { call.close(); }
 }
 
+test('ABI 10 metadata reaches admission for unary, recovery, outcome and topics', {timeout: 150_000}, async () => {
+  await withServer(async ({connector, address, contract}) => {
+    const endpoint = await connector(address);
+    const metadata = {token: 'allowed'};
+    const denied = error => error.code === 724 && error.canonicalName === 'AdmissionDenied'
+      && error.transportPhase === 'pre_dispatch';
+    const expired = error => error.code === 715 && error.transportPhase === 'pre_dispatch';
+    let call;
+    let subscription;
+    try {
+      await endpoint.prepare('echo', contract);
+      for (const invalid of [{Bad: 'case'}, {token: ' trailing'}, {token: 1}, {token: undefined}]) {
+        assert.throws(() => endpoint.beginCall('echo', 'ping', false, null, undefined, invalid), /metadata/i);
+      }
+      await assert.rejects(endpoint.queryCall('echo', 'tracked', null), denied);
+      await assert.rejects(endpoint.queryCall('echo', 'tracked', 0, metadata), expired);
+      assert.throws(() => endpoint.beginCall('echo', 'ping', false, 0, undefined, metadata), expired);
+      call = endpoint.beginCall('echo', 'ping', false, null, 'tracked', metadata);
+      await call.chargeInput(1);
+      await call.dispatch(Uint8Array.of(9));
+      const result = await call.next();
+      assert.deepEqual([...result], [9]);
+      result.release();
+      await assert.rejects(endpoint.recoverCall('echo', 'ping', 'tracked', null), denied);
+      const replay = await endpoint.recoverCall('echo', 'ping', 'tracked', null, metadata);
+      assert.deepEqual([...replay], [9]);
+      replay.release();
+      assert.equal((await endpoint.queryCall('echo', 'tracked', null, metadata)).status, 'succeeded');
+      await assert.rejects(endpoint.openSubscription('echo', 'state'), denied);
+      subscription = await endpoint.openSubscription('echo', 'state', {metadata});
+      const item = (await subscription.next()).value;
+      assert.equal(item.seq, 1n);
+      item.value.release();
+    } finally {
+      await subscription?.close();
+      call?.close();
+      await endpoint.close();
+    }
+  }, {}, 'admission');
+});
+
 test('keyed unary query bypasses a full client and recovery replays once after a deadline', {timeout: 150_000}, async () => {
   await withServer(async ({connector, address, contract, lines, child}) => {
     const endpoint = await connector(address);

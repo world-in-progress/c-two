@@ -88,6 +88,10 @@ test('HTTP call and observation use route name and contract without a route UID'
       return {status:200,async arrayBuffer(){return new ArrayBuffer(0)}};
     }
     assert.equal(init.method, 'POST');
+    const target = new URL(url);
+    assert.equal(target.pathname, '/_c2/calls/call');
+    assert.equal(target.searchParams.get('route'), 'route');
+    assert.equal(target.searchParams.get('method'), 'echo');
     assert.equal(retiredHeader in init.headers, false);
     return {status:200,async arrayBuffer(){return Uint8Array.of(4).buffer}};
   };

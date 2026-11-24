@@ -20,6 +20,7 @@ use c_two::{
 use serde_json::{Value, json};
 
 const WAIT: Duration = Duration::from_secs(30);
+const MESH_PROTOCOL_VERSION: u64 = 8;
 static NEXT_DIRECTORY: AtomicUsize = AtomicUsize::new(0);
 const DESCRIPTOR: &[u8] = br#"{
   "schema":"c-two.contract.v2",
@@ -248,7 +249,7 @@ fn post(url: &str, path: &str, body: &Value) -> Value {
 }
 
 fn envelope(sender: &Relay, message: Value) -> Value {
-    json!({"protocol_version": 7, "sender_relay_id": sender.id, "message": message})
+    json!({"protocol_version": MESH_PROTOCOL_VERSION, "sender_relay_id": sender.id, "message": message})
 }
 
 fn join_and_exchange(a: &Relay, b: &Relay) {
@@ -261,7 +262,10 @@ fn join_and_exchange(a: &Relay, b: &Relay) {
                 json!({"type":"RelayJoin", "relay_id":source.id, "url":source.url}),
             ),
         );
-        assert_eq!(joined["protocol_version"], 7, "{joined}");
+        assert_eq!(
+            joined["protocol_version"], MESH_PROTOCOL_VERSION,
+            "{joined}"
+        );
     }
     for (source, target) in [(a, b), (b, a)] {
         // The owner sends its active route as a genuine mesh DigestDiff reply.
@@ -749,7 +753,10 @@ fn join_without_reachable_peer_urls(a: &Relay, b: &Relay, name: &str) -> Vec<Tcp
                 json!({"type":"RelayJoin", "relay_id":source.id, "url":url}),
             ),
         );
-        assert_eq!(joined["protocol_version"], 7, "{joined}");
+        assert_eq!(
+            joined["protocol_version"], MESH_PROTOCOL_VERSION,
+            "{joined}"
+        );
     }
     let diff = post(
         &a.url,
@@ -773,7 +780,10 @@ fn restore_peer_urls(a: &Relay, b: &Relay) {
                 json!({"type":"RelayJoin", "relay_id":source.id, "url":source.url}),
             ),
         );
-        assert_eq!(joined["protocol_version"], 7, "{joined}");
+        assert_eq!(
+            joined["protocol_version"], MESH_PROTOCOL_VERSION,
+            "{joined}"
+        );
     }
     wait_until(|| {
         peer_status(a, b).as_deref() == Some("Alive")

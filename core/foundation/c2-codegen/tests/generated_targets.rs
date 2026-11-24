@@ -792,7 +792,7 @@ export class Payload {
     std::fs::write(tempdir.path().join("package.json"), r#"{"type":"module"}"#).unwrap();
     std::fs::write(
         tempdir.path().join("smoke.ts"),
-        r#"import { ContractClient, type C2EncodedClientTransport } from "./generated/typescript/c_two_contract.js";
+        r#"import { ContractClient, type C2CallOptions, type C2EncodedClientTransport } from "./generated/typescript/c_two_contract.js";
 import {
   Payload,
   events,
@@ -805,18 +805,22 @@ const warnings: string[] = [];
 console.warn = (...args: unknown[]): void => { warnings.push(args.map(String).join(" ")); };
 let responseReleaseThrows = false;
 let submittedKey: string | undefined;
+const views: Array<C2CallOptions | undefined> = [];
 const transportReleaseError = new Error("transport release failed");
 const transport: C2EncodedClientTransport = {
-  async queryCall(route, _contract, key) {
+  async queryCall(route, _contract, key, view) {
+    views.push(view);
     if (route !== "payload-route" || key !== submittedKey) throw new Error("wrong outcome query");
     return { status:"succeeded", method_name:"echo", result_available:true, result_unavailable_reason:null, error_code:null, error_details_available:false };
   },
-  async recoverCall(route, _contract, method, key) {
+  async recoverCall(route, _contract, method, key, view) {
+    views.push(view);
     if (route !== "payload-route" || method !== "echo" || key !== submittedKey) throw new Error("wrong recovery");
     events.push("transport:recover");
     return Object.assign(new Uint8Array([7]), { release() { events.push("transport:release"); } });
   },
-  async call(_routeName, _contract, _method, request, options) {
+  async call(_routeName, _contract, _method, request, options, view) {
+    views.push(view);
     submittedKey = options?.callId;
     if (typeof request === "function") request();
     events.push("transport:call");
@@ -839,6 +843,48 @@ function requireEvents(expected: readonly string[]): void {
     throw new Error(`unexpected lifecycle events ${actual}; expected ${wanted}`);
   }
 }
+
+const originalMetadata = {trace:"original", token:"before"};
+const firstView = client.withCallOptions({timeoutMs:750, metadata:originalMetadata});
+originalMetadata.trace = "caller mutation";
+const overlay = firstView.withCallOptions({metadata:{token:"after", empty:""}});
+await overlay.method_1_echo(new Payload(), {callId:"overlay"});
+await overlay.queryCall("overlay");
+await overlay.recover_method_1_echo("overlay");
+await firstView.withCallOptions({timeoutMs:null, metadata:null}).method_1_echo(new Payload());
+await firstView.withCallOptions({}).method_1_echo(new Payload());
+await client.method_1_echo(new Payload());
+const mergedOptions = {timeoutMs:750, metadata:{trace:"original", token:"after", empty:""}};
+const expectedViews = [
+  mergedOptions, mergedOptions, mergedOptions, {timeoutMs:null},
+  {timeoutMs:750, metadata:{trace:"original", token:"before"}}, {},
+];
+if (JSON.stringify(views) !== JSON.stringify(expectedViews)) {
+  throw new Error(`wrong call option overlays: ${JSON.stringify(views)}`);
+}
+function rejectOptions(options: C2CallOptions, message: RegExp, parent = client): void {
+  try { parent.withCallOptions(options); }
+  catch (error) { if (error instanceof TypeError && message.test(error.message)) return; throw error; }
+  throw new Error(`accepted invalid call options: ${String(message)}`);
+}
+const maxEntries = client.withCallOptions({metadata:Object.fromEntries(
+  Array.from({length:64}, (_, index) => [`k${index}`, ""]),
+)});
+maxEntries.withCallOptions({metadata:{k0:"replace"}});
+rejectOptions({metadata:{extra:""}}, /64 entries/, maxEntries);
+const maxBytes = client.withCallOptions({metadata:{
+  a:"a".repeat(4096), b:"b".repeat(4096), c:"c".repeat(4096), d:"d".repeat(4092),
+}});
+maxBytes.withCallOptions({metadata:{a:"x".repeat(4096)}});
+rejectOptions({metadata:{e:""}}, /16384 bytes/, maxBytes);
+const invalidKeys: Record<string, string>[] = [{"":"empty key"}, {"Invalid":"case"}, {"x\n":"newline"}];
+for (const invalid of invalidKeys) {
+  rejectOptions({metadata:invalid}, /metadata key/);
+}
+for (const invalid of [" leading", "trailing ", "café", "line\n", "x".repeat(4097)]) {
+  rejectOptions({metadata:{token:invalid}}, /metadata value/);
+}
+events.length = 0;
 
 await client.method_1_echo(new Payload(), {callId:"write-1"});
 if (submittedKey !== "write-1" || (await client.queryCall("write-1")).method_name !== "echo") {

@@ -2,8 +2,9 @@
 use c2_config::{ConfigResolver, ConfigSources, EnvCatalog, LocalEndpointOptions};
 use c2_contract::{ContractRelease, derive_contract_fingerprints_json};
 use c2_server::{
-    ConcurrencyMode, CrmCallback, CrmError, CrmStream, CrmStreamCallback, CrmStreamItem,
-    ResponseMeta, RouteBuildSpec, SchedulerLimits, Server, ServerIpcConfig,
+    AdmissionContext, AdmissionDecision, ConcurrencyMode, CrmCallback, CrmError, CrmStream,
+    CrmStreamCallback, CrmStreamItem, ResponseMeta, RouteBuildSpec, SchedulerLimits, Server,
+    ServerIpcConfig,
 };
 use serde_json::json;
 use std::{
@@ -174,8 +175,19 @@ async fn main() {
     if args.get(2).is_some_and(|mode| mode == "metadata_only") {
         config.outcome_max_retained_bytes = Some(0);
     }
-    let server = Arc::new(Server::new_with_endpoint(endpoint, config).unwrap());
-    let topics_enabled = args.get(2).is_some_and(|mode| mode == "topics");
+    let mut server = Server::new_with_endpoint(endpoint, config).unwrap();
+    let admission_enabled = args.get(2).is_some_and(|mode| mode == "admission");
+    if admission_enabled {
+        server = server.with_admission_hook(Arc::new(|context: &AdmissionContext<'_>| {
+            if context.metadata().get("token") == Some("allowed") {
+                AdmissionDecision::allow()
+            } else {
+                AdmissionDecision::deny("missing token")
+            }
+        }));
+    }
+    let server = Arc::new(server);
+    let topics_enabled = admission_enabled || args.get(2).is_some_and(|mode| mode == "topics");
     let release = if topics_enabled {
         let mut descriptor: serde_json::Value = serde_json::from_slice(DESCRIPTOR).unwrap();
         descriptor["topics"] = json!([{

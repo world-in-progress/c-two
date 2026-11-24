@@ -5,7 +5,7 @@ use serde_json::{Value, json};
 #[test]
 fn unary_artifacts_for_all_three_languages_match_golden_hashes() {
     // The portable matrix and original unary fixtures use the pinned FastDB
-    // 0.3.0 Core SDK and include the ADR 0006 outcome APIs.
+    // 0.3.0 Core SDK and include the ADR 0007 client views and outcome APIs.
     let baseline: Value =
         serde_json::from_str(include_str!("fixtures/unary-artifacts.json")).unwrap();
     for row in baseline.as_array().unwrap() {

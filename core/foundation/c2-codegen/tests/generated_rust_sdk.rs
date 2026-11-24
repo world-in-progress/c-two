@@ -518,6 +518,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     )?;
     let client = contract::ContractClient::new(core_client)?;
     client.method_0_ping()?;
+    let keyed = client.with_call_options(c_two::CallOptions::new().with_metadata_entry("source", "rust")?);
+    keyed.method_0_ping_with_call_id("ping-1")?;
+    assert_eq!(keyed.query_call("ping-1")?.status, c_two::CallOutcomeStatus::Succeeded);
+    keyed.recover_method_0_ping("ping-1")?;
     let wrong = wrong_payload();
     let error = client.method_1_echo(&wrong).err().expect("wrong input must fail before dispatch");
     assert_eq!(error.transport_phase(), Some(c_two::TransportPhase::PreDispatch));

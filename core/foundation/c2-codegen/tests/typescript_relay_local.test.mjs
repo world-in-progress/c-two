@@ -39,7 +39,7 @@ function client(options = {}) {
         abi_hash:hash,signature_hash:hash,max_payload_size:1024,
       }])).buffer}};
     },
-    ipc:{async connect(_address,_timeout,nativeOptions) {
+    ipc:{callTimeoutMs:options.localCallTimeoutMs, async connect(_address,_timeout,nativeOptions) {
       const id = ++state.connections;
       assert.deepEqual(nativeOptions.expectedServerIdentity,{serverId:'s',serverInstanceId:'i'});
       assert.equal('expectedRouteToken' in nativeOptions,false);
@@ -53,7 +53,9 @@ function client(options = {}) {
           state.prepared.push({id,route});
           return {serverId:'s',serverInstanceId:'i',connectionId:String(id)};
         },
-        beginCall(route) {if(state.deactivated)throw nativeError(707,'ResourceClosed');return {
+        beginCall(route, method, stream, timeoutMs, callId, metadata) {
+          options.onBegin?.({route, method, stream, timeoutMs, callId, metadata});
+          if(state.deactivated)throw nativeError(707,'ResourceClosed');return {
           async chargeInput(){}, async dispatch(){state.calls.push(route);return {path:'DirectIpc',serverId:'s',serverInstanceId:'i',connectionId:String(id)}},
           async next(){const value=Uint8Array.of(id + state.generation);value.release=()=>{};return value},
           checkDeadline(){},close(){},cancel(){},async observe(){return {completed:true,error:null,completeItems:1n}},
@@ -136,4 +138,27 @@ test('stream close retires an endpoint when its asynchronous preparation fails',
   await call('manager');
   assert.equal(state.connections,2);
   await transport.close();
+});
+
+test('relay-local dispatch uses the explicit view instead of the IPC default timeout', async () => {
+  const calls = [];
+  const {state, transport} = client({localCallTimeoutMs:5, onBegin: call => calls.push(call)});
+  const run = (view, key) =>
+    transport.call('builder', contract, 'ping', () => new Uint8Array(), {callId:key}, view);
+  const metadata = {token:'tracked'};
+  try {
+    await run({timeoutMs:null, metadata}, 'unlimited');
+    await run({timeoutMs:5000, metadata}, 'finite');
+    assert.deepEqual(calls.map(({callId, metadata}) => [callId, metadata]), [
+      ['unlimited', {token:'tracked'}], ['finite', {token:'tracked'}],
+    ]);
+    assert.equal(calls[0].timeoutMs, null);
+    assert.ok(calls[1].timeoutMs >= 2500 && calls[1].timeoutMs <= 5000);
+    await assert.rejects(run({timeoutMs:0, metadata}, 'expired'), error =>
+      error.code === 715 && error.transportPhase === 'pre_dispatch');
+    assert.equal(calls.length, 2);
+    assert.equal(state.connections, 1);
+  } finally {
+    await transport.close();
+  }
 });

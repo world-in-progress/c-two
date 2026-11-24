@@ -113,8 +113,8 @@ test('native next uses an external buffer and releases it once after detaching a
         }
       }
       uint32_t c2_mem_ffi_call_begin(void *endpoint, const char *route, const char *method,
-          uint8_t stream, const uint64_t *timeout, const uint8_t *id, size_t id_len, void **out, void **error) {
-        (void)endpoint; (void)route; (void)method; (void)timeout;
+          uint8_t stream, const uint64_t *timeout, const uint8_t *id, size_t id_len, const char *metadata, void **out, void **error) {
+        (void)endpoint; (void)route; (void)method; (void)timeout; (void)metadata;
         Call *call = calloc(1, sizeof(Call));
         pthread_mutex_init(&call->mutex, NULL); pthread_cond_init(&call->released, NULL);
         call->references = 1; call->stream = stream;
@@ -274,7 +274,7 @@ test('native next uses an external buffer and releases it once after detaching a
       static void *watched_data, *watched_hint;
       static bool watched_ran, watched_freed;
       static void watched_free(void *ptr) {
-        if (ptr == watched_hint) { watched_freed = true; return; }
+        if (watched_hint != NULL && ptr == watched_hint) { watched_freed = true; return; }
         free(ptr);
       }
       static void watched_finalizer(napi_env env, void *data, void *hint) {
@@ -423,7 +423,7 @@ test('ABI 10 native completion survives Worker termination after a pending call'
       }
       #[unsafe(no_mangle)] pub extern "C" fn c2_mem_ffi_endpoint_context_free(_: *mut c_void) {}
       #[unsafe(no_mangle)] pub unsafe extern "C" fn c2_mem_ffi_call_begin(
-          _: *const c_void, _: *const c_char, _: *const c_char, _: u8, _: *const u64, _: *const u8, _: usize,
+          _: *const c_void, _: *const c_char, _: *const c_char, _: u8, _: *const u64, _: *const u8, _: usize, _: *const c_char,
           out: *mut *mut c_void, error: *mut *mut c_void) -> u32 {
         unsafe { *out = 3usize as *mut c_void; *error = std::ptr::null_mut(); } 0
       }

@@ -96,6 +96,7 @@ fn raw_call_begin_rejects_keyed_stream_and_invalid_length_delimited_keys() {
                 ptr::null(),
                 id,
                 len,
+                ptr::null(),
                 &mut call,
                 &mut error,
             )
@@ -229,6 +230,9 @@ impl Fixture {
         Self::with_limits(json!({"memoryBudgetBytes": budget}))
     }
     fn with_limits(limits: Value) -> Self {
+        Self::with_host_options(limits, HostOptions::default().without_relay())
+    }
+    fn with_host_options(limits: Value, host_options: HostOptions) -> Self {
         let process_state = crate::tests::PROCESS_STATE_LOCK.lock().unwrap();
         assert_eq!(c2_mem_ffi_abi_version(), 10);
         let root = tempfile::tempdir().unwrap();
@@ -247,9 +251,7 @@ impl Fixture {
                 ConfigSources::empty(),
             )
             .unwrap();
-        let host = runtime
-            .host(HostOptions::default().without_relay())
-            .unwrap();
+        let host = runtime.host(host_options).unwrap();
         let release = ContractRelease::from_descriptor_json(DESCRIPTOR).unwrap();
         let registration = host
             .register(
@@ -345,6 +347,7 @@ impl Fixture {
                     ptr::null(),
                     ptr::null(),
                     0,
+                    ptr::null(),
                     &mut call,
                     &mut error,
                 )
@@ -556,6 +559,7 @@ fn dispatch_error_keeps_typed_failure_and_original_target() {
                 ptr::null(),
                 ptr::null(),
                 0,
+                ptr::null(),
                 &mut call,
                 &mut error,
             )
@@ -661,6 +665,7 @@ fn cancelling_input_budget_wait_does_not_wait_for_a_held_item_to_release() {
                 ptr::null(),
                 ptr::null(),
                 0,
+                ptr::null(),
                 &mut second,
                 &mut error,
             )
@@ -1100,6 +1105,7 @@ fn route_refusal_and_replacement_preserve_other_route_on_same_endpoint() {
                     ptr::null(),
                     ptr::null(),
                     0,
+                    ptr::null(),
                     &mut call,
                     &mut error,
                 )
@@ -1550,4 +1556,133 @@ fn relay_endpoints_prepare_concurrently_and_share_one_client_domain() {
     }
     let _ = local_host.shutdown();
     let _ = remote_host.shutdown();
+}
+
+#[test]
+fn abi_metadata_uses_strict_json_and_rejects_duplicate_decoded_keys() {
+    for invalid_json in [
+        c"{\"a\":\"1\",\"a\":\"2\"}",
+        cr#"{"a":"1","\u0061":"2"}"#,
+        c"null",
+        c"[]",
+        c"{\"a\":123}",
+        c"{\"UPPER\":\"token\"}",
+        c"{\"a\":\" trailing\"}",
+    ] {
+        assert!(
+            parse_metadata(invalid_json.as_ptr()).is_err(),
+            "{invalid_json:?}"
+        );
+    }
+    assert!(parse_metadata(ptr::null()).unwrap().is_empty());
+    assert_eq!(
+        parse_metadata(cr#"{"a":"first","b":"second"}"#.as_ptr())
+            .unwrap()
+            .get("b"),
+        Some("second")
+    );
+    assert!(
+        serde_json::from_str::<SubscriptionPolicy>(r#"{"metadata":{"a":"1","a":"2"}}"#).is_err()
+    );
+    assert!(serde_json::from_str::<SubscriptionPolicy>(r#"{"metadata":null}"#).is_err());
+}
+
+#[test]
+fn metadata_is_owned_at_the_abi_and_host_denial_is_projected() {
+    use c2_core::{AdmissionContext, AdmissionDecision, AdmissionOperation};
+    let (send, observations) = mpsc::channel();
+    let fixture = Fixture::with_host_options(
+        json!({}),
+        HostOptions::default()
+            .without_relay()
+            .with_admission_hook(Arc::new(move |context: &AdmissionContext<'_>| {
+                let token = context.metadata().get("token").map(str::to_owned);
+                send.send((context.operation(), token.clone())).unwrap();
+                if token.as_deref() == Some("allowed") {
+                    AdmissionDecision::allow()
+                } else {
+                    AdmissionDecision::deny("missing token")
+                }
+            })),
+    );
+    let route = c"items".as_ptr();
+    let id = b"probe";
+    let query = |metadata_json, timeout| {
+        async_result(|callback, user| unsafe {
+            c2_mem_ffi_query_call(
+                fixture.endpoint,
+                route,
+                id.as_ptr(),
+                id.len(),
+                timeout,
+                metadata_json,
+                callback,
+                user,
+            )
+        })
+    };
+    let result = query(cr#"{"token":"allowed"}"#.as_ptr(), ptr::null());
+    assert_eq!(unsafe { metadata(result) }["status"], "unknown");
+    unsafe { c2_mem_ffi_result_free(result) };
+    let refusal = unsafe { error_details(query(ptr::null(), ptr::null())) };
+    assert_eq!(refusal["code"], 724);
+    assert_eq!(refusal["canonicalName"], "AdmissionDenied");
+    assert_eq!(refusal["transportPhase"], "pre_dispatch");
+    let expired = unsafe { error_details(query(cr#"{"token":"allowed"}"#.as_ptr(), &0)) };
+    assert_eq!(expired["code"], 715);
+    assert_eq!(expired["transportPhase"], "pre_dispatch");
+    assert_eq!(
+        observations.try_iter().collect::<Vec<_>>(),
+        [
+            (
+                AdmissionOperation::QueryOutcome,
+                Some("allowed".to_string())
+            ),
+            (AdmissionOperation::QueryOutcome, None),
+        ]
+    );
+}
+
+#[test]
+fn query_deadline_includes_time_queued_behind_a_blocking_worker() {
+    let fixture = Fixture::new(64);
+    let endpoint = &unsafe { &*fixture.endpoint }.0;
+    let client = endpoint.bound_client("items").unwrap();
+    let operation = endpoint.begin_operation().unwrap();
+    let executor = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .max_blocking_threads(1)
+        .build()
+        .unwrap();
+    let (entered, ready) = mpsc::channel();
+    let (release, gate) = mpsc::channel();
+    let blocker = executor.spawn_blocking(move || {
+        entered.send(()).unwrap();
+        gate.recv().unwrap();
+    });
+    ready.recv_timeout(WAIT).unwrap();
+    let limit = Duration::from_millis(50);
+    executor.block_on(async {
+        use std::task::Poll;
+        let started = Instant::now();
+        let mut query = Box::pin(query_bound_client(
+            operation,
+            client,
+            "queued".into(),
+            Some(limit),
+            CallMetadata::empty(),
+            started,
+        ));
+        std::future::poll_fn(|task| {
+            assert!(query.as_mut().poll(task).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        tokio::time::sleep_until((started + limit).into()).await;
+        release.send(()).unwrap();
+        blocker.await.unwrap();
+        let error = query.await.unwrap_err();
+        assert_eq!(error_value(&error)["code"], 715);
+        assert_eq!(error.transport_phase(), Some(TransportPhase::PreDispatch));
+    });
 }

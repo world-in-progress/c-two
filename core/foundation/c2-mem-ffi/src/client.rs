@@ -2,15 +2,16 @@
 use super::*;
 use c2_contract::ExpectedRouteContract;
 use c2_core::{
-    CallDispatchTarget, CallOptions, CallRecordOutcome, CallScope, CallState, CallTimeout, Client,
-    Connect, CoreResponseStream, CoreTopicSubscription, Error, HeldResponse, LagPolicy,
-    LifecycleError, ObservedPath, PreparedCall, Runtime, RuntimeOptions, SubscribeOptions,
-    TopicStart, TransportPhase,
+    CallDispatchTarget, CallMetadata, CallOptions, CallOutcome, CallRecordOutcome, CallScope,
+    CallState, CallTimeout, Client, Connect, CoreResponseStream, CoreTopicSubscription, Error,
+    HeldResponse, LagPolicy, LifecycleError, ObservedPath, PreparedCall, Runtime, RuntimeOptions,
+    SubscribeOptions, TopicStart, TransportPhase,
 };
 use c2_error::{C2Error, ErrorCode};
 use c2_ipc::IpcStreamCancellation;
 use futures_util::FutureExt;
 use parking_lot::Mutex;
+use serde::de::{self, Deserializer, MapAccess, Visitor};
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::ffi::CString;
@@ -338,6 +339,71 @@ fn parse_options(value: *const c_char, allowed: &[&str]) -> Result<Value, Error>
     }
     Ok(value)
 }
+#[derive(Default)]
+struct MetadataObject(CallMetadata);
+
+impl<'de> de::Deserialize<'de> for MetadataObject {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct MetadataVisitor;
+
+        impl<'de> Visitor<'de> for MetadataVisitor {
+            type Value = MetadataObject;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a call metadata object with string values")
+            }
+
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+                let mut entries = Vec::new();
+                while let Some(entry) = map.next_entry::<String, String>()? {
+                    if entries.len() == c2_config::MAX_CALL_METADATA_ENTRIES {
+                        return Err(de::Error::custom("too many call metadata entries"));
+                    }
+                    entries.push(entry);
+                }
+                CallMetadata::from_entries(entries)
+                    .map(MetadataObject)
+                    .map_err(de::Error::custom)
+            }
+        }
+
+        deserializer.deserialize_map(MetadataVisitor)
+    }
+}
+
+fn parse_metadata(value: *const c_char) -> Result<CallMetadata, Error> {
+    if value.is_null() {
+        return Ok(CallMetadata::empty());
+    }
+    serde_json::from_str::<MetadataObject>(&text(value)?)
+        .map(|object| object.0)
+        .map_err(|error| invalid(format!("invalid call metadata: {error}")))
+}
+
+fn call_options(limit: Option<Duration>, metadata: CallMetadata) -> CallOptions {
+    CallOptions::with_timeout(limit.map_or(CallTimeout::Unlimited, CallTimeout::After))
+        .with_metadata(metadata)
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SubscriptionPolicy {
+    #[serde(default = "default_topic_start")]
+    start: Value,
+    #[serde(default = "default_topic_lag", rename = "onLag")]
+    on_lag: Value,
+    #[serde(default)]
+    metadata: MetadataObject,
+}
+
+fn default_topic_start() -> Value {
+    Value::String("latest".to_owned())
+}
+
+fn default_topic_lag() -> Value {
+    Value::String("skip".to_owned())
+}
+
 fn unsigned_option(options: &Value, key: &str) -> Result<Option<u64>, Error> {
     options
         .get(key)
@@ -946,6 +1012,7 @@ pub unsafe extern "C" fn c2_mem_ffi_call_begin(
     limit: *const u64,
     call_id: *const u8,
     call_id_len: usize,
+    metadata_json: *const c_char,
     out: *mut *mut C2MemFfiCall,
     error: *mut *mut C2MemFfiError,
 ) -> C2MemFfiStatus {
@@ -975,17 +1042,14 @@ pub unsafe extern "C" fn c2_mem_ffi_call_begin(
             let method = text(method)?;
             let _operation = endpoint.begin_operation()?;
             let client = endpoint.bound_client(&route)?;
-            let limit = timeout(limit).map_or(CallTimeout::Unlimited, CallTimeout::After);
+            let client = client
+                .with_call_options(call_options(timeout(limit), parse_metadata(metadata_json)?));
             let prepared = if stream == 1 {
-                client
-                    .with_call_options(CallOptions::with_timeout(limit))
-                    .begin_stream(&method)?
+                client.begin_stream(&method)?
+            } else if let Some(id) = &call_id {
+                client.begin_keyed_call(&method, id)?
             } else {
-                let mut options = c2_core::UnaryCallOptions::new().with_timeout(limit);
-                if let Some(id) = &call_id {
-                    options = options.with_call_id(id).map_err(invalid)?;
-                }
-                client.begin_unary_with_options(&method, options)?
+                client.begin_call(&method)?
             };
             let scope = prepared.scope();
             Ok(C2MemFfiCall(Arc::new(Call {
@@ -1030,6 +1094,7 @@ pub unsafe extern "C" fn c2_mem_ffi_recover_call(
     call_id: *const u8,
     call_id_len: usize,
     limit: *const u64,
+    metadata_json: *const c_char,
     complete: C2MemFfiComplete,
     user: *mut std::ffi::c_void,
 ) -> C2MemFfiStatus {
@@ -1042,11 +1107,8 @@ pub unsafe extern "C" fn c2_mem_ffi_recover_call(
         let operation = endpoint.begin_operation()?;
         let client = endpoint.bound_client(&text(route)?)?;
         let id = read_call_id(call_id, call_id_len)?;
-        let encoded = client.begin_recover(
-            &text(method)?,
-            &id,
-            limit.map_or(CallTimeout::Unlimited, CallTimeout::After),
-        )?;
+        let client = client.with_call_options(call_options(limit, parse_metadata(metadata_json)?));
+        let encoded = client.begin_recover(&text(method)?, &id)?;
         Ok::<_, Error>((encoded, operation, id))
     })();
     launch(complete, user, async move {
@@ -1085,6 +1147,7 @@ pub unsafe extern "C" fn c2_mem_ffi_query_call(
     call_id: *const u8,
     call_id_len: usize,
     limit: *const u64,
+    metadata_json: *const c_char,
     complete: C2MemFfiComplete,
     user: *mut std::ffi::c_void,
 ) -> C2MemFfiStatus {
@@ -1098,34 +1161,50 @@ pub unsafe extern "C" fn c2_mem_ffi_query_call(
         let client = endpoint.bound_client(&text(route)?)?;
         let id = read_call_id(call_id, call_id_len)?;
         let limit = timeout(limit);
-        Ok::<_, Error>((operation, client, id, limit))
+        let metadata = parse_metadata(metadata_json)?;
+        Ok::<_, Error>((operation, client, id, limit, metadata))
     })();
     launch(complete, user, async move {
-        let (operation, client, id, limit) = args?;
-        tokio::task::spawn_blocking(move || {
-            let _operation = operation;
-            let timeout = limit.map_or(CallTimeout::Unlimited, |duration|
-                CallTimeout::After(duration.saturating_sub(started.elapsed())));
-            let outcome = client.query_call(&id, timeout)?;
-            use c2_core::{CallOutcomeStatus, ResultUnavailableReason};
-            Ok(Output::Json(json!({
-                "status": match outcome.status {
-                    CallOutcomeStatus::InFlight => "in_flight",
-                    CallOutcomeStatus::Succeeded => "succeeded",
-                    CallOutcomeStatus::Failed => "failed",
-                    CallOutcomeStatus::Unknown => "unknown",
-                },
-                "method_name": outcome.method_name,
-                "result_available": outcome.result_available,
-                "result_unavailable_reason": outcome.result_unavailable_reason.map(|reason| match reason {
-                    ResultUnavailableReason::NotRetained => "not_retained",
-                    ResultUnavailableReason::Evicted => "evicted",
-                }),
-                "error_code": outcome.error_code.map(|code| code as u32),
-                "error_details_available": outcome.error_details_available,
-            })))
-        }).await.map_err(|error| invalid(error.to_string()))?
+        let (operation, client, id, limit, metadata) = args?;
+        let outcome = query_bound_client(operation, client, id, limit, metadata, started).await?;
+        use c2_core::{CallOutcomeStatus, ResultUnavailableReason};
+        Ok(Output::Json(json!({
+            "status": match outcome.status {
+                CallOutcomeStatus::InFlight => "in_flight",
+                CallOutcomeStatus::Succeeded => "succeeded",
+                CallOutcomeStatus::Failed => "failed",
+                CallOutcomeStatus::Unknown => "unknown",
+            },
+            "method_name": outcome.method_name,
+            "result_available": outcome.result_available,
+            "result_unavailable_reason": outcome.result_unavailable_reason.map(|reason| match reason {
+                ResultUnavailableReason::NotRetained => "not_retained",
+                ResultUnavailableReason::Evicted => "evicted",
+            }),
+            "error_code": outcome.error_code.map(|code| code as u32),
+            "error_details_available": outcome.error_details_available,
+        })))
     })
+}
+
+async fn query_bound_client(
+    operation: EndpointOperation,
+    client: Client,
+    id: String,
+    limit: Option<Duration>,
+    metadata: CallMetadata,
+    started: Instant,
+) -> Result<CallOutcome, Error> {
+    tokio::task::spawn_blocking(move || {
+        let _operation = operation;
+        // The original budget includes the wait for this blocking worker.
+        let remaining = limit.map(|duration| duration.saturating_sub(started.elapsed()));
+        client
+            .with_call_options(call_options(remaining, metadata))
+            .query_call(&id)
+    })
+    .await
+    .map_err(|error| invalid(error.to_string()))?
 }
 
 #[unsafe(no_mangle)]
@@ -1452,17 +1531,20 @@ pub unsafe extern "C" fn c2_mem_ffi_subscription_open(
             .map_err(|error| invalid(error.to_string()))?;
         let route = text(route)?;
         let topic = text(topic)?;
-        let options = parse_options(options, &["start", "onLag"])?;
-        let start = match options.get("start") {
-            None => TopicStart::Latest,
-            Some(value) if value == "latest" => TopicStart::Latest,
-            Some(value) if value == "next" => TopicStart::Next,
+        let options = text(options)?;
+        if !options.trim_start().starts_with('{') {
+            return Err(invalid("subscription options must be an object"));
+        }
+        let options: SubscriptionPolicy =
+            serde_json::from_str(&options).map_err(|error| invalid(error.to_string()))?;
+        let start = match options.start.as_str() {
+            Some("latest") => TopicStart::Latest,
+            Some("next") => TopicStart::Next,
             _ => return Err(invalid("invalid subscription start")),
         };
-        let on_lag = match options.get("onLag") {
-            None => LagPolicy::Skip,
-            Some(value) if value == "skip" => LagPolicy::Skip,
-            Some(value) if value == "error" => LagPolicy::Error,
+        let on_lag = match options.on_lag.as_str() {
+            Some("skip") => LagPolicy::Skip,
+            Some("error") => LagPolicy::Error,
             _ => return Err(invalid("invalid subscription onLag")),
         };
         let operation = endpoint.begin_operation()?;
@@ -1470,17 +1552,16 @@ pub unsafe extern "C" fn c2_mem_ffi_subscription_open(
             route,
             topic,
             SubscribeOptions { start, on_lag },
+            options.metadata.0,
             deadline,
             operation,
         ))
     })();
     launch(complete, user, async move {
-        let (route, topic, options, deadline, operation) = args?;
+        let (route, topic, options, metadata, deadline, operation) = args?;
         let client = endpoint.bound_client(&route)?;
-        let call_options =
-            CallOptions::with_timeout(deadline.map_or(CallTimeout::Unlimited, |deadline| {
-                CallTimeout::After(deadline.saturating_duration_since(Instant::now()))
-            }));
+        let remaining = deadline.map(|deadline| deadline.saturating_duration_since(Instant::now()));
+        let call_options = call_options(remaining, metadata);
         let core = client
             .subscribe_async(&topic, options, call_options)
             .await?;

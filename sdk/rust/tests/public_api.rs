@@ -745,8 +745,8 @@ fn client_and_host_freeze_only_their_own_role() {
 }
 
 #[test]
-fn sdk_call_timeout_options_resolve_the_caller_deadline() {
-    use c_two::{CallOptions, CallTimeout};
+fn sdk_call_options_hold_metadata_and_resolve_the_caller_deadline() {
+    use c_two::{CallMetadata, CallMetadataError, CallOptions, CallTimeout};
 
     assert_eq!(CallOptions::new().timeout(), CallTimeout::Inherit);
     assert_eq!(
@@ -758,6 +758,16 @@ fn sdk_call_timeout_options_resolve_the_caller_deadline() {
         CallTimeout::try_after_seconds(0.0).unwrap(),
         CallTimeout::After(Duration::ZERO)
     );
+    let invalid: Result<CallMetadata, CallMetadataError> =
+        CallMetadata::from_entries([("Trace", "invalid")]);
+    assert!(invalid.is_err());
+    let options = CallOptions::with_timeout(CallTimeout::Unlimited)
+        .with_metadata_entry("trace", "initial")
+        .unwrap();
+    let cleared = options.clone().clear_metadata();
+    assert_eq!(options.metadata().get("trace"), Some("initial"));
+    assert!(cleared.metadata().is_empty());
+    assert_eq!(cleared.timeout(), CallTimeout::Unlimited);
 }
 
 #[cfg(unix)]

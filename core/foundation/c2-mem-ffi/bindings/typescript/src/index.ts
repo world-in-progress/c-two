@@ -40,6 +40,7 @@ export interface NativeCall {
 }
 
 export interface SubscribeOptions {
+  readonly metadata?: Readonly<Record<string, string>>;
   readonly start?: "latest" | "next";
   readonly onLag?: "skip" | "error";
 }
@@ -112,10 +113,10 @@ export interface CallOutcome {
 export interface NativeEndpointContext {
   prepare(routeName: string, contract: object, timeoutMs?: number | null): Promise<NativePreparedRoute>;
   connectionSnapshot(routeName: string): NativeConnectionSnapshot | null;
-  beginCall(routeName: string, method: string, serverStream: boolean, timeoutMs: number | null): NativeCall;
-  beginCall(routeName: string, method: string, serverStream: false, timeoutMs: number | null, callId?: string): NativeCall;
-  recoverCall(routeName: string, method: string, callId: string, timeoutMs: number | null): Promise<NativeBuffer>;
-  queryCall(routeName: string, callId: string, timeoutMs: number | null): Promise<CallOutcome>;
+  beginCall(routeName: string, method: string, serverStream: boolean, timeoutMs: number | null, callId?: undefined, metadata?: Readonly<Record<string, string>>): NativeCall;
+  beginCall(routeName: string, method: string, serverStream: false, timeoutMs: number | null, callId?: string, metadata?: Readonly<Record<string, string>>): NativeCall;
+  recoverCall(routeName: string, method: string, callId: string, timeoutMs: number | null, metadata?: Readonly<Record<string, string>>): Promise<NativeBuffer>;
+  queryCall(routeName: string, callId: string, timeoutMs: number | null, metadata?: Readonly<Record<string, string>>): Promise<CallOutcome>;
   openSubscription(routeName: string, topic: string, options?: SubscribeOptions, timeoutMs?: number | null): Promise<SubscriptionHandle>;
   deactivate(): void;
   close(): Promise<void>;
@@ -309,9 +310,21 @@ class ProjectedSubscription implements SubscriptionHandle {
 }
 
 type NativeEndpoint = Omit<NativeEndpointContext, "openSubscription" | "beginCall"> & {
-  beginCall(routeName: string, method: string, serverStream: boolean, timeoutMs: number | null, callId?: string): NativeCall;
+  beginCall(routeName: string, method: string, serverStream: boolean, timeoutMs: number | null, callId?: string, metadata?: Readonly<Record<string, string>>): NativeCall;
   openSubscription(routeName: string, topic: string, options: SubscribeOptions, timeoutMs: number | null): Promise<NativeSubscriptionOpen>;
 };
+
+function copyMetadata(metadata: Readonly<Record<string, string>> | undefined): Readonly<Record<string, string>> | undefined {
+  if (metadata === undefined) return undefined;
+  if (metadata === null || typeof metadata !== "object" || Array.isArray(metadata)) {
+    throw new TypeError("Metadata must be a record of strings.");
+  }
+  const entries = Object.entries(metadata);
+  for (const [key, value] of entries) {
+    if (typeof value !== "string") throw new TypeError(`Metadata value for ${key} must be a string.`);
+  }
+  return Object.fromEntries(entries);
+}
 
 class ProjectedEndpoint implements NativeEndpointContext {
   constructor(private readonly native: NativeEndpoint) {}
@@ -323,19 +336,23 @@ class ProjectedEndpoint implements NativeEndpointContext {
   connectionSnapshot(routeName: string): NativeConnectionSnapshot | null {
     return nativeValue(() => this.native.connectionSnapshot(routeName));
   }
-  beginCall(routeName: string, method: string, serverStream: boolean, timeoutMs: number | null): NativeCall;
-  beginCall(routeName: string, method: string, serverStream: false, timeoutMs: number | null, callId?: string): NativeCall;
-  beginCall(routeName: string, method: string, serverStream: boolean, timeoutMs: number | null, callId?: string): NativeCall {
-    return new ProjectedCall(nativeValue(() => this.native.beginCall(routeName, method, serverStream, timeoutMs, callId)));
+  beginCall(routeName: string, method: string, serverStream: boolean, timeoutMs: number | null, callId?: undefined, metadata?: Readonly<Record<string, string>>): NativeCall;
+  beginCall(routeName: string, method: string, serverStream: false, timeoutMs: number | null, callId?: string, metadata?: Readonly<Record<string, string>>): NativeCall;
+  beginCall(routeName: string, method: string, serverStream: boolean, timeoutMs: number | null, callId?: string, metadata?: Readonly<Record<string, string>>): NativeCall {
+    return new ProjectedCall(nativeValue(() => this.native.beginCall(routeName, method, serverStream, timeoutMs, callId, copyMetadata(metadata))));
   }
-  recoverCall(routeName: string, method: string, callId: string, timeoutMs: number | null): Promise<NativeBuffer> {
-    return nativePromise(() => this.native.recoverCall(routeName, method, callId, timeoutMs));
+  recoverCall(routeName: string, method: string, callId: string, timeoutMs: number | null, metadata?: Readonly<Record<string, string>>): Promise<NativeBuffer> {
+    return nativePromise(() => this.native.recoverCall(routeName, method, callId, timeoutMs, copyMetadata(metadata)));
   }
-  queryCall(routeName: string, callId: string, timeoutMs: number | null): Promise<CallOutcome> {
-    return nativePromise(() => this.native.queryCall(routeName, callId, timeoutMs));
+  queryCall(routeName: string, callId: string, timeoutMs: number | null, metadata?: Readonly<Record<string, string>>): Promise<CallOutcome> {
+    return nativePromise(() => this.native.queryCall(routeName, callId, timeoutMs, copyMetadata(metadata)));
   }
   async openSubscription(routeName: string, topic: string, options: SubscribeOptions = {}, timeoutMs: number | null = null): Promise<SubscriptionHandle> {
-    return new ProjectedSubscription(await nativePromise(() => this.native.openSubscription(routeName, topic, options, timeoutMs)));
+    const { metadata, ...policy } = options;
+    return new ProjectedSubscription(await nativePromise(() => this.native.openSubscription(routeName, topic, {
+      ...policy,
+      ...(metadata === undefined ? {} : { metadata: copyMetadata(metadata)! }),
+    }, timeoutMs)));
   }
   deactivate(): void { nativeValue(() => this.native.deactivate()); }
   close(): Promise<void> { return nativePromise(() => this.native.close()); }
