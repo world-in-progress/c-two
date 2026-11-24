@@ -65,6 +65,7 @@ class TestErrorCode:
             "CallIdConflict": 721,
             "CallResultUnavailable": 722,
             "CallOutcomeUnknown": 723,
+            "AdmissionDenied": 724,
         }
         assert {member.name: member.value for member in ErrorCode} == expected
 
@@ -349,7 +350,7 @@ class TestPublicSurface:
             'ProtocolViolation', 'FallbackDenied', 'CallDeadlineExceeded',
             'UnsupportedCallMode', 'CallCapacityExceeded', 'CallCancelled', 'RouteConflict',
             'SubscriptionLagged',
-            'CallIdConflict', 'CallResultUnavailable', 'CallOutcomeUnknown',
+            'CallIdConflict', 'CallResultUnavailable', 'CallOutcomeUnknown', 'AdmissionDenied',
         }
         assert set(error.__all__) == expected
 

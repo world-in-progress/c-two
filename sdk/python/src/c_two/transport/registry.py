@@ -38,10 +38,11 @@ import signal
 import sys
 import threading
 from inspect import getattr_static
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, TypeVar
 
+from c_two._call_context import AdmissionContext, AdmissionDecision, _UNSET, _Unset
 from c_two.crm.contract import CRMContract, crm_contract, crm_contract_identity
 from c_two.crm.conformance import validate_resource_conformance
 from c_two.crm.meta import _SHUTDOWN_ATTR, get_shutdown_method
@@ -65,11 +66,6 @@ if TYPE_CHECKING:
 
 CRM = TypeVar('CRM')
 log = logging.getLogger(__name__)
-class _Unset:
-    pass
-
-
-_UNSET = _Unset()
 
 
 def _print_serve_message(message: str) -> None:
@@ -213,12 +209,17 @@ class Runtime:
         max_outstanding_calls: int | None | _Unset = _UNSET,
         outcome_max_entries: int | None | _Unset = _UNSET,
         outcome_max_retained_bytes: int | None | _Unset = _UNSET,
+        admission_hook: Callable[[AdmissionContext], AdmissionDecision | None] | None | _Unset = _UNSET,
     ) -> None:
-        """Update Host configuration. Omitted fields keep their overrides; None inherits."""
+        """Update Host configuration, which freezes when the Host starts.
+
+        Omitted fields keep their overrides. Pass ``admission_hook=None`` to clear
+        the hook or pass the same callable again to keep it on a frozen Host.
+        """
         self._runtime_session.update_server_config(
             _UNSET, server_id, startup_timeout, max_payload_size, max_execution_workers,
             memory_budget_bytes, file_spill_budget_bytes, max_outstanding_calls,
-            outcome_max_entries, outcome_max_retained_bytes,
+            outcome_max_entries, outcome_max_retained_bytes, admission_hook,
         )
 
     def set_client(
@@ -472,7 +473,7 @@ class Runtime:
                 if address is None and server is not None
                 else None
             )
-            if local is not None and local[1] is not None and local[1].snapshot().closed:
+            if local is not None and local[1] is not None and local[1].is_closed:
                 local = None
             local_copy_tracker = runtime_session.local_copy_tracker()
 
@@ -884,6 +885,7 @@ def set_server(
     max_outstanding_calls: int | None | _Unset = _UNSET,
     outcome_max_entries: int | None | _Unset = _UNSET,
     outcome_max_retained_bytes: int | None | _Unset = _UNSET,
+    admission_hook: Callable[[AdmissionContext], AdmissionDecision | None] | None | _Unset = _UNSET,
 ) -> None:
     """Update the default Runtime's Host configuration."""
     _get_default_runtime().set_server(
@@ -896,6 +898,7 @@ def set_server(
         max_outstanding_calls=max_outstanding_calls,
         outcome_max_entries=outcome_max_entries,
         outcome_max_retained_bytes=outcome_max_retained_bytes,
+        admission_hook=admission_hook,
     )
 
 

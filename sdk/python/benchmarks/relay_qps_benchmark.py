@@ -19,6 +19,7 @@ import re
 import subprocess
 import sys
 from pathlib import Path
+from urllib.parse import quote
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -34,6 +35,10 @@ TOTAL_REQUESTS = 3000
 CONCURRENCY = 32
 
 PAYLOAD_FILE = '/tmp/c2_bench_payload.bin'
+
+
+def _greeting_url(relay_url: str, route_name: str) -> str:
+    return f'{relay_url}/_c2/calls/call?route={quote(route_name, safe="")}&method=greeting'
 
 
 def _route_hey_args(expected: CRMContract) -> list[str]:
@@ -103,7 +108,7 @@ def main():
                     ['hey', '-n', '500', '-c', '8', '-m', 'POST',
                      '-D', PAYLOAD_FILE, '-T', 'application/octet-stream',
                      *expected_header_args,
-                     f'{relay_url}/{route_name}/greeting'],
+                     _greeting_url(relay_url, route_name)],
                 )
 
                 # Benchmark
@@ -113,7 +118,7 @@ def main():
                      '-m', 'POST', '-D', PAYLOAD_FILE,
                      '-T', 'application/octet-stream',
                      *expected_header_args,
-                     f'{relay_url}/{route_name}/greeting'],
+                     _greeting_url(relay_url, route_name)],
                 )
 
                 # Extract QPS

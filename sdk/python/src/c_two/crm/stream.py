@@ -7,6 +7,7 @@ from collections.abc import Generator, Iterator
 from functools import wraps
 from typing import Generic, TypeVar, TypedDict, get_args, get_origin
 
+from .._call_context import _current
 from .. import error
 from .payload_plan import (
     PayloadPlanKind, _DeferredFastDbPlan, _fastdb_input_nbytes,
@@ -193,8 +194,11 @@ class _ResourceStream:
     """One Context and its iterator, entered serially by native resource steps."""
 
     def __init__(self, factory, *, output=None, input_binding=None, request=None,
-                 release_input=None, detach_input=None, borrowed=False, args=(), input_arity=0, encoded=True):
+                 release_input=None, detach_input=None, borrowed=False, args=(),
+                 input_arity=0, encoded=True, call_context=None):
         self._context = contextvars.copy_context()
+        self._context.run(_current.set, call_context)
+        del call_context
         self._iterator = None
         self._factory = factory
         self._output = output
@@ -210,7 +214,7 @@ class _ResourceStream:
             self._context.run(self._start)
         except BaseException as exc:
             from .transferable import _cleanup_preserving_primary
-            _cleanup_preserving_primary(exc, lambda: self._context.run(self._cleanup))
+            _cleanup_preserving_primary(exc, self.close)
             raise
 
     def _start(self):
@@ -268,7 +272,10 @@ class _ResourceStream:
             release()
 
     def close(self):
-        return self._context.run(self._cleanup)
+        try:
+            return self._context.run(self._cleanup)
+        finally:
+            self._context.run(_current.set, None)
 
     def _cleanup(self):
         from .transferable import _attach_cleanup_error, _cause_details, _safe_error_message
@@ -369,6 +376,7 @@ def _build_stream_wrapper(func, input_binding, output_binding):
                 release_input=kwargs.pop('_release_fn', None),
                 detach_input=kwargs.pop('_detach_input', None),
                 borrowed=kwargs.pop('_c2_input_buffer_mode', None) == 'borrowed',
+                call_context=kwargs.pop('_c2_call_context', None),
             )
         if (
             exact_arg_count is not None

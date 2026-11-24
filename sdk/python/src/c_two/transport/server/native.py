@@ -16,6 +16,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
+from ..._call_context import current_call_context
 from ...crm.contract import (
     CRMContract,
     crm_contract_identity,
@@ -286,7 +287,7 @@ class NativeServerBridge:
                     finally:
                         del semantic
                 raise
-            slot.scheduler = Scheduler(native_concurrency, method_index)
+            slot.scheduler = Scheduler(native_concurrency, method_index, registration=native_registration)
             self._slots[routing_name] = slot
         return native_registration
 
@@ -511,6 +512,7 @@ class NativeServerBridge:
                 return method(
                     mv, _release_fn=release_fn, _detach_input=detach,
                     _c2_input_buffer_mode=buffer_mode,
+                    _c2_call_context=current_call_context(),
                 )
 
             if buffer_mode == 'view':

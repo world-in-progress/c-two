@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
-use pyo3::exceptions::{PyRuntimeError, PyValueError};
+use pyo3::exceptions::{PyRuntimeError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyDict, PyList};
 
@@ -15,18 +15,20 @@ use c2_contract::{
     MethodMode, PORTABLE_CONTRACT_SCHEMA, contract_descriptor_sha256_hex,
 };
 use c2_core::{
-    ClientConfigPatch, Connect, FailedStartShutdownReceipt, Host, HostLifecycleSnapshot,
-    HostOptions, MethodDefinition, RegisterOutcome, Registration, Runtime, RuntimeOptions,
-    RuntimeShutdownReceipt, RuntimeShutdownTarget, ServiceConcurrencyMode, ServiceDefinition,
-    ShutdownOutcome, UnregisterOutcome,
+    AccessLevel, AdmissionContext, AdmissionHook, AdmissionOperation, AdmissionTransport,
+    CallContext, ClientConfigPatch, Connect, FailedStartShutdownReceipt, Host,
+    HostLifecycleSnapshot, HostOptions, MethodDefinition, RegisterOutcome, Registration, Runtime,
+    RuntimeOptions, RuntimeShutdownReceipt, RuntimeShutdownTarget, ServiceConcurrencyMode,
+    ServiceDefinition, ShutdownOutcome, UnregisterOutcome, evaluate_admission_hook,
 };
 
+use crate::admission_ffi::{PyAdmissionHook, project_call_context};
 use crate::config_ffi::{PyConnectAttempt, config_field, config_uint};
 use crate::core_error_ffi::{
     core_error_to_py, lifecycle_error_to_py, relay_cleanup_error_to_dict,
-    route_close_outcome_to_dict,
+    route_close_outcome_to_dict, semantic_error_to_py,
 };
-use crate::core_ffi::{PyCoreClient, PyCoreService};
+use crate::core_ffi::{PyCoreClient, PyCoreService, PyNativeCallOptions};
 use crate::endpoint_ffi::{PyEndpointCredential, PyLocalEndpointContext};
 use crate::local_copy_ffi::{PyLocalCopyTracker, local_copy_stats_dict};
 use crate::route_concurrency_ffi::PyRouteConcurrency;
@@ -630,6 +632,7 @@ pub struct PyRuntimeSession {
     host: Mutex<HostRecord>,
     registrations: Mutex<HashMap<String, Arc<SessionRegistration>>>,
     server_bridge: Mutex<ServerBridgeSlot>,
+    admission_hook: Mutex<Option<Arc<PyAdmissionHook>>>,
 }
 
 /// One live route registration shared by the session map and Python handles.
@@ -639,16 +642,25 @@ pub struct PyRuntimeSession {
 /// the inner value out (explicit unregister, retirement) seals every handle
 /// minted from this registration against later same-name registrations.
 pub(crate) struct SessionRegistration {
-    route_name: String,
+    expected: ExpectedRouteContract,
+    admission_hook: Option<Arc<dyn AdmissionHook>>,
+    concurrency: c2_core::RouteConcurrency,
     observer: c2_core::RegistrationObserver,
     registration: Mutex<Option<Registration>>,
 }
 
 impl SessionRegistration {
-    fn new(route_name: String, registration: Registration) -> Arc<Self> {
+    fn new(
+        expected: ExpectedRouteContract,
+        registration: Registration,
+        admission_hook: Option<Arc<dyn AdmissionHook>>,
+    ) -> Arc<Self> {
         let observer = registration.observer();
+        let concurrency = registration.route_concurrency();
         Arc::new(Self {
-            route_name,
+            expected,
+            admission_hook,
+            concurrency,
             observer,
             registration: Mutex::new(Some(registration)),
         })
@@ -662,7 +674,7 @@ impl SessionRegistration {
         match guard.as_ref() {
             Some(registration) => registration.publisher(topic_name),
             None => Err(crate::topic_ffi::registration_closed_error(
-                &self.route_name,
+                &self.expected.route_name,
             )),
         }
     }
@@ -687,7 +699,7 @@ impl SessionRegistration {
     fn close(&self) -> Result<UnregisterOutcome, c2_core::Error> {
         let Some(mut registration) = self.registration.lock().take() else {
             return Err(crate::topic_ffi::registration_closed_error(
-                &self.route_name,
+                &self.expected.route_name,
             ));
         };
         registration.close()
@@ -711,7 +723,7 @@ pub(crate) struct PyNativeRegistration {
 impl PyNativeRegistration {
     #[getter]
     fn route_name(&self) -> &str {
-        &self.shared.route_name
+        &self.shared.expected.route_name
     }
 
     /// Mint a publisher bound to this registration instance. Fails with
@@ -725,6 +737,97 @@ impl PyNativeRegistration {
         py.detach(|| self.shared.publisher(topic_name))
             .map(crate::topic_ffi::PyTopicPublisher::new)
             .map_err(core_error_to_py)
+    }
+
+    fn subscribe_local(
+        &self,
+        py: Python<'_>,
+        topic: &str,
+        start: &str,
+        on_lag: &str,
+    ) -> PyResult<crate::topic_ffi::PyLocalTopicSubscription> {
+        let options = crate::topic_ffi::subscribe_options(start, on_lag)?;
+        py.detach(|| {
+            let registration = self.shared.registration.lock();
+            registration
+                .as_ref()
+                .ok_or_else(|| crate::topic_ffi::registration_closed_error(self.route_name()))?
+                .subscribe_local(topic, options)
+        })
+        .map(crate::topic_ffi::PyLocalTopicSubscription::new)
+        .map_err(core_error_to_py)
+    }
+
+    #[pyo3(signature = (target, operation, method_index, options))]
+    fn admit_local<'py>(
+        &self,
+        py: Python<'py>,
+        target: &str,
+        operation: &str,
+        method_index: Option<u16>,
+        options: &PyNativeCallOptions,
+    ) -> PyResult<Option<Bound<'py, PyAny>>> {
+        let operation = match operation {
+            "unary" => AdmissionOperation::Unary,
+            "server_stream" => AdmissionOperation::ServerStream,
+            "subscribe" => AdmissionOperation::Subscribe,
+            _ => return Err(PyValueError::new_err("invalid local admission operation")),
+        };
+        let registration = &self.shared;
+        let expected = &registration.expected;
+        let access = method_index
+            .and_then(|index| registration.concurrency.method_access(index))
+            .map(|access| match access {
+                MethodAccess::Read => AccessLevel::Read,
+                MethodAccess::Write => AccessLevel::Write,
+            });
+        let metadata = options.options.metadata();
+        let result = py.detach(|| {
+            if registration.is_closed() {
+                return Err(crate::topic_ffi::registration_closed_error(
+                    &expected.route_name,
+                ));
+            }
+            let Some(hook) = registration.admission_hook.as_ref() else {
+                return Ok(None);
+            };
+            let context = AdmissionContext::new(
+                &expected.route_name,
+                &expected.crm_ns,
+                &expected.crm_name,
+                &expected.crm_ver,
+                Some(target),
+                access,
+                operation,
+                AdmissionTransport::ThreadLocal,
+                None,
+                metadata,
+            );
+            let decision =
+                evaluate_admission_hook(hook.as_ref(), &context).map_err(c2_core::Error::from);
+            if registration.is_closed() {
+                return Err(crate::topic_ffi::registration_closed_error(
+                    &expected.route_name,
+                ));
+            }
+            decision
+        });
+        let extension = result.map_err(|error| match error {
+            c2_core::Error::Semantic(error) => semantic_error_to_py(py, error, "pre_dispatch"),
+            error => core_error_to_py(error),
+        })?;
+        if operation == AdmissionOperation::Subscribe {
+            return Ok(None);
+        }
+        let context = CallContext::new(
+            &expected.route_name,
+            target,
+            operation,
+            None,
+            metadata.clone(),
+            extension,
+        );
+        project_call_context(py, &context).map(Some)
     }
 
     #[getter]
@@ -994,6 +1097,7 @@ impl PyRuntimeSession {
             host: Mutex::new(HostRecord::default()),
             registrations: Mutex::new(HashMap::new()),
             server_bridge: Mutex::new(ServerBridgeSlot::default()),
+            admission_hook: Mutex::new(None),
         })
     }
 
@@ -1111,14 +1215,27 @@ impl PyRuntimeSession {
         Ok(dict)
     }
 
-    fn inherit_retirement(&self, previous: &Self) -> PyResult<()> {
-        let handoff = previous
-            .inner
-            .capture_retirement_handoff()
+    fn inherit_retirement(&self, py: Python<'_>, previous: &Self) -> PyResult<()> {
+        // Capture Core's override intent and its Python identity together.
+        // Hold Rust Arcs while locked and release displaced owners afterwards.
+        let (handoff, hook) = py
+            .detach(|| {
+                let hook = previous.admission_hook.lock();
+                Ok((previous.inner.capture_retirement_handoff()?, hook.clone()))
+            })
             .map_err(lifecycle_error_to_py)?;
-        self.inner
-            .adopt_retirement_handoff(&handoff)
-            .map_err(lifecycle_error_to_py)
+        let (result, displaced) = py.detach(|| {
+            let mut current = self.admission_hook.lock();
+            let result = self.inner.adopt_retirement_handoff(&handoff);
+            let displaced = if result.is_ok() {
+                std::mem::replace(&mut *current, hook)
+            } else {
+                None
+            };
+            (result, displaced)
+        });
+        drop(displaced);
+        result.map_err(lifecycle_error_to_py)
     }
 
     fn ensure_server<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
@@ -1183,6 +1300,7 @@ impl PyRuntimeSession {
         max_outstanding_calls: &Bound<'_, PyAny>,
         outcome_max_entries: &Bound<'_, PyAny>,
         outcome_max_retained_bytes: &Bound<'_, PyAny>,
+        admission_hook: &Bound<'_, PyAny>,
     ) -> PyResult<()> {
         let patch = ServerConfigPatch {
             server_id: config_field(server_id, unset, |value| value.extract())?,
@@ -1208,8 +1326,47 @@ impl PyRuntimeSession {
                 max_outstanding_calls,
             )?,
         };
-        py.detach(|| self.inner.update_server_config(patch))
-            .map_err(runtime_configuration_error_to_py)
+        let hook = config_field(admission_hook, unset, |value| {
+            if !value.is_callable() {
+                return Err(PyTypeError::new_err(
+                    "admission_hook must be callable or None",
+                ));
+            }
+            Ok(Arc::new(PyAdmissionHook::new(value.clone().unbind())))
+        })?;
+        let (result, displaced) = py.detach(|| {
+            let mut current = self.admission_hook.lock();
+            let selected = match &hook {
+                ConfigField::Set(candidate) => {
+                    let same = current
+                        .as_ref()
+                        .filter(|hook| hook.is_same_callable(candidate));
+                    ConfigField::Set(Arc::clone(same.unwrap_or(candidate)))
+                }
+                ConfigField::Inherit => ConfigField::Inherit,
+                ConfigField::Keep => ConfigField::Keep,
+            };
+            let native = match &selected {
+                ConfigField::Set(hook) => ConfigField::Set(hook.clone() as Arc<dyn AdmissionHook>),
+                ConfigField::Inherit => ConfigField::Inherit,
+                ConfigField::Keep => ConfigField::Keep,
+            };
+            let result = self
+                .inner
+                .update_server_config_with_admission_hook(patch, native);
+            let displaced = if result.is_ok() {
+                match selected {
+                    ConfigField::Keep => None,
+                    ConfigField::Inherit => current.take(),
+                    ConfigField::Set(hook) => current.replace(hook),
+                }
+            } else {
+                None
+            };
+            (result, displaced)
+        });
+        drop(displaced);
+        result.map_err(runtime_configuration_error_to_py)
     }
 
     fn update_client_config(
@@ -1391,7 +1548,7 @@ impl PyRuntimeSession {
             expected_route_contract(name, crm_ns, crm_name, crm_ver, abi_hash, signature_hash)?;
         let service = Arc::new(PyCoreService::new(name.to_string(), dispatcher));
         let (definition, portable) =
-            service_definition(descriptor_json, expected, methods, service)?;
+            service_definition(descriptor_json, expected.clone(), methods, service)?;
         let definition = definition
             .with_concurrency(
                 parse_concurrency_mode(concurrency_mode)?,
@@ -1413,8 +1570,8 @@ impl PyRuntimeSession {
             .detach(|| host.register(definition))
             .map_err(core_error_to_py)?;
         let outcome = registration.outcome().clone();
-        let concurrency = registration.route_concurrency();
-        let shared = SessionRegistration::new(name.to_string(), registration);
+        let shared = SessionRegistration::new(expected, registration, host.admission_hook());
+        let concurrency = shared.concurrency.clone();
         // Clone the handle's Arc before publishing the slot so a concurrent
         // unregister/re-register race can never hand out the wrong instance.
         let handle_shared = Arc::clone(&shared);
@@ -1445,44 +1602,6 @@ impl PyRuntimeSession {
             .detach(|| registration.close())
             .map_err(core_error_to_py)?;
         unregister_outcome_to_dict(py, outcome)
-    }
-
-    /// Attach a same-process subscription to the route's current registration.
-    ///
-    /// Validates the exact route name and contract identity like a remote
-    /// `OPEN`: 701 for an absent route, 709 on identity mismatch, 713 for a
-    /// topic the matched contract does not declare.
-    #[allow(clippy::too_many_arguments)] // PyO3 signature is the existing Python call boundary.
-    #[pyo3(signature = (route_name, crm_ns, crm_name, crm_ver, abi_hash, signature_hash, topic, start, on_lag))]
-    fn subscribe_local_route(
-        &self,
-        py: Python<'_>,
-        route_name: &str,
-        crm_ns: &str,
-        crm_name: &str,
-        crm_ver: &str,
-        abi_hash: &str,
-        signature_hash: &str,
-        topic: &str,
-        start: &str,
-        on_lag: &str,
-    ) -> PyResult<crate::topic_ffi::PyLocalTopicSubscription> {
-        let expected = expected_route_contract(
-            route_name,
-            crm_ns,
-            crm_name,
-            crm_ver,
-            abi_hash,
-            signature_hash,
-        )?;
-        let options = crate::topic_ffi::subscribe_options(start, on_lag)?;
-        let host = py.detach(|| self.host.lock().host.clone());
-        py.detach(move || {
-            let host = host.ok_or_else(|| crate::topic_ffi::route_host_absent_error(route_name))?;
-            host.subscribe_local(&expected, topic, options)
-        })
-        .map(crate::topic_ffi::PyLocalTopicSubscription::new)
-        .map_err(core_error_to_py)
     }
 
     #[pyo3(signature = (connect_attempt=None))]

@@ -153,10 +153,8 @@ def test_generated_python_stream_client_uses_real_native_ipc(monkeypatch, tmp_pa
     try:
         runtime.register(MatrixPortable, resource, name='generated-stream')
         proxy = runtime.connect(MatrixPortable, name='generated-stream', address=runtime.server_address())
-        native = proxy.client._client
-        if with_options:
-            native = native.with_call_options(timeout=None)
-        client = module.ContractClient(native)
+        view = cc.with_call_options(proxy, timeout=None) if with_options else proxy
+        client = module.ContractClient(view.client._client)
         client.method_0_ping()
         stream = client.method_1_echo(source)
         for value in stream:

@@ -243,14 +243,6 @@ pub(crate) fn registration_closed_error(route_name: &str) -> c2_core::Error {
     ))
 }
 
-/// The `ResourceNotFound` (701) refusal for same-process subscribe with no host.
-pub(crate) fn route_host_absent_error(route_name: &str) -> c2_core::Error {
-    c2_core::Error::Semantic(C2Error::new(
-        ErrorCode::ResourceNotFound,
-        format!("route not found: {route_name}"),
-    ))
-}
-
 pub(crate) fn register_module(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<PyTopicPublisher>()?;
     module.add_class::<PyLocalTopicSubscription>()?;

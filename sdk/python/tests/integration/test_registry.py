@@ -369,6 +369,8 @@ class TestRegisterConnect:
         cc.register(Hello, PrefixHelloImpl('local'), name='hello')
         crm = cc.connect(Hello, name='hello')
         remote_runtime = Runtime()
+        admitted = []
+        remote_runtime.set_server(admission_hook=lambda context: admitted.append(dict(context.metadata)))
         remote_runtime.register(Hello, PrefixHelloImpl('remote'), name='hello')
         runtime = _get_default_runtime()
         acquisitions = []
@@ -430,7 +432,7 @@ class TestRegisterConnect:
 
         def create_view():
             try:
-                created['view'] = cc.with_call_options(crm, timeout=None)
+                created['view'] = cc.with_call_options(crm, metadata={'trace': 'follow'})
             except BaseException as exc:
                 created['error'] = exc
 
@@ -457,6 +459,7 @@ class TestRegisterConnect:
             view = created['view']
             assert target_closes == []
             assert view.greeting('after') == 'remote:after'
+            assert admitted == [{}, {'trace': 'follow'}]
             assert acquisitions == ['hello']
             cc.close(view)
             assert target_closes == [True]

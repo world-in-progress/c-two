@@ -9,6 +9,7 @@ from importlib.metadata import version as _version
 __version__ = _version('c-two')
 
 from . import error
+from ._call_context import AdmissionContext, AdmissionDecision, CallContext, current_call_context
 from .crm.meta import crm, read, write, stream, topic, on_shutdown
 from .crm.transferable import hold, recover_call, transfer, with_call_id, HeldResult
 from .crm.stream import Stream, StreamCloseReceipt
@@ -37,6 +38,10 @@ __all__ = [
     'recover_call',
     'query_call',
     'CallOutcome',
+    'AdmissionContext',
+    'AdmissionDecision',
+    'CallContext',
+    'current_call_context',
     'HeldResult',
     'Delivery',
     'Publisher',

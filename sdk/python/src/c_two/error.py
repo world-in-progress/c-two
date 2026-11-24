@@ -521,6 +521,13 @@ class SubscriptionLagged(_FixedCodeError):
     _default_message = 'Subscription lagged'
 
 
+class AdmissionDenied(_FixedCodeError):
+    """The Host admission hook refused the operation."""
+
+    _code = ErrorCode.AdmissionDenied
+    _default_message = 'Admission denied'
+
+
 class CallIdConflict(_FixedCodeError):
     """The key already belongs to a different method or encoded input."""
 
@@ -565,6 +572,7 @@ _CODE_TO_CLASS: dict[int, type[CCError]] = {
     int(ErrorCode.CallCancelled): CallCancelled,
     int(ErrorCode.RouteConflict): RouteConflict,
     int(ErrorCode.SubscriptionLagged): SubscriptionLagged,
+    int(ErrorCode.AdmissionDenied): AdmissionDenied,
     int(ErrorCode.CallIdConflict): CallIdConflict,
     int(ErrorCode.CallResultUnavailable): CallResultUnavailable,
     int(ErrorCode.CallOutcomeUnknown): CallOutcomeUnknown,
@@ -617,9 +625,10 @@ def _callback_error_copy(exc: CCError) -> CCError:
     """Isolate a callback error from the outer call's dispatch and outcome."""
     if exc.code in (
         ErrorCode.CallIdConflict, ErrorCode.CallResultUnavailable, ErrorCode.CallOutcomeUnknown,
+        ErrorCode.AdmissionDenied,
     ):
         return ResourceExecutionError(
-            'resource callback returned an inner call outcome error',
+            'resource callback returned an inner Host control error',
             details={'cause_code': str(int(exc.code)), 'cause_message': exc.message},
         )
     stripped_details = _strip_callback_phases(getattr(exc, 'details', {}))
@@ -727,6 +736,7 @@ __all__ = [
     'RouteConflict',
     'SubscriptionLagged',
     'CallIdConflict',
+    'AdmissionDenied',
     'CallResultUnavailable',
     'CallOutcomeUnknown',
 ]

@@ -72,7 +72,7 @@ def stalled_relay():
                 'version': 1, 'code': 701, 'name': 'ResourceNotFound',
                 'message': 'route not found: connect-timeout',
                 'details': {
-                    'transport_phase': 'application_detail',
+                    'dispatch_phase': 'pre_dispatch',
                     'custom_detail': 'preserved',
                     'route_name': 'connect-timeout',
                 },
@@ -151,8 +151,8 @@ def test_stalled_relay_connect_budget_and_recovery(mode, stalled_relay):
         assert isinstance(projected, cc.error.ResourceNotFound)
         assert projected.message == 'route not found: connect-timeout'
         assert projected.details['route_name'] == 'connect-timeout'
-        # Local acquisition facts take precedence over bogus peer phase keys,
-        # while arbitrary peer diagnostic details survive untouched.
+        # The canonical refusal carries the acquisition phase and preserves
+        # the relay's application diagnostics.
         assert native.transport_phase == 'pre_dispatch'
         assert projected.transport_phase == 'pre_dispatch'
         assert projected.details['transport_phase'] == 'pre_dispatch'
