@@ -130,15 +130,19 @@ define_error_codes! {
     CallIdConflict = 721,
     CallResultUnavailable = 722,
     CallOutcomeUnknown = 723,
+    AdmissionDenied = 724,
 }
 
 impl ErrorCode {
-    /// True for Host-minted post-dispatch outcome control errors that must
+    /// True for Host-minted admission and outcome control errors that must
     /// never escape a nested resource callback as the outer call's own status.
-    pub const fn is_outcome_control(self) -> bool {
+    pub const fn is_host_control(self) -> bool {
         matches!(
             self,
-            Self::CallIdConflict | Self::CallResultUnavailable | Self::CallOutcomeUnknown
+            Self::CallIdConflict
+                | Self::CallResultUnavailable
+                | Self::CallOutcomeUnknown
+                | Self::AdmissionDenied
         )
     }
 }
@@ -724,7 +728,7 @@ mod tests {
     fn error_code_registry_matches_canonical_wire_values() {
         use ErrorCode::*;
 
-        let expected: [(ErrorCode, u16, &str); 29] = [
+        let expected: [(ErrorCode, u16, &str); 30] = [
             (Unknown, 0, "Unknown"),
             (ResourceInputDeserializing, 1, "ResourceInputDeserializing"),
             (ResourceOutputSerializing, 2, "ResourceOutputSerializing"),
@@ -754,6 +758,7 @@ mod tests {
             (CallIdConflict, 721, "CallIdConflict"),
             (CallResultUnavailable, 722, "CallResultUnavailable"),
             (CallOutcomeUnknown, 723, "CallOutcomeUnknown"),
+            (AdmissionDenied, 724, "AdmissionDenied"),
         ];
         let registry = ErrorCode::registry();
         assert_eq!(registry.len(), expected.len());
@@ -994,6 +999,7 @@ mod tests {
             (ErrorCode::CallIdConflict, 721),
             (ErrorCode::CallResultUnavailable, 722),
             (ErrorCode::CallOutcomeUnknown, 723),
+            (ErrorCode::AdmissionDenied, 724),
         ] {
             let plain = C2Error::new(code, "bounded call budget exhausted");
             let decoded = C2Error::from_wire_bytes(&plain.to_wire_bytes())
@@ -1005,11 +1011,12 @@ mod tests {
             assert!(decoded.details.is_empty());
         }
 
-        assert!(ErrorCode::CallIdConflict.is_outcome_control());
-        assert!(ErrorCode::CallResultUnavailable.is_outcome_control());
-        assert!(ErrorCode::CallOutcomeUnknown.is_outcome_control());
-        assert!(!ErrorCode::ResourceFunctionExecuting.is_outcome_control());
-        assert!(!ErrorCode::CallCapacityExceeded.is_outcome_control());
+        assert!(ErrorCode::CallIdConflict.is_host_control());
+        assert!(ErrorCode::CallResultUnavailable.is_host_control());
+        assert!(ErrorCode::CallOutcomeUnknown.is_host_control());
+        assert!(ErrorCode::AdmissionDenied.is_host_control());
+        assert!(!ErrorCode::ResourceFunctionExecuting.is_host_control());
+        assert!(!ErrorCode::CallCapacityExceeded.is_host_control());
     }
 
     #[test]

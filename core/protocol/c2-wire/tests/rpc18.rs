@@ -1,3 +1,4 @@
+use c2_config::CallMetadata;
 use c2_error::{C2Error, ErrorCode};
 use c2_wire::buddy::BuddyPayload;
 use c2_wire::flags::{FLAG_CHUNKED, FLAG_FIRST_CHUNK, FLAG_RPC_RECORD};
@@ -71,6 +72,7 @@ fn open_and_end_have_one_record_inside_the_sixteen_byte_envelope() {
         &identity(),
         3,
         c2_wire::rpc::CallMode::Unary,
+        &CallMetadata::empty(),
         ValuePart::whole(ValueStorage::Inline(b"x")),
     )
     .unwrap();
@@ -117,7 +119,15 @@ fn open_and_end_have_one_record_inside_the_sixteen_byte_envelope() {
 #[test]
 fn chunk_first_is_strictly_less_than_total_and_zero_loan_is_typed() {
     let part = ValuePart::first(3, ValueStorage::Inline(b"x"));
-    let open = encode_open_frame(2, &identity(), 1, c2_wire::rpc::CallMode::Unary, part).unwrap();
+    let open = encode_open_frame(
+        2,
+        &identity(),
+        1,
+        CallMode::Unary,
+        &CallMetadata::empty(),
+        part,
+    )
+    .unwrap();
     let (header, payload) = decode_frame(&open).unwrap();
     assert_eq!(
         header.flags,
@@ -152,6 +162,7 @@ fn chunk_first_is_strictly_less_than_total_and_zero_loan_is_typed() {
         &identity(),
         1,
         c2_wire::rpc::CallMode::Unary,
+        &CallMetadata::empty(),
         ValuePart::whole(ValueStorage::Shm(descriptor)),
     )
     .unwrap();
@@ -380,6 +391,7 @@ fn invalid_open_identity_still_exposes_original_shm_carrier() {
         &identity(),
         1,
         c2_wire::rpc::CallMode::Unary,
+        &CallMetadata::empty(),
         ValuePart::whole(ValueStorage::Shm(descriptor)),
     )
     .unwrap();
@@ -455,23 +467,30 @@ fn future_record_kinds_have_exact_shapes_and_reject_retired_flag_bit() {
 
 #[test]
 fn open_roundtrips_call_mode_in_whole_and_first_chunk() {
+    let metadata = CallMetadata::from_entries([("trace", "call"), ("empty", "")]).unwrap();
     for mode in [CallMode::Unary, CallMode::ServerStream] {
         for value in [
             ValuePart::whole(ValueStorage::Inline(b"x")),
             ValuePart::first(2, ValueStorage::Inline(b"x")),
         ] {
-            let wire = encode_open_frame(1, &identity(), 3, mode, value).unwrap();
+            let wire = encode_open_frame(1, &identity(), 3, mode, &metadata, value).unwrap();
             let (header, payload) = decode_frame(&wire).unwrap();
-            let (_, _, _, call_id, metadata_len) =
+            let (_, _, _, call_id, decoded_metadata, metadata_len) =
                 c2_wire::rpc::decode_open_metadata(payload).unwrap();
             assert_eq!(call_id, None);
+            assert_eq!(decoded_metadata, metadata);
             assert_eq!(
-                &payload[metadata_len - 3..metadata_len],
+                metadata_len,
+                c2_wire::rpc::encoded_open_metadata_len(&identity(), &metadata).unwrap()
+            );
+            let metadata_start = metadata_len - c2_wire::rpc::encoded_call_metadata_len(&metadata);
+            assert_eq!(
+                &payload[metadata_start - 3..metadata_start],
                 &[mode as u8, 3, 0]
             );
             assert!(matches!(decode_rpc_record(&header, payload, None).unwrap(),
-                RpcRecord::Open { method_idx: 3, mode: actual, call_id: None, value: actual_value, .. }
-                if actual == mode && actual_value == value));
+                RpcRecord::Open { method_idx: 3, mode: actual, call_id: None, metadata: ref actual_metadata, value: actual_value, .. }
+                if actual == mode && actual_value == value && *actual_metadata == metadata));
         }
     }
 }
@@ -484,10 +503,11 @@ fn unknown_open_mode_and_cancel_cause_use_invalid_value() {
             &identity(),
             0,
             CallMode::Unary,
+            &CallMetadata::empty(),
             ValuePart::whole(ValueStorage::Inline(b"")),
         )
         .unwrap();
-        let mode_offset = wire.len() - 3;
+        let mode_offset = wire.len() - 4;
         wire[mode_offset] = value;
         let (header, payload) = decode_frame(&wire).unwrap();
         assert_eq!(
@@ -526,11 +546,13 @@ fn invalid_keyed_open_call_id_preserves_shm_carrier_and_unknown_mode_returns_non
     ] {
         // Structurally intact KeyedUnary OPEN with invalid call_id characters
         // proves exact carrier offset so the SHM loan is released once.
-        let mut keyed = encode_open_keyed_frame(1, &identity(), 0, "valid-id", part).unwrap();
-        let (_, _, _, _, metadata_len) =
+        let mut keyed =
+            encode_open_keyed_frame(1, &identity(), 0, "valid-id", &CallMetadata::empty(), part)
+                .unwrap();
+        let (_, _, _, _, _, metadata_len) =
             c2_wire::rpc::decode_open_metadata(&keyed[16..]).unwrap();
         // Corrupt one character of call_id to '/' (forbidden).
-        keyed[16 + metadata_len - 1] = b'/';
+        keyed[16 + metadata_len - 2] = b'/';
         let (header, payload) = decode_frame(&keyed).unwrap();
         let failure = decode_rpc_record_with_carrier(&header, payload, None).unwrap_err();
         assert!(matches!(
@@ -544,10 +566,18 @@ fn invalid_keyed_open_call_id_preserves_shm_carrier_and_unknown_mode_returns_non
 
         // Unknown CallMode has unprovable carrier offset in IPC 18 -> None
         // (connection retires instead of guessing offset).
-        let mut unknown = encode_open_frame(1, &identity(), 0, CallMode::Unary, part).unwrap();
-        let (_, _, _, _, metadata_len) =
+        let mut unknown = encode_open_frame(
+            1,
+            &identity(),
+            0,
+            CallMode::Unary,
+            &CallMetadata::empty(),
+            part,
+        )
+        .unwrap();
+        let (_, _, _, _, _, metadata_len) =
             c2_wire::rpc::decode_open_metadata(&unknown[16..]).unwrap();
-        let mode_offset = 16 + metadata_len - 3;
+        let mode_offset = 16 + metadata_len - 4;
         unknown[mode_offset] = 5;
         let (header, payload) = decode_frame(&unknown).unwrap();
         let failure = decode_rpc_record_with_carrier(&header, payload, None).unwrap_err();
@@ -568,7 +598,8 @@ fn subscribe_open_ready_item_begin_and_call_end_roundtrip_and_reject_invalid() {
         start: WireTopicStart::Next,
         on_lag: WireLagPolicy::Error,
     };
-    let open = encode_open_subscribe_frame(7, &identity(), "state", options).unwrap();
+    let metadata = CallMetadata::from_entries([("trace", "subscribe")]).unwrap();
+    let open = encode_open_subscribe_frame(7, &identity(), "state", options, &metadata).unwrap();
     let (header, payload) = decode_frame(&open).unwrap();
     assert_eq!(
         decode_rpc_record(&header, payload, None).unwrap(),
@@ -584,12 +615,14 @@ fn subscribe_open_ready_item_begin_and_call_end_roundtrip_and_reject_invalid() {
             },
             topic_name: "state".into(),
             options,
+            metadata: metadata.clone(),
         }
     );
 
     // Reserved option bits and trailing bytes are rejected.
     let mut bad_opts = open.clone();
-    *bad_opts.last_mut().unwrap() = 0x04;
+    let options_index = bad_opts.len() - c2_wire::rpc::encoded_call_metadata_len(&metadata) - 1;
+    bad_opts[options_index] = 0x04;
     let (h, p) = decode_frame(&bad_opts).unwrap();
     assert_eq!(
         decode_rpc_record(&h, p, None).unwrap_err(),
@@ -604,19 +637,23 @@ fn subscribe_open_ready_item_begin_and_call_end_roundtrip_and_reject_invalid() {
             &identity(),
             0,
             CallMode::Subscribe,
+            &CallMetadata::empty(),
             ValuePart::whole(ValueStorage::Inline(b""))
         )
         .is_err()
     );
 
     // READY round-trips and rejects start_seq = 0.
-    let ready = encode_ready_frame(7, 42).unwrap();
+    let ready = encode_ready_frame(7, 42, 41).unwrap();
     let (h, p) = decode_frame(&ready).unwrap();
     assert_eq!(
         decode_rpc_record(&h, p, Some(CallMode::Subscribe)).unwrap(),
-        RpcRecord::Ready { start_seq: 42 }
+        RpcRecord::Ready {
+            start_seq: 42,
+            head_seq: 41
+        }
     );
-    assert!(encode_ready_frame(7, 0).is_err());
+    assert!(encode_ready_frame(7, 0, 41).is_err());
 
     // Subscribe ITEM_BEGIN carries (seq, total_bytes) and rejects seq = 0 or wrong mode.
     let begin = encode_subscribe_item_begin_frame(7, 42, 1024).unwrap();
@@ -688,20 +725,24 @@ fn connection_core_subscribe_open_begins_items_without_resource_step() {
 
 #[test]
 fn keyed_unary_recover_query_call_and_result_roundtrip_and_reject_invalid() {
+    let metadata = CallMetadata::from_entries([("token", "keyed one"), ("trace", "a")]).unwrap();
     // KeyedUnary whole + chunked first + metadata len matches exact payload offset.
     for part in [
         ValuePart::whole(ValueStorage::Inline(b"payload")),
         ValuePart::first(12, ValueStorage::Inline(b"payl")),
     ] {
-        let wire = encode_open_keyed_frame(9, &identity(), 4, "op_01-AZ", part).unwrap();
+        let wire = encode_open_keyed_frame(9, &identity(), 4, "op_01-AZ", &metadata, part).unwrap();
         let (h, p) = decode_frame(&wire).unwrap();
-        let (_, midx, mode, cid, meta_len) = c2_wire::rpc::decode_open_metadata(p).unwrap();
+        let (_, midx, mode, cid, decoded_metadata, meta_len) =
+            c2_wire::rpc::decode_open_metadata(p).unwrap();
         assert_eq!(midx, 4);
         assert_eq!(mode, CallMode::KeyedUnary);
         assert_eq!(cid.as_deref(), Some("op_01-AZ"));
+        assert_eq!(decoded_metadata, metadata);
         assert_eq!(
             meta_len,
-            c2_wire::rpc::encoded_keyed_open_metadata_len(&identity(), "op_01-AZ").unwrap()
+            c2_wire::rpc::encoded_keyed_open_metadata_len(&identity(), "op_01-AZ", &metadata)
+                .unwrap()
         );
         assert!(matches!(
             decode_rpc_record(&h, p, None).unwrap(),
@@ -709,9 +750,10 @@ fn keyed_unary_recover_query_call_and_result_roundtrip_and_reject_invalid() {
                 method_idx: 4,
                 mode: CallMode::KeyedUnary,
                 call_id: Some(ref id),
+                metadata: ref actual_metadata,
                 value,
                 ..
-            } if id == "op_01-AZ" && value == part
+            } if id == "op_01-AZ" && value == part && *actual_metadata == metadata
         ));
     }
     assert!(
@@ -720,6 +762,7 @@ fn keyed_unary_recover_query_call_and_result_roundtrip_and_reject_invalid() {
             &identity(),
             4,
             "",
+            &metadata,
             ValuePart::whole(ValueStorage::Inline(b""))
         )
         .is_err()
@@ -730,21 +773,23 @@ fn keyed_unary_recover_query_call_and_result_roundtrip_and_reject_invalid() {
             &identity(),
             4,
             "bad/id",
+            &metadata,
             ValuePart::whole(ValueStorage::Inline(b""))
         )
         .is_err()
     );
 
     // Recover OPEN carries no payload and rejects trailing bytes or storage flags.
-    let rec = encode_open_recover_frame(11, &identity(), 4, "op_01-AZ").unwrap();
+    let rec = encode_open_recover_frame(11, &identity(), 4, "op_01-AZ", &metadata).unwrap();
     let (h, p) = decode_frame(&rec).unwrap();
     assert!(matches!(
         decode_rpc_record(&h, p, None).unwrap(),
         RpcRecord::OpenRecover {
             method_idx: 4,
             call_id: ref id,
+            metadata: ref actual_metadata,
             ..
-        } if id == "op_01-AZ"
+        } if id == "op_01-AZ" && *actual_metadata == metadata
     ));
     let mut rec_trailing = rec.clone();
     rec_trailing.push(0xAA);
@@ -776,13 +821,14 @@ fn keyed_unary_recover_query_call_and_result_roundtrip_and_reject_invalid() {
     }
 
     // QueryCall round-trip and direction/RID validation.
-    let q = encode_query_call_frame(15, &identity(), "op_01-AZ").unwrap();
+    let q = encode_query_call_frame(15, &identity(), "op_01-AZ", &metadata).unwrap();
     let (h, p) = decode_frame(&q).unwrap();
     assert!(matches!(
         decode_rpc_record(&h, p, None).unwrap(),
-        RpcRecord::QueryCall { call_id: ref id, .. } if id == "op_01-AZ"
+        RpcRecord::QueryCall { call_id: ref id, metadata: ref actual_metadata, .. }
+            if id == "op_01-AZ" && *actual_metadata == metadata
     ));
-    assert!(encode_query_call_frame(0, &identity(), "op_01-AZ").is_err());
+    assert!(encode_query_call_frame(0, &identity(), "op_01-AZ", &metadata).is_err());
 
     // QueryCallResult round-trips every valid outcome variant + error truncation.
     for res in [
@@ -865,4 +911,337 @@ fn call_record_finish_replayed_competes_with_reject_before_execution() {
     assert!(rec2.queue());
     assert_eq!(rec2.reject_before_execution(), Some(CallStatus::NotExecuted));
     assert_eq!(rec2.finish_replayed(CallStatus::Success), None);
+}
+
+fn raw_metadata(
+    entries: impl IntoIterator<Item = (impl AsRef<[u8]>, impl AsRef<[u8]>)>,
+) -> Vec<u8> {
+    let mut bytes = vec![0];
+    for (key, value) in entries {
+        let (key, value) = (key.as_ref(), value.as_ref());
+        bytes[0] += 1;
+        bytes.push(u8::try_from(key.len()).unwrap());
+        bytes.extend_from_slice(key);
+        bytes.extend_from_slice(&u16::try_from(value.len()).unwrap().to_le_bytes());
+        bytes.extend_from_slice(value);
+    }
+    bytes
+}
+
+#[test]
+fn metadata_codec_canonicalizes_empty_and_enforces_individual_and_combined_limits() {
+    use c2_config::{
+        MAX_CALL_METADATA_ENTRIES, MAX_CALL_METADATA_KEY_LEN, MAX_CALL_METADATA_TOTAL_BYTES,
+        MAX_CALL_METADATA_VALUE_LEN,
+    };
+    use c2_wire::rpc::{
+        MAX_WIRE_CALL_METADATA_BYTES, decode_call_metadata, encoded_call_metadata_len,
+        write_call_metadata,
+    };
+
+    let mut bytes = Vec::new();
+    write_call_metadata(&mut bytes, &CallMetadata::empty());
+    assert_eq!(bytes, [0]);
+    let mut pos = 0;
+    assert_eq!(
+        decode_call_metadata(&bytes, &mut pos).unwrap(),
+        CallMetadata::empty()
+    );
+    assert_eq!(pos, 1);
+
+    let max_metadata = CallMetadata::from_entries(
+        (0..MAX_CALL_METADATA_ENTRIES)
+            .rev()
+            .map(|i| (format!("k{i:02}"), "v".repeat(253))),
+    )
+    .unwrap();
+    assert_eq!(max_metadata.total_bytes(), MAX_CALL_METADATA_TOTAL_BYTES);
+    assert_eq!(encoded_call_metadata_len(&max_metadata), 16_577);
+    assert_eq!(
+        encoded_call_metadata_len(&max_metadata),
+        MAX_WIRE_CALL_METADATA_BYTES
+    );
+    bytes.clear();
+    write_call_metadata(&mut bytes, &max_metadata);
+    assert_eq!(bytes.len(), MAX_WIRE_CALL_METADATA_BYTES);
+    assert_eq!(bytes[0] as usize, MAX_CALL_METADATA_ENTRIES);
+    let mut pos = 0;
+    assert_eq!(
+        decode_call_metadata(&bytes, &mut pos).unwrap(),
+        max_metadata
+    );
+    assert_eq!(pos, bytes.len());
+
+    let key = "k".repeat(MAX_CALL_METADATA_KEY_LEN);
+    let value = "v".repeat(MAX_CALL_METADATA_VALUE_LEN);
+    let largest_entry = raw_metadata([(&key, &value)]);
+    let mut pos = 0;
+    let metadata = decode_call_metadata(&largest_entry, &mut pos).unwrap();
+    assert_eq!(metadata.get(&key), Some(value.as_str()));
+    assert_eq!(pos, largest_entry.len());
+
+    let too_many = raw_metadata((0..=MAX_CALL_METADATA_ENTRIES).map(|i| (format!("k{i:02}"), "")));
+    let too_large = raw_metadata((0..MAX_CALL_METADATA_ENTRIES).map(|i| {
+        (
+            format!("k{i:02}"),
+            "v".repeat(if i == 0 { 254 } else { 253 }),
+        )
+    }));
+    let invalid_segments = [
+        too_many,
+        too_large,
+        raw_metadata([("a", "one"), ("a", "two")]),
+        raw_metadata([("b", ""), ("a", "")]),
+        raw_metadata([("A", "value")]),
+        raw_metadata([("", "")]),
+        raw_metadata([("key!", "")]),
+        raw_metadata([("é", "")]),
+        raw_metadata([("k", " start")]),
+        raw_metadata([("k", "end ")]),
+        raw_metadata([("k", "a\tb")]),
+        raw_metadata([("k", "a\r\nb")]),
+        raw_metadata([("k", "\x7f")]),
+        raw_metadata([("k", "é")]),
+        raw_metadata([(b"key".as_slice(), b"\xff".as_slice())]),
+        raw_metadata([(b"\xff".as_slice(), b"".as_slice())]),
+        raw_metadata([(format!("{key}k"), String::new())]),
+        raw_metadata([(key, format!("{value}v"))]),
+    ];
+    for segment in invalid_segments {
+        let mut bytes = vec![0xff];
+        bytes.extend_from_slice(&segment);
+        bytes.push(0xff);
+        let mut pos = 1;
+        let error = decode_call_metadata(&bytes, &mut pos).unwrap_err();
+        assert!(error.is_call_metadata_validation(), "{error}");
+        assert_eq!(pos, bytes.len() - 1);
+    }
+}
+
+#[test]
+fn invalid_open_metadata_still_exposes_the_original_shm_loan() {
+    use c2_wire::rpc::decode_open_metadata;
+
+    let descriptor = BuddyPayload {
+        seg_idx: 1,
+        generation: 1,
+        offset: 7,
+        data_size: 1,
+        is_dedicated: false,
+        loan_id: 43,
+    };
+    let empty = CallMetadata::empty();
+    for value in [
+        ValuePart::whole(ValueStorage::Shm(descriptor)),
+        ValuePart::first(2, ValueStorage::Shm(descriptor)),
+    ] {
+        for wire in [
+            encode_open_frame(1, &identity(), 3, CallMode::Unary, &empty, value).unwrap(),
+            encode_open_frame(1, &identity(), 3, CallMode::ServerStream, &empty, value).unwrap(),
+            encode_open_keyed_frame(1, &identity(), 3, "id", &empty, value).unwrap(),
+        ] {
+            let (header, payload) = decode_frame(&wire).unwrap();
+            let (_, _, _, _, _, value_offset) = decode_open_metadata(payload).unwrap();
+            for segment in [
+                raw_metadata([("A", "value")]),
+                raw_metadata([("a", "value ")]),
+                raw_metadata([("a", "one"), ("a", "two")]),
+                raw_metadata([("b", ""), ("a", "")]),
+                raw_metadata((0..65).map(|i| (format!("k{i:02}"), ""))),
+            ] {
+                let malformed = [
+                    &payload[..value_offset - 1],
+                    &segment,
+                    &payload[value_offset..],
+                ]
+                .concat();
+                let mut header = header;
+                header.total_len = 12 + malformed.len() as u32;
+                let failure =
+                    decode_rpc_record_with_carrier(&header, &malformed, None).unwrap_err();
+                assert!(
+                    failure.error.is_call_metadata_validation(),
+                    "{}",
+                    failure.error
+                );
+                assert_eq!(failure.carrier, Some(descriptor));
+
+                let truncated = &malformed[..malformed.len() - 1];
+                header.total_len -= 1;
+                let failure = decode_rpc_record_with_carrier(&header, truncated, None).unwrap_err();
+                assert!(
+                    !failure.error.is_call_metadata_validation(),
+                    "{}",
+                    failure.error
+                );
+                assert_eq!(failure.carrier, None);
+            }
+        }
+    }
+}
+
+#[test]
+fn control_and_valueless_open_records_validate_structure_before_metadata_semantics() {
+    use c2_wire::rpc::encode_admit_topic_frame;
+
+    let empty = CallMetadata::empty();
+    let segment = raw_metadata([("A", "first"), ("b", " trailing "), ("c", "last")]);
+    let options = WireSubscribeOptions {
+        start: WireTopicStart::Next,
+        on_lag: WireLagPolicy::Error,
+    };
+    for wire in [
+        encode_query_call_frame(15, &identity(), "id", &empty).unwrap(),
+        encode_admit_topic_frame(15, 14, &empty).unwrap(),
+        encode_open_recover_frame(15, &identity(), 3, "id", &empty).unwrap(),
+        encode_open_subscribe_frame(15, &identity(), "state", options, &empty).unwrap(),
+    ] {
+        let (mut header, payload) = decode_frame(&wire).unwrap();
+        let mut malformed = [&payload[..payload.len() - 1], &segment].concat();
+        header.total_len = 12 + malformed.len() as u32;
+        let error = decode_rpc_record(&header, &malformed, None).unwrap_err();
+        assert!(error.is_call_metadata_validation(), "{error}");
+        assert!(
+            error.to_string().contains("key must contain only"),
+            "{error}"
+        );
+
+        let truncated = &malformed[..malformed.len() - 1];
+        header.total_len -= 1;
+        let error = decode_rpc_record(&header, truncated, None).unwrap_err();
+        assert!(!error.is_call_metadata_validation());
+        assert!(
+            matches!(
+                error,
+                DecodeError::Truncated {
+                    field: "call_metadata value",
+                    ..
+                }
+            ),
+            "{error}"
+        );
+
+        malformed.push(0xff);
+        header.total_len += 2;
+        let error = decode_rpc_record(&header, &malformed, None).unwrap_err();
+        assert!(!error.is_call_metadata_validation());
+        assert!(
+            matches!(error, DecodeError::InvalidValue { value: 1, .. }),
+            "{error}"
+        );
+    }
+}
+
+#[test]
+fn ready_requires_two_sequences_and_a_start_at_or_before_the_next_head() {
+    for (start_seq, head_seq) in [(1, 0), (4, 5), (6, 5), (u64::MAX, u64::MAX)] {
+        let wire = encode_ready_frame(1, start_seq, head_seq).unwrap();
+        let (header, payload) = decode_frame(&wire).unwrap();
+        assert_eq!(payload.len(), 17);
+        assert_eq!(
+            decode_rpc_record(&header, payload, Some(CallMode::Subscribe)).unwrap(),
+            RpcRecord::Ready {
+                start_seq,
+                head_seq
+            }
+        );
+
+        let mut shortened = header;
+        shortened.total_len -= 8;
+        assert!(decode_rpc_record(&shortened, &payload[..9], None).is_err());
+
+        for invalid_start in [0, head_seq.saturating_add(2)] {
+            if invalid_start == u64::MAX {
+                continue;
+            }
+            assert!(encode_ready_frame(1, invalid_start, head_seq).is_err());
+            let mut malformed = payload.to_vec();
+            malformed[1..9].copy_from_slice(&invalid_start.to_le_bytes());
+            assert!(decode_rpc_record(&header, &malformed, None).is_err());
+        }
+    }
+    assert!(encode_ready_frame(0, 1, 1).is_err());
+}
+
+#[test]
+fn admit_topic_roundtrips_and_enforces_direction_request_id_and_storage() {
+    use c2_wire::flags::{FLAG_BUDDY, FLAG_RESPONSE};
+    use c2_wire::rpc::{
+        WireAdmitTopicResult, encode_admit_topic_draft_frame, encode_admit_topic_frame,
+        encode_admit_topic_result_frame,
+    };
+
+    let metadata = CallMetadata::from_entries([("token", "allowed")]).unwrap();
+    let request = encode_admit_topic_frame(42, 7, &metadata).unwrap();
+    let mut draft = encode_admit_topic_draft_frame(7, &metadata).unwrap();
+    draft[4..12].copy_from_slice(&42u64.to_le_bytes());
+    assert_eq!(draft, request);
+    assert!(encode_admit_topic_frame(0, 7, &metadata).is_err());
+    assert!(encode_admit_topic_frame(42, 0, &metadata).is_err());
+    assert!(encode_admit_topic_draft_frame(0, &metadata).is_err());
+    let (header, payload) = decode_frame(&request).unwrap();
+    assert_eq!(
+        decode_rpc_record(&header, payload, None).unwrap(),
+        RpcRecord::AdmitTopic {
+            subscription_stream_id: 7,
+            metadata
+        }
+    );
+    let mut zero_stream = payload.to_vec();
+    zero_stream[1..9].fill(0);
+    assert!(decode_rpc_record(&header, &zero_stream, None).is_err());
+
+    let allowed = WireAdmitTopicResult::Allowed { head_seq: 0 };
+    let denied = WireAdmitTopicResult::Error(C2Error::new(ErrorCode::AdmissionDenied, "denied"));
+    let allowed_wire = encode_admit_topic_result_frame(42, &allowed).unwrap();
+    let denied_wire = encode_admit_topic_result_frame(42, &denied).unwrap();
+    for (bytes, expected) in [(&allowed_wire, allowed), (&denied_wire, denied)] {
+        let (header, payload) = decode_frame(bytes).unwrap();
+        assert_eq!(
+            decode_rpc_record(&header, payload, None).unwrap(),
+            RpcRecord::AdmitTopicResult(expected)
+        );
+    }
+    assert!(
+        encode_admit_topic_result_frame(0, &WireAdmitTopicResult::Allowed { head_seq: 0 }).is_err()
+    );
+    for bytes in [&request, &allowed_wire, &denied_wire] {
+        let (header, payload) = decode_frame(bytes).unwrap();
+        let mut bad = header;
+        bad.flags ^= FLAG_RESPONSE;
+        assert!(decode_rpc_record(&bad, payload, None).is_err());
+        bad = header;
+        bad.flags |= FLAG_BUDDY;
+        assert!(decode_rpc_record(&bad, payload, None).is_err());
+        bad = header;
+        bad.flags |= FLAG_CHUNKED;
+        assert!(decode_rpc_record(&bad, payload, None).is_err());
+        bad = header;
+        bad.request_id = 0;
+        assert!(decode_rpc_record(&bad, payload, None).is_err());
+    }
+
+    let huge = C2Error::new(ErrorCode::AdmissionDenied, "x".repeat(20_000));
+    let wire = encode_admit_topic_result_frame(42, &WireAdmitTopicResult::Error(huge)).unwrap();
+    let (mut header, payload) = decode_frame(&wire).unwrap();
+    assert!(payload.len() <= MAX_QUERY_CALL_ERROR_BYTES + 2);
+    assert!(matches!(
+        decode_rpc_record(&header, payload, None).unwrap(),
+        RpcRecord::AdmitTopicResult(WireAdmitTopicResult::Error(error))
+            if error.code == ErrorCode::AdmissionDenied
+                && error.details.get("truncated").map(String::as_str) == Some("true")
+    ));
+
+    let oversized = [&[14, 1][..], &[0; MAX_QUERY_CALL_ERROR_BYTES + 1][..]].concat();
+    for malformed in [
+        &[14, 2][..],                            // Unknown tag.
+        &[14, 0, 0][..],                         // Short allowed result.
+        &[14, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0][..], // Extra allowed byte.
+        &[14, 1][..],                            // Empty error.
+        b"\x0e\x01{}",
+        &oversized,
+    ] {
+        header.total_len = 12 + malformed.len() as u32;
+        assert!(decode_rpc_record(&header, malformed, None).is_err());
+    }
 }
