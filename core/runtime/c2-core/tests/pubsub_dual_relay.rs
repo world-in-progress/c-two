@@ -549,6 +549,22 @@ fn raw_topic_request_bytes(path: &str, extra_headers: &[(&str, &str)]) -> String
     request
 }
 
+fn raw_get_json(address: SocketAddr, path: &str) -> Value {
+    let mut stream = std::net::TcpStream::connect(address).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    let request = format!("GET {path} HTTP/1.1\r\nHost: relay\r\nConnection: close\r\n\r\n");
+    stream.write_all(request.as_bytes()).unwrap();
+    let mut bytes = Vec::new();
+    stream.read_to_end(&mut bytes).unwrap();
+    let header_end = bytes
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .expect("HTTP headers");
+    serde_json::from_slice(&bytes[header_end + 4..]).expect("valid JSON response")
+}
+
 fn raw_topic_request(
     address: SocketAddr,
     path: &str,
@@ -560,20 +576,33 @@ fn raw_topic_request(
         .unwrap();
     let request = raw_topic_request_bytes(path, extra_headers);
     stream.write_all(request.as_bytes()).unwrap();
-    let mut bytes = Vec::new();
-    stream.read_to_end(&mut bytes).unwrap();
-    let header_end = bytes
-        .windows(4)
-        .position(|window| window == b"\r\n\r\n")
-        .expect("HTTP headers");
-    let status: u16 = std::str::from_utf8(&bytes[..12])
+    let mut header_bytes = Vec::new();
+    while !header_bytes.ends_with(b"\r\n\r\n") {
+        let mut byte = [0u8; 1];
+        stream.read_exact(&mut byte).unwrap();
+        header_bytes.push(byte[0]);
+    }
+    let status: u16 = std::str::from_utf8(&header_bytes[..12])
         .unwrap()
         .split_whitespace()
         .nth(1)
         .unwrap()
         .parse()
         .unwrap();
-    let body = bytes[header_end + 4..].to_vec();
+    let headers_lower = std::str::from_utf8(&header_bytes)
+        .unwrap()
+        .to_ascii_lowercase();
+    // Streaming 200 topic responses never terminate; fail immediately instead of
+    // blocking read_to_end or silently returning an empty body inside retry loops.
+    // Finite 200 responses (such as /_c2/topics/confirm) do not carry the stream
+    // media type and continue through read_to_end below.
+    assert!(
+        !headers_lower.contains("application/vnd.c-two.topic-stream"),
+        "raw_topic_request expects a finite response, got streaming topic response: {}",
+        String::from_utf8_lossy(&header_bytes)
+    );
+    let mut body = Vec::new();
+    stream.read_to_end(&mut body).unwrap();
     // A refusal has no chunked body; strip the terminating chunk if present.
     let body = body
         .strip_suffix(b"0\r\n\r\n")
@@ -1206,20 +1235,29 @@ fn mesh_route_conflict_refuses_remote_subscriptions_pre_dispatch() {
         )
         .unwrap();
     let mut b_registration = DualRelay::register_route(&b_host, "topic-route");
-    // Release the join: B merges A's snapshot next to its own registration.
+    // Release the join: wait until B's mesh view observes the conflict before
+    // sending the topic subscribe request (otherwise an early request before
+    // gossip completes would legitimately open a live 200 topic stream on B).
     fixture.a.set_target(fixture.relay_a.local_addr());
     wait_until(|| {
-        let (status, body) = raw_topic_request(
-            fixture.relay_b.local_addr(),
-            "/_c2/topics/subscribe?route=topic-route&topic=state",
-            &[],
-        );
-        status == 409
-            && serde_json::from_slice::<Value>(&body).is_ok_and(|json| {
-                json["code"] == 719 && json["details"]["dispatch_phase"] == "pre_dispatch"
-            })
+        let json = raw_get_json(fixture.relay_b.local_addr(), "/_routes");
+        json["routes"].as_array().is_some_and(|routes| {
+            routes
+                .iter()
+                .any(|route| route["name"] == "topic-route" && route["conflict"] == true)
+        })
     });
+    let (status, body) = raw_topic_request(
+        fixture.relay_b.local_addr(),
+        "/_c2/topics/subscribe?route=topic-route&topic=state",
+        &[],
+    );
+    assert_eq!(status, 409);
+    let json: Value = serde_json::from_slice(&body).expect("conflict error JSON");
+    assert_eq!(json["code"], 719);
+    assert_eq!(json["details"]["dispatch_phase"], "pre_dispatch");
     assert_eq!(fixture.registration.active_subscribers(), 0);
+    assert_eq!(b_registration.active_subscribers(), 0);
     let _ = b_registration.close();
     let _ = b_host.shutdown();
 }
