@@ -2200,6 +2200,7 @@ function outcomeRelay(route, handle, factory = transport.createHttpRelayEncodedT
     async fetch(input, init) {
       const url = new URL(input);
       if (url.pathname.startsWith('/_resolve') || url.pathname.startsWith('/_probe')) {
+        assert.ok(Object.keys(init.headers).every(key => !key.toLowerCase().startsWith('x-c2-meta-')));
         const path = url.pathname.split('/');
         const resolvedRoute = path.length === 2 ? url.searchParams.get('route') : decodeURIComponent(path[2]);
         assert.equal(resolvedRoute, route);
@@ -2248,7 +2249,7 @@ test('outcome endpoints carry the scoped route, method, contract and call ID wit
     }
   }
   const plain = outcomeRelay('route', (url, init) => {
-    assert.equal(url.pathname, '/route/step');
+    assert.equal(url.pathname + url.search, '/_c2/calls/call?route=route&method=step');
     assert.equal(init.redirect, 'error');
     assert.equal(init.headers['x-c2-call-id'], undefined);
     return new Response('');
@@ -2369,11 +2370,113 @@ test('Fetch never repeats a business POST at the redirect destination', async ()
       }
     }
     assert.deepEqual(requests, Array(2).fill([
-      ['POST','/route/step'], ['POST','/_c2/calls/keyed?route=route&method=step'],
+      ['POST','/_c2/calls/call?route=route&method=step'], ['POST','/_c2/calls/keyed?route=route&method=step'],
       ['POST','/_c2/calls/recover?route=route&method=step'],
     ]).flat());
   } finally {
     await client.close();
     await new Promise(resolve => server.close(resolve));
+  }
+});
+
+test('call and outcome metadata are sent only to business URLs', async () => {
+  const path = 'route / 雪';
+  const requests = [];
+  const {client} = outcomeRelay(path, (url, init) => {
+    requests.push([init.method, url.pathname, init.headers['x-c2-meta-token'], init.headers['x-c2-meta-empty']]);
+    assert.equal(url.searchParams.get('route'), path);
+    if (url.pathname === '/_c2/calls/outcome') return Response.json(unknownOutcome);
+    assert.equal(url.searchParams.get('method'), 'method 雪 ?');
+    return new Response('');
+  });
+  const view = {timeoutMs:null, metadata:{token:'trace-1', empty:''}};
+  const encode = () => new Uint8Array();
+  await client.call(path, contract, 'method 雪 ?', encode, undefined, view);
+  await client.call(path, contract, 'method 雪 ?', encode, {callId:'track'}, view);
+  await client.recoverCall(path, contract, 'method 雪 ?', 'track', view);
+  await client.queryCall(path, contract, 'track', view);
+  await client.call(path, contract, 'method 雪 ?', encode, undefined, {metadata:null});
+  assert.deepEqual(requests, [
+    ['POST','/_c2/calls/call','trace-1',''],
+    ['POST','/_c2/calls/keyed','trace-1',''],
+    ['POST','/_c2/calls/recover','trace-1',''],
+    ['GET','/_c2/calls/outcome','trace-1',''],
+    ['POST','/_c2/calls/call',undefined,undefined],
+  ]);
+  await client.close();
+  assert.throws(() => transport.createHttpRelayEncodedTransport('https://relay.invalid', {
+    headers:{'X-C2-MeTa-Token':'transport token'},
+  }), /reserved C-Two HTTP header/i);
+});
+
+test('HTTP admission and metadata refusals preserve the acquired target', async () => {
+  let reply;
+  const {client, acquired} = outcomeRelay('route', () => reply());
+  const call = () => client.call('route', contract, 'step', () => new Uint8Array());
+  for (const [status, code, name, stage] of [
+    [403, 724, 'AdmissionDenied', undefined],
+    [400, 713, 'ProtocolViolation', 'call_metadata_validation'],
+  ]) {
+    reply = () => Response.json({version:1, code, name, message:'refused', details:{
+      dispatch_phase:'pre_dispatch', ...(stage === undefined ? {} : {stage}),
+    }}, {status});
+    await assert.rejects(call(), error =>
+      error.code === code && error.transportPhase === 'pre_dispatch' && !error.retrySafe);
+  }
+  for (const [status, body] of [
+    [403, 'Forbidden'],
+    [404, 'Not Found'],
+    [404, JSON.stringify({version:1, code:724, name:'AdmissionDenied', message:'refused',
+      details:{dispatch_phase:'pre_dispatch'}})],
+    [403, JSON.stringify({version:1, code:724, name:'AdmissionDenied', message:'refused',
+      details:{transport_phase:'dispatch_uncertain'}})],
+  ]) {
+    reply = () => new Response(body, {status});
+    await assert.rejects(call(), error =>
+      error.status === status && error.transportPhase === 'dispatch_uncertain' && !error.retrySafe);
+  }
+  reply = () => new Response('');
+  await call();
+  assert.deepEqual(acquired, ['_resolve', '_probe']);
+  await client.close();
+});
+
+test('subscription deadlines use explicit options, then the view, then unlimited', async () => {
+  const opened = [];
+  const endpoint = {
+    connectionSnapshot: () => null,
+    async prepare() {},
+    async openSubscription(route, topic, policy, timeout) {
+      opened.push({route, topic, policy, timeout});
+      return {startSeq:1n, topic, async close(){return receipt}, checkDeadline(){}, cancel(){}};
+    },
+    async close() {},
+  };
+  for (const client of [
+    transport.createIpcEncodedTransport('ipc://subscriptions', {connect:async()=>endpoint, callTimeoutMs:1}),
+    transport.createHttpRelayEncodedTransport('https://relay.invalid', {connect:async()=>endpoint}),
+  ]) {
+    const subscribe = (options, view) => client.subscribe('route', contract, 'state', bytes=>bytes, options, false, view);
+    const check = async (options, view, min, max) => {
+      const sub = await subscribe(options, view);
+      const {timeout, policy, topic} = opened.pop();
+      assert.equal(topic, 'state');
+      assert.deepEqual(policy.metadata, view?.metadata);
+      if (max === null) assert.equal(timeout, null);
+      else assert.ok(timeout >= min && timeout <= max, `out-of-range timeout ${timeout}`);
+      await sub.close();
+    };
+    const metadata = {token:'sub'};
+    await check(undefined, undefined, null, null);
+    await check(undefined, {timeoutMs:20_000, metadata}, 10_000, 20_000);
+    await check({timeoutMs:8_000}, {timeoutMs:20_000, metadata}, 4_000, 8_000);
+    await check({timeoutMs:null}, {timeoutMs:0, metadata}, null, null);
+    await check({timeoutMs:8_000}, {timeoutMs:null, metadata}, 4_000, 8_000);
+    await assert.rejects(subscribe(undefined, {timeoutMs:0, metadata}),
+      error => error.code === 715 && error.transportPhase === 'pre_dispatch');
+    await assert.rejects(subscribe({timeoutMs:0}, {timeoutMs:null, metadata}),
+      error => error.code === 715 && error.transportPhase === 'pre_dispatch');
+    assert.deepEqual(opened, []);
+    await client.close();
   }
 });

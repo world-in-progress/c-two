@@ -32,9 +32,10 @@ class Scheduler:
     guard used by IPC dispatch while preserving the public SDK config types.
     """
 
-    def __init__(self, native: Any, method_index: dict[str, int]) -> None:
+    def __init__(self, native: Any, method_index: dict[str, int], *, registration=None) -> None:
         self._native = native
         self._method_index = dict(method_index)
+        self._registration = registration
 
     def method_idx(self, method_name: str) -> int:
         return self._method_index[method_name]
@@ -45,6 +46,12 @@ class Scheduler:
 
     def snapshot(self) -> Any:
         return self._native.snapshot()
+
+    @property
+    def is_closed(self) -> bool:
+        return self.snapshot().closed or (
+            self._registration is not None and self._registration.is_closed
+        )
 
     def execution_guard(self, method_idx: int):
         return self._native.execution_guard(method_idx)

@@ -164,11 +164,14 @@ class TestServeSubprocess:
         interrupt_python_process(proc)
 
         try:
-            proc.wait(timeout=10.0)
+            proc.communicate(timeout=10.0)
         except subprocess.TimeoutExpired:
             proc.kill()
-            proc.wait()
-            pytest.fail('Process did not exit after a console interrupt')
+            stdout, stderr = proc.communicate(timeout=5.0)
+            pytest.fail(
+                'Process did not exit after a console interrupt\n'
+                f'stdout:\n{stdout}\nstderr:\n{stderr}'
+            )
 
         assert proc.returncode == 0
 

@@ -215,6 +215,7 @@ impl OutcomeHarness {
                     &identity,
                     method_idx,
                     call_id,
+                    &c2_config::CallMetadata::empty(),
                     ValuePart::whole(ValueStorage::Inline(input)),
                 )
                 .unwrap(),
@@ -231,9 +232,18 @@ impl OutcomeHarness {
         call_id: &str,
         method_idx: u16,
     ) {
-        peer.write_all(&rpc::encode_open_recover_frame(id, identity, method_idx, call_id).unwrap())
-            .await
-            .unwrap();
+        peer.write_all(
+            &rpc::encode_open_recover_frame(
+                id,
+                identity,
+                method_idx,
+                call_id,
+                &c2_config::CallMetadata::empty(),
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
     }
 
     async fn query_on(
@@ -242,9 +252,12 @@ impl OutcomeHarness {
         id: u64,
         call_id: &str,
     ) {
-        peer.write_all(&rpc::encode_query_call_frame(id, identity, call_id).unwrap())
-            .await
-            .unwrap();
+        peer.write_all(
+            &rpc::encode_query_call_frame(id, identity, call_id, &c2_config::CallMetadata::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
     }
 
     async fn stop(mut self) {
@@ -590,6 +603,7 @@ async fn conflicts_revocation_and_shared_shm_multi_waiter_delivery() {
                 &identity,
                 1,
                 "conflict",
+                &c2_config::CallMetadata::empty(),
                 ValuePart::whole(ValueStorage::Inline(b"a")),
             )
             .unwrap(),
@@ -631,6 +645,7 @@ async fn conflicts_revocation_and_shared_shm_multi_waiter_delivery() {
                 &identity,
                 0,
                 "truncated",
+                &c2_config::CallMetadata::empty(),
                 ValuePart::first(1024, ValueStorage::Inline(&first)),
             )
             .unwrap(),
@@ -649,6 +664,7 @@ async fn conflicts_revocation_and_shared_shm_multi_waiter_delivery() {
                 &harness.identity,
                 0,
                 "truncated",
+                &c2_config::CallMetadata::empty(),
                 ValuePart::whole(ValueStorage::Inline(b"eventual-duplicate")),
             )
             .unwrap(),
@@ -873,6 +889,7 @@ async fn unregister_waits_for_detached_execution_and_revokes_partial_input() {
                 &harness.identity,
                 0,
                 "partial",
+                &c2_config::CallMetadata::empty(),
                 ValuePart::first(32, ValueStorage::Inline(b"never completed")),
             )
             .unwrap(),
@@ -987,6 +1004,7 @@ async fn query_overload_and_contract_mismatch_are_control_errors() {
             &harness.identity,
             0,
             "still-open",
+            &c2_config::CallMetadata::empty(),
             ValuePart::whole(ValueStorage::Inline(b"in")),
         )
         .unwrap(),
@@ -1065,6 +1083,7 @@ async fn reassembly_retries_after_memory_shortfall_without_shedding_for_permanen
                 &identity,
                 0,
                 "cannot-fit",
+                &c2_config::CallMetadata::empty(),
                 ValuePart::first(MEMORY, ValueStorage::Inline(&part)),
             )
             .unwrap(),
@@ -1103,6 +1122,7 @@ async fn reassembly_retries_after_memory_shortfall_without_shedding_for_permanen
                 &identity,
                 0,
                 "fits-after-shedding",
+                &c2_config::CallMetadata::empty(),
                 ValuePart::first(2 * PART as u64, ValueStorage::Inline(&part)),
             )
             .unwrap(),

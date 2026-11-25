@@ -2,6 +2,7 @@ mod admission;
 pub mod config;
 pub mod connection;
 mod dispatcher;
+mod hook;
 mod outcome;
 pub mod response;
 pub mod runtime;
@@ -19,6 +20,11 @@ pub use connection::Connection;
 pub use dispatcher::{
     BuiltRoute, CrmCallback, CrmError, CrmStream, CrmStreamCallback, CrmStreamItem,
     PreparedShmResponse, ResponseMeta, RouteBuildSpec,
+};
+pub use hook::{
+    AdmissionContext, AdmissionDecision, AdmissionHook, AdmissionOperation, AdmissionRejection,
+    AdmissionTransport, CallContext, CallContextGuard, current_call_context, enter_call_context,
+    evaluate_admission_hook,
 };
 pub use runtime::{ServerRuntimeBuilder, ServerRuntimeOptions};
 pub use scheduler::{

@@ -502,48 +502,83 @@ pub fn normalize_http_error(error: HttpError, phase: TransportPhase) -> Error {
 }
 
 fn normalize_http_call_semantic_bytes(bytes: &[u8], status: u16, phase: TransportPhase) -> Error {
-    let parsed = C2Error::from_json_bytes(bytes).map_err(|error| error.to_string());
-    let mut semantic = match parsed {
-        Ok(mut semantic) => {
-            if status == 500 || semantic.code == ErrorCode::CallResultUnavailable {
-                clear_resource_failure_phase(&mut semantic);
-            } else if phase == TransportPhase::PreDispatch
-                && semantic.code != ErrorCode::Unknown
-                && semantic
-                    .details
-                    .get("dispatch_phase")
-                    .is_none_or(|phase| phase == "pre_dispatch")
-                && semantic
-                    .details
-                    .get("transport_phase")
-                    .is_none_or(|phase| phase == "pre_dispatch")
-                && ((status == 404 && semantic.code == ErrorCode::ResourceNotFound)
-                    || semantic
-                        .details
-                        .get("dispatch_phase")
-                        .is_some_and(|phase| phase == "pre_dispatch"))
-            {
-                semantic
-                    .details
-                    .insert("transport_phase".into(), "pre_dispatch".into());
-            } else {
-                semantic
-                    .details
-                    .insert("transport_phase".into(), "dispatch_uncertain".into());
-            }
-            return Error::Semantic(semantic);
-        }
-        Err(reason) => protocol_violation("HTTP semantic error envelope is malformed", "http", &reason),
-    };
-    if status != 500 {
-        let phase_name = match phase {
-            TransportPhase::PreDispatch => "pre_dispatch",
-            TransportPhase::DispatchUncertain => "dispatch_uncertain",
+    if status == 500 {
+        let mut semantic = match C2Error::from_json_bytes(bytes) {
+            Ok(semantic) => semantic,
+            Err(error) => protocol_violation(
+                "HTTP semantic error envelope is malformed",
+                "http",
+                &error.to_string(),
+            ),
         };
+        clear_resource_failure_phase(&mut semantic);
+        return Error::Semantic(semantic);
+    }
+
+    if let Some(mut semantic) = c2_http::decode_control_error(status, bytes) {
         semantic
             .details
-            .insert("transport_phase".into(), phase_name.into());
+            .insert("transport_phase".into(), "pre_dispatch".into());
+        return Error::Semantic(semantic);
     }
+
+    let requires_control_proof = matches!(status, 200..=299 | 403 | 404);
+    let (mut semantic, phase) = match C2Error::from_json_bytes(bytes) {
+        Ok(mut semantic) if status == 200 && semantic.code == ErrorCode::ProtocolViolation => {
+            clear_resource_failure_phase(&mut semantic);
+            (semantic, TransportPhase::DispatchUncertain)
+        }
+        Ok(mut semantic)
+            if !requires_control_proof
+                && !matches!(
+                    semantic.code,
+                    ErrorCode::AdmissionDenied | ErrorCode::ResourceNotFound
+                )
+                && semantic.details.get("dispatch_phase").map(String::as_str)
+                    != Some("pre_dispatch") =>
+        {
+            let dispatch_phase = semantic
+                .details
+                .get("dispatch_phase")
+                .filter(|phase| phase.as_str() == "dispatch_uncertain")
+                .cloned();
+            clear_resource_failure_phase(&mut semantic);
+            if let Some(dispatch_phase) = dispatch_phase {
+                semantic
+                    .details
+                    .insert("dispatch_phase".into(), dispatch_phase);
+            }
+            (semantic, TransportPhase::DispatchUncertain)
+        }
+        Ok(semantic) => (
+            protocol_violation(
+                "HTTP status, error code or dispatch phase is inconsistent",
+                "http",
+                &format!("HTTP {status}, C2E1 {}", u16::from(semantic.code)),
+            ),
+            TransportPhase::DispatchUncertain,
+        ),
+        Err(error) => (
+            protocol_violation(
+                "HTTP semantic error envelope is malformed",
+                "http",
+                &error.to_string(),
+            ),
+            if requires_control_proof {
+                TransportPhase::DispatchUncertain
+            } else {
+                phase
+            },
+        ),
+    };
+    semantic.details.insert(
+        "transport_phase".into(),
+        match phase {
+            TransportPhase::PreDispatch => "pre_dispatch",
+            TransportPhase::DispatchUncertain => "dispatch_uncertain",
+        }
+        .into(),
+    );
     Error::Semantic(semantic)
 }
 
@@ -565,10 +600,10 @@ fn clear_resource_failure_phase(error: &mut C2Error) {
 /// Isolate an error that escaped a resource callback from the current Host's
 /// dispatch authority and outcome table.
 pub fn strip_callback_error_phases(error: &mut C2Error) {
-    if error.code.is_outcome_control() {
+    if error.code.is_host_control() {
         *error = C2Error::new(
             ErrorCode::ResourceFunctionExecuting,
-            "resource callback returned an inner call outcome error",
+            "resource callback returned an inner Host control error",
         )
         .with_details(BTreeMap::from([
             ("cause_code".into(), u16::from(error.code).to_string()),
@@ -992,6 +1027,96 @@ mod native_boundary_tests {
     }
 
     #[test]
+    fn http_call_control_claims_must_agree_with_the_status_and_phase() {
+        for (status, code, dispatch_phase, expected_code, expected_phase) in [
+            (
+                404,
+                ErrorCode::ResourceNotFound,
+                None,
+                ErrorCode::ResourceNotFound,
+                TransportPhase::PreDispatch,
+            ),
+            (
+                403,
+                ErrorCode::AdmissionDenied,
+                Some("pre_dispatch"),
+                ErrorCode::AdmissionDenied,
+                TransportPhase::PreDispatch,
+            ),
+            (
+                403,
+                ErrorCode::AdmissionDenied,
+                Some("dispatch_uncertain"),
+                ErrorCode::ProtocolViolation,
+                TransportPhase::DispatchUncertain,
+            ),
+            (
+                404,
+                ErrorCode::ResourceNotFound,
+                Some("dispatch_uncertain"),
+                ErrorCode::ProtocolViolation,
+                TransportPhase::DispatchUncertain,
+            ),
+            (
+                403,
+                ErrorCode::ResourceNotFound,
+                Some("pre_dispatch"),
+                ErrorCode::ProtocolViolation,
+                TransportPhase::DispatchUncertain,
+            ),
+            (
+                503,
+                ErrorCode::AdmissionDenied,
+                Some("pre_dispatch"),
+                ErrorCode::ProtocolViolation,
+                TransportPhase::DispatchUncertain,
+            ),
+            (
+                200,
+                ErrorCode::ProtocolViolation,
+                Some("pre_dispatch"),
+                ErrorCode::ProtocolViolation,
+                TransportPhase::DispatchUncertain,
+            ),
+        ] {
+            let mut semantic =
+                C2Error::new(code, "control reply").with_details(BTreeMap::from([(
+                    "reason".into(),
+                    "invalid_outcome".into(),
+                )]));
+            if let Some(phase) = dispatch_phase {
+                semantic
+                    .details
+                    .insert("dispatch_phase".into(), phase.into());
+            }
+            let normalized = normalize_http_error(
+                HttpError::ResponseError(status, serde_json::to_vec(&semantic.envelope()).unwrap()),
+                TransportPhase::PreDispatch,
+            );
+            assert_eq!(normalized.transport_phase(), Some(expected_phase));
+            let Error::Semantic(actual) = normalized else {
+                panic!("expected a semantic error");
+            };
+            assert_eq!(actual.code, expected_code);
+            if status == 200 {
+                assert_eq!(actual.details["reason"], "invalid_outcome");
+                assert!(!actual.details.contains_key("dispatch_phase"));
+            }
+        }
+        let bare = normalize_http_error(
+            HttpError::ResponseError(404, b"not found".to_vec()),
+            TransportPhase::PreDispatch,
+        );
+        assert_eq!(
+            bare.transport_phase(),
+            Some(TransportPhase::DispatchUncertain)
+        );
+        assert!(
+            matches!(bare, Error::Semantic(error) if error.code == ErrorCode::ProtocolViolation)
+        );
+    }
+
+    #[test]
     fn local_call_rejection_keeps_semantic_code_and_no_fallback_details() {
         for code in [
             ErrorCode::CallDeadlineExceeded,
@@ -1059,20 +1184,13 @@ mod native_boundary_tests {
             ]));
         let body = serde_json::to_string(&semantic.envelope()).unwrap();
         let raw_bytes = body.clone().into_bytes();
-        let budget = c2_mem::DomainBudget::from_limits(&c2_config::DomainLimits {
-            memory_budget_bytes: (raw_bytes.capacity().max(1)) as u64,
-            ..Default::default()
-        });
-        let reservation = budget
-            .try_reserve_memory(raw_bytes.capacity() as u64)
-            .unwrap();
         for error in [
             normalize_http_error(
                 HttpError::ServerError(502, body),
                 TransportPhase::DispatchUncertain,
             ),
             normalize_http_error(
-                HttpError::ResponseError(502, c2_mem::BudgetedBuffer::new(raw_bytes, reservation)),
+                HttpError::ResponseError(502, raw_bytes),
                 TransportPhase::DispatchUncertain,
             ),
         ] {
@@ -1108,9 +1226,10 @@ mod native_boundary_tests {
         assert_eq!(ipc_failed.details, BTreeMap::from([("route".into(), "downstream".into())]));
 
         let http_body = serde_json::to_string(&inner.envelope()).unwrap();
-        let Error::Semantic(http_failed) =
-            normalize_http_error(HttpError::ServerError(500, http_body), TransportPhase::DispatchUncertain)
-        else {
+        let Error::Semantic(http_failed) = normalize_http_error(
+            HttpError::ServerError(500, http_body),
+            TransportPhase::DispatchUncertain,
+        ) else {
             panic!("expected semantic error");
         };
         assert_eq!(http_failed.details, BTreeMap::from([("route".into(), "downstream".into())]));
@@ -1118,25 +1237,18 @@ mod native_boundary_tests {
 
     #[test]
     fn malformed_and_non_utf8_http_error_bodies_preserve_outer_phase() {
-        let budget = c2_mem::DomainBudget::from_limits(&c2_config::DomainLimits {
-            memory_budget_bytes: 64,
-            ..Default::default()
-        });
         for (phase, expected) in [
-            (TransportPhase::PreDispatch, Some(TransportPhase::PreDispatch)),
+            (
+                TransportPhase::PreDispatch,
+                Some(TransportPhase::PreDispatch),
+            ),
             (
                 TransportPhase::DispatchUncertain,
                 Some(TransportPhase::DispatchUncertain),
             ),
         ] {
             let non_utf8 = vec![0xff, 0xfe, 0xfd];
-            let reservation = budget
-                .try_reserve_memory(non_utf8.capacity() as u64)
-                .unwrap();
-            let err_bytes = normalize_http_error(
-                HttpError::ResponseError(502, c2_mem::BudgetedBuffer::new(non_utf8, reservation)),
-                phase,
-            );
+            let err_bytes = normalize_http_error(HttpError::ResponseError(502, non_utf8), phase);
             assert_eq!(err_bytes.transport_phase(), expected);
             let Error::Semantic(actual) = err_bytes else {
                 panic!("expected ProtocolViolation");

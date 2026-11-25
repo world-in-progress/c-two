@@ -1,4 +1,5 @@
 use super::*;
+use crate::tests::EMPTY_METADATA;
 use c2_wire::release::{ReleaseBatch, decode_release_frame, encode_release_frame};
 
 #[derive(Clone, Copy, Debug)]
@@ -180,12 +181,20 @@ async fn isolated_reply_failure(fault: ReplyFault) {
     let client = Arc::new(client);
     let target = tokio::spawn({
         let client = client.clone();
-        async move { client.call_inline(&identity(), 0, b"target").await }
+        async move {
+            client
+                .call_inline(&identity(), 0, b"target", &EMPTY_METADATA)
+                .await
+        }
     });
     request_seen.await.unwrap();
     let other = tokio::spawn({
         let client = client.clone();
-        async move { client.call_inline(&identity(), 0, b"other").await }
+        async move {
+            client
+                .call_inline(&identity(), 0, b"other", &EMPTY_METADATA)
+                .await
+        }
     });
     assembly_ready.await.unwrap();
     if partial {
@@ -247,7 +256,7 @@ async fn isolated_reply_failure(fault: ReplyFault) {
     );
     assert_eq!(
         client
-            .call_inline(&identity(), 0, b"ping")
+            .call_inline(&identity(), 0, b"ping", &EMPTY_METADATA)
             .await
             .unwrap()
             .into_owned_bytes()
@@ -375,11 +384,19 @@ async fn control_violations_deactivate_but_sent_inline_and_chunked_calls_finish(
         let client = Arc::new(client);
         let first = tokio::spawn({
             let client = client.clone();
-            async move { client.call_inline(&identity(), 0, b"first").await }
+            async move {
+                client
+                    .call_inline(&identity(), 0, b"first", &EMPTY_METADATA)
+                    .await
+            }
         });
         let second = tokio::spawn({
             let client = client.clone();
-            async move { client.call_inline(&identity(), 0, b"second").await }
+            async move {
+                client
+                    .call_inline(&identity(), 0, b"second", &EMPTY_METADATA)
+                    .await
+            }
         });
         requests_seen.await.unwrap();
         eventually(|| !client.is_connected()).await;
@@ -394,7 +411,7 @@ async fn control_violations_deactivate_but_sent_inline_and_chunked_calls_finish(
             fault < 2 || fault == 4
         );
         let rejected = client
-            .call_inline(&identity(), 0, b"new")
+            .call_inline(&identity(), 0, b"new", &EMPTY_METADATA)
             .await
             .unwrap_err();
         assert_eq!(rejected.phase(), crate::TransportPhase::PreDispatch);
@@ -434,7 +451,12 @@ async fn peer_views_keep_only_buddy_mappings_and_retire_on_close() {
         let peer = client.server_pool.lock().clone().unwrap();
         let binding = client.acquire_route(&contract()).await.unwrap();
         let held = client
-            .call_bound(&binding, "echo", &[9; SHM_THRESHOLD as usize + 1])
+            .call_bound(
+                &binding,
+                "echo",
+                &[9; SHM_THRESHOLD as usize + 1],
+                &EMPTY_METADATA,
+            )
             .await
             .unwrap()
             .into_owned_bytes()
@@ -459,7 +481,12 @@ async fn peer_views_keep_only_buddy_mappings_and_retire_on_close() {
         assert_eq!(held, vec![9; SHM_THRESHOLD as usize + 1]);
         assert_eq!(
             client
-                .call_bound(&binding, "echo", &[8; SHM_THRESHOLD as usize + 1])
+                .call_bound(
+                    &binding,
+                    "echo",
+                    &[8; SHM_THRESHOLD as usize + 1],
+                    &EMPTY_METADATA
+                )
                 .await
                 .unwrap()
                 .into_owned_bytes()
@@ -560,14 +587,18 @@ async fn configured_write_timeout_preserves_a_sent_calls_readable_reply() {
     let client = Arc::new(client);
     let other = tokio::spawn({
         let client = client.clone();
-        async move { client.call_inline(&identity(), 0, b"other").await }
+        async move {
+            client
+                .call_inline(&identity(), 0, b"other", &EMPTY_METADATA)
+                .await
+        }
     });
     request_seen.await.unwrap();
     let target = tokio::spawn({
         let client = client.clone();
         async move {
             client
-                .call_inline(&identity(), 0, &vec![7; 8 * 1024 * 1024])
+                .call_inline(&identity(), 0, &vec![7; 8 * 1024 * 1024], &EMPTY_METADATA)
                 .await
         }
     });
@@ -582,7 +613,7 @@ async fn configured_write_timeout_preserves_a_sent_calls_readable_reply() {
     assert_eq!(client.pending_len_for_test(), 2);
     assert_eq!(
         client
-            .call_inline(&identity(), 0, b"new")
+            .call_inline(&identity(), 0, b"new", &EMPTY_METADATA)
             .await
             .unwrap_err()
             .phase(),
@@ -640,11 +671,15 @@ async fn untrusted_frame_boundary_fails_all_sent_calls_and_waits_for_peer_end() 
     let client = Arc::new(client);
     let first = tokio::spawn({
         let client = client.clone();
-        async move { client.call_inline(&identity(), 0, b"first").await }
+        async move {
+            client
+                .call_inline(&identity(), 0, b"first", &EMPTY_METADATA)
+                .await
+        }
     });
     request_seen.await.unwrap();
     let second_identity = identity();
-    let second = client.call_inline(&second_identity, 0, b"second");
+    let second = client.call_inline(&second_identity, 0, b"second", &EMPTY_METADATA);
     let (first, second) = timeout(WAIT, async { tokio::join!(first, second) })
         .await
         .unwrap();
@@ -700,12 +735,20 @@ async fn zero_response_loan_deactivates_with_zero_shm_budget_and_preserves_other
     let client = Arc::new(client);
     let target = tokio::spawn({
         let client = client.clone();
-        async move { client.call_inline(&identity(), 0, b"target").await }
+        async move {
+            client
+                .call_inline(&identity(), 0, b"target", &EMPTY_METADATA)
+                .await
+        }
     });
     request_seen.await.unwrap();
     let other = tokio::spawn({
         let client = client.clone();
-        async move { client.call_inline(&identity(), 0, b"other").await }
+        async move {
+            client
+                .call_inline(&identity(), 0, b"other", &EMPTY_METADATA)
+                .await
+        }
     });
     let error = timeout(WAIT, target).await.unwrap().unwrap().unwrap_err();
     assert_eq!(error.phase(), crate::TransportPhase::DispatchUncertain);
@@ -806,6 +849,7 @@ async fn early_chunk_rejection_stops_at_the_frame_boundary_and_preserves_the_con
                         3 * CHUNK_SIZE as usize,
                         DEFAULT_MAX_PAYLOAD_SIZE,
                         source,
+                        &EMPTY_METADATA,
                     )
                     .await
             }
@@ -834,7 +878,7 @@ async fn early_chunk_rejection_stops_at_the_frame_boundary_and_preserves_the_con
         assert!(client.is_connected());
         assert_eq!(
             client
-                .call_inline(&identity(), 0, b"next")
+                .call_inline(&identity(), 0, b"next", &EMPTY_METADATA)
                 .await
                 .unwrap()
                 .into_owned_bytes()

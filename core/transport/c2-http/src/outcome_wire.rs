@@ -5,9 +5,6 @@ use serde::{Deserialize, Serialize};
 
 pub(crate) const MAX_OUTCOME_JSON_BYTES: usize = 1024;
 pub(crate) const CALL_ID_HEADER: &str = "x-c2-call-id";
-pub(crate) const KEYED_PATH: &str = "/_c2/calls/keyed";
-pub(crate) const RECOVER_PATH: &str = "/_c2/calls/recover";
-pub(crate) const OUTCOME_PATH: &str = "/_c2/calls/outcome";
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

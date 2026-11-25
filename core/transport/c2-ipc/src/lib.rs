@@ -8,7 +8,7 @@
 //! ```text
 //! HTTP handler
 //!     -> IpcClient::acquire_route(route contract)
-//!     -> IpcClient::call_bound(binding, method, payload)
+//!     -> IpcClient::call_bound(binding, method, payload, metadata)
 //!         -> select inline / buddy SHM / chunked request transport
 //!         -> send_task:  serialize frame -> write local stream
 //!         -> recv_task:  read local stream -> match request_id -> oneshot -> caller

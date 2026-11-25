@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::http::StatusCode;
-use c2_config::{DomainLimits, LocalEndpointContext, RelayConfig};
+use c2_config::{CallMetadata, DomainLimits, LocalEndpointContext, RelayConfig};
 use c2_ipc::{IpcClient, RouteBinding};
 use c2_mem::DomainBudget;
 use c2_server::{
@@ -324,7 +324,7 @@ async fn read_framed_reply<R: tokio::io::AsyncRead + Unpin>(
 
 fn request_head(socket: std::net::SocketAddr, method: &str, framing: &str) -> String {
     format!(
-        "POST /grid/{method} HTTP/1.1\r\nHost: {socket}\r\n{framing}\r\nConnection: close\r\nx-c2-expected-crm-ns: test.echo\r\nx-c2-expected-crm-name: Echo\r\nx-c2-expected-crm-ver: 0.1.0\r\nx-c2-expected-abi-hash: {TEST_ABI_HASH}\r\nx-c2-expected-signature-hash: {TEST_SIGNATURE_HASH}\r\n\r\n"
+        "POST /_c2/calls/call?route=grid&method={method} HTTP/1.1\r\nHost: {socket}\r\n{framing}\r\nConnection: close\r\nx-c2-expected-crm-ns: test.echo\r\nx-c2-expected-crm-name: Echo\r\nx-c2-expected-crm-ver: 0.1.0\r\nx-c2-expected-abi-hash: {TEST_ABI_HASH}\r\nx-c2-expected-signature-hash: {TEST_SIGNATURE_HASH}\r\n\r\n"
     )
 }
 
@@ -395,25 +395,25 @@ mod early_rejection {
     fn cases() -> Vec<Case> {
         let mut cases = vec![
             Case {
-                path: "/grid/ping",
+                path: "/_c2/calls/call?route=grid&method=ping",
                 replace: Some(("x-c2-expected-crm-ns: test.echo\r\n", "")),
                 status: 400,
                 error: "InvalidCrmTag",
             },
             Case {
-                path: "/grid/ping",
+                path: "/_c2/calls/call?route=grid&method=ping",
                 replace: Some((TEST_ABI_HASH, "invalid-hash")),
                 status: 400,
                 error: "InvalidCrmTag",
             },
             Case {
-                path: "/missing/ping",
+                path: "/_c2/calls/call?route=missing&method=ping",
                 replace: None,
                 status: 404,
                 error: "ResourceNotFound",
             },
             Case {
-                path: "/grid/ping",
+                path: "/_c2/calls/call?route=grid&method=ping",
                 replace: Some((
                     "x-c2-expected-crm-name: Echo",
                     "x-c2-expected-crm-name: Other",
@@ -422,7 +422,7 @@ mod early_rejection {
                 error: "ContractMismatch",
             },
             Case {
-                path: "/grid/ping",
+                path: "/_c2/calls/call?route=grid&method=ping",
                 replace: None,
                 status: 413,
                 error: "PayloadTooLarge",
@@ -588,7 +588,7 @@ mod early_rejection {
 
         fn head(&self, case: &Case, framing: &str) -> String {
             let head = request_head(self.socket, "ping", framing)
-                .replacen("/grid/ping", case.path, 1)
+                .replacen("/_c2/calls/call?route=grid&method=ping", case.path, 1)
                 .replace(
                     "Connection: close",
                     "Connection: close\r\nContent-Type: text/plain",
@@ -899,7 +899,7 @@ async fn capacity_rejection_case(kind: CapacityRequest) {
                             observed.fetch_add(1, Ordering::SeqCst);
                         }
                         if request.method() == axum::http::Method::POST
-                            && request.uri().path() == "/grid/ping"
+                            && request.uri().path() == crate::CALL_PATH
                         {
                             observed_posts.fetch_add(1, Ordering::SeqCst);
                         }
@@ -978,6 +978,7 @@ async fn capacity_rejection_case(kind: CapacityRequest) {
                         "ping",
                         Arc::new(vec![7; input_len]),
                         &control,
+                        &CallMetadata::empty(),
                     ))
                     .await
                     .unwrap_err();
@@ -1029,7 +1030,7 @@ async fn capacity_rejection_case(kind: CapacityRequest) {
                 let head = request_head(socket, "ping", &framing);
                 let mut request = axum::http::Request::builder()
                     .method("POST")
-                    .uri("/grid/ping");
+                    .uri("/_c2/calls/call?route=grid&method=ping");
                 for line in head
                     .split("\r\n")
                     .skip(1)
@@ -1516,7 +1517,7 @@ async fn withdrawn_route_during_acquire(request: WithdrawalRequest, pause: Withd
         };
         let head = match request {
             WithdrawalRequest::Probe => fixture.head("target", "Content-Length: 0").replacen(
-                "POST /grid/target",
+                "POST /_c2/calls/call?route=grid&method=target",
                 "GET /_probe/grid",
                 1,
             ),
@@ -1928,7 +1929,12 @@ async fn disconnected_response_case(carrier: Carrier, operations: u64) {
     });
     let mut other = tokio::spawn(async move {
         client
-            .call_bound_phased(&binding, "other", &vec![7; input_len])
+            .call_bound_phased(
+                &binding,
+                "other",
+                &vec![7; input_len],
+                &CallMetadata::empty(),
+            )
             .await
     });
     let mut other_joined = false;
@@ -1964,7 +1970,7 @@ async fn disconnected_response_case(carrier: Carrier, operations: u64) {
         let other_reply = other_result.unwrap().unwrap();
         assert_eq!(other_reply.into_owned_bytes().unwrap(), vec![0; 32], "already-in-flight other RID must succeed on same IPC client");
         assert!(fixture.client.is_connected());
-        let ping = bounded(fixture.client.call_bound_phased(&fixture.binding, "ping", &vec![7; input_len])).await.unwrap();
+        let ping = bounded(fixture.client.call_bound_phased(&fixture.binding, "ping", &vec![7; input_len], &CallMetadata::empty())).await.unwrap();
         assert_eq!(ping.into_owned_bytes().unwrap(), vec![2; 32], "same client ping must succeed without reconnect");
         let (lease, _, _) = bounded(fixture.state.acquire_upstream_for_route(&fixture.entry)).await.unwrap_or_else(|_| panic!("same pooled client acquire failed"));
         assert!(Arc::ptr_eq(&lease.client(), &fixture.client), "liveness cannot be masked by reconnecting");
@@ -2135,6 +2141,7 @@ async fn h1_partial_upload_source_fault_refunds_without_dispatch_or_withdrawal()
             &fixture.binding,
             "ping",
             &[7; INPUT_LEN],
+            &CallMetadata::empty(),
         ))
         .await
         .unwrap();
@@ -2291,8 +2298,11 @@ async fn disconnect_during_ipc_write_preserves_same_client(pause_point: WriterPa
     let mut fixture = Fixture::start_with_input_len(Carrier::Inline, 1, 3 * LEN as u64, LEN).await;
     let client = fixture.client.clone();
     let binding = fixture.binding.clone();
-    let mut other =
-        tokio::spawn(async move { client.call_bound_phased(&binding, "other", &[7; LEN]).await });
+    let mut other = tokio::spawn(async move {
+        client
+            .call_bound_phased(&binding, "other", &[7; LEN], &CallMetadata::empty())
+            .await
+    });
     let mut other_joined = false;
     let (acquired_tx, acquired_rx) = oneshot::channel();
     let (acquire_resume_tx, acquire_resume_rx) = oneshot::channel();
@@ -2352,7 +2362,7 @@ async fn disconnect_during_ipc_write_preserves_same_client(pause_point: WriterPa
         eventually(|| fixture.state.forwarding.snapshot().used_operations == 0).await;
         eventually(|| fixture.client.pending_len_for_test() == 0).await;
         assert_eq!(fixture.state.forwarding.budget().clone().snapshot().memory.used_bytes, 0);
-        let ping = bounded(fixture.client.call_bound_phased(&fixture.binding, "ping", &[7; LEN])).await.unwrap();
+        let ping = bounded(fixture.client.call_bound_phased(&fixture.binding, "ping", &[7; LEN], &CallMetadata::empty())).await.unwrap();
         assert_eq!(ping.into_owned_bytes().unwrap(), vec![2; 32]);
         let current = fixture.state.local_route("grid").expect("HTTP disconnect must not withdraw route");
         assert_eq!(current.route_uid, fixture.entry.route_uid);
@@ -2402,7 +2412,7 @@ async fn unary_body_last_bytes_reference_refunds_download_window() {
     let result = AssertUnwindSafe(async {
         let mut request = axum::http::Request::builder()
             .method("POST")
-            .uri("/grid/target");
+            .uri("/_c2/calls/call?route=grid&method=target");
         for line in fixture.head("target", "Content-Length: 32").lines().skip(1) {
             if let Some((name, value)) = line.split_once(':') {
                 request = request.header(name, value.trim());
@@ -2514,9 +2524,14 @@ async fn eviction_during_ipc_frame_write_finishes_old_http_reply_and_reconnects(
             "the started frame still owns the old connection"
         );
         assert!(
-            bounded(old.call_bound_phased(&fixture.binding, "ping", &[7; LEN]))
-                .await
-                .is_err()
+            bounded(old.call_bound_phased(
+                &fixture.binding,
+                "ping",
+                &[7; LEN],
+                &CallMetadata::empty()
+            ))
+            .await
+            .is_err()
         );
         assert_eq!(fixture.probe.calls[2].load(Ordering::SeqCst), 0);
         assert!(
@@ -2681,6 +2696,7 @@ async fn h1_admitted_unknown_upload_can_finish_after_operation_admission_closes(
             &fixture.binding,
             "ping",
             &[7; INPUT_LEN],
+            &CallMetadata::empty(),
         ))
         .await
         .unwrap();

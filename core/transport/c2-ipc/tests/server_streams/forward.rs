@@ -1,10 +1,93 @@
 use super::*;
 use c2_ipc::ForwardRecord;
+use c2_server::{AdmissionContext, AdmissionDecision, AdmissionOperation};
 use c2_wire::rpc::CancelCause;
 #[cfg(feature = "test-support")]
 use futures_util::FutureExt;
 use futures_util::StreamExt;
 use futures_util::stream;
+use tokio::time::timeout;
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn forward_stream_admits_large_metadata_with_a_one_byte_upload_window() {
+    let metadata =
+        CallMetadata::from_entries(["a", "b", "c", "d"].map(|key| (key, "v".repeat(4095))))
+            .unwrap();
+    let (seen, mut calls) = tokio::sync::mpsc::unbounded_channel();
+    let hook = {
+        let metadata = metadata.clone();
+        Arc::new(move |ctx: &AdmissionContext<'_>| {
+            seen.send(ctx.operation()).unwrap();
+            if ctx.metadata() == &metadata {
+                AdmissionDecision::allow()
+            } else {
+                AdmissionDecision::deny("expected the forwarding caller's metadata")
+            }
+        })
+    };
+    let fixture = Harness::start_with_admission(ServerIpcConfig::default(), None, Some(hook)).await;
+    assert!(fixture.client.server_has_admission_hook());
+    let budget = memory_budget(9);
+
+    let mut response = fixture
+        .client
+        .forward_stream_bound_sized_phased(
+            &fixture.binding,
+            "echo",
+            4,
+            stream::iter([Ok::<_, std::io::Error>([1, 0, 8, 0])]),
+            budget.try_reserve_memory(1).unwrap(),
+            &metadata,
+        )
+        .await
+        .unwrap();
+    timeout(WAIT, response.wait_uploaded())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(calls.recv().await, Some(AdmissionOperation::ServerStream));
+    assert!(matches!(
+        timeout(WAIT, response.next_record())
+            .await
+            .unwrap()
+            .unwrap(),
+        ForwardRecord::ItemBegin { total_bytes: 8 }
+    ));
+    let chunk = timeout(WAIT, response.read_chunk(download_slice(&budget, 8), 8))
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(chunk.as_ref(), &[0; 8]);
+    drop(chunk);
+    let ForwardRecord::CallEnd(terminal) = timeout(WAIT, response.next_record())
+        .await
+        .unwrap()
+        .unwrap()
+    else {
+        panic!("expected a terminal after one item");
+    };
+    assert_eq!(terminal.status, CallStatus::Success);
+    assert_eq!(terminal.complete_items, 1);
+
+    let empty = timeout(
+        WAIT,
+        fixture.client.forward_unary_bound_sized_phased(
+            &fixture.binding,
+            "ping",
+            0,
+            stream::empty::<Result<Vec<u8>, std::io::Error>>(),
+            budget.try_reserve_memory(0).unwrap(),
+            &metadata,
+        ),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(empty.into_owned_bytes().unwrap(), b"pong");
+    assert_eq!(calls.recv().await, Some(AdmissionOperation::Unary));
+    fixture.stop().await;
+}
 
 struct FailingWriteCallback;
 
@@ -108,6 +191,7 @@ async fn item_write_range_failure_preserves_failed_call_end() {
             1,
             stream::iter([Ok::<_, std::io::Error>(vec![2])]),
             budget.try_reserve_memory(1).unwrap(),
+            &EMPTY_METADATA,
         )
         .await
         .unwrap();
@@ -188,6 +272,7 @@ async fn whole_shm_item_larger_than_copy_window_releases_after_last_chunk() {
             4,
             stream::iter([Ok::<_, std::io::Error>(vec![1, 0, 0, 128])]),
             send,
+            &EMPTY_METADATA,
         )
         .await
         .unwrap();
@@ -265,6 +350,7 @@ async fn consumer_cancel_mid_item_keeps_shared_unary_alive() {
             4,
             stream::iter([Ok::<_, std::io::Error>(vec![2, 0, 0, 128])]),
             budget.try_reserve_memory(1).unwrap(),
+            &EMPTY_METADATA,
         )
         .await
         .unwrap();
@@ -320,6 +406,7 @@ async fn unary_cursor_reads_a_carrier_in_charged_ranges() {
             1,
             stream::iter([Ok::<_, std::io::Error>(vec![7])]),
             budget.try_reserve_memory(1).unwrap(),
+            &EMPTY_METADATA,
         )
         .await
         .unwrap();
@@ -357,6 +444,7 @@ async fn inline_item_consumes_each_real_credit_window() {
             3,
             stream::iter([Ok::<_, std::io::Error>(vec![1, 0, 32])]),
             budget.try_reserve_memory(1).unwrap(),
+            &EMPTY_METADATA,
         )
         .await
         .unwrap();
@@ -407,6 +495,7 @@ async fn lifecycle_cancel_keeps_current_item_storage_and_cleanup_count() {
             3,
             stream::iter([Ok::<_, std::io::Error>(vec![2, 0, 32])]),
             budget.try_reserve_memory(1).unwrap(),
+            &EMPTY_METADATA,
         )
         .await
         .unwrap();
@@ -460,6 +549,7 @@ async fn partial_upload_failure_cancels_only_its_stream() {
                 Err(std::io::Error::other("source broke after OPEN")),
             ]),
             budget.try_reserve_memory(1).unwrap(),
+            &EMPTY_METADATA,
         )
         .await
         .unwrap();
@@ -490,6 +580,7 @@ async fn consumer_escalates_lifecycle_cancel_without_blocking_other_calls() {
             3,
             stream::iter([Ok::<_, std::io::Error>(vec![2, 0, 32])]),
             budget.try_reserve_memory(1).unwrap(),
+            &EMPTY_METADATA,
         )
         .await
         .unwrap();
@@ -529,6 +620,7 @@ async fn consumer_cancel_settles_call_end_deferred_behind_shm_copy() {
             4,
             stream::iter([Ok::<_, std::io::Error>(vec![1, 0, 0, 128])]),
             budget.try_reserve_memory(1).unwrap(),
+            &EMPTY_METADATA,
         )
         .await
         .unwrap();
@@ -573,6 +665,7 @@ async fn cancel_before_item_header_suppresses_queued_begin() {
             3,
             stream::iter([Ok::<_, std::io::Error>(vec![1, 0, 8])]),
             budget.try_reserve_memory(1).unwrap(),
+            &EMPTY_METADATA,
         )
         .await
         .unwrap();
@@ -610,6 +703,7 @@ async fn begin_arriving_after_consumer_cancel_is_never_announced() {
             3,
             stream::iter([Ok::<_, std::io::Error>(vec![1, 0, 8])]),
             budget.try_reserve_memory(1).unwrap(),
+            &EMPTY_METADATA,
         )
         .await
         .unwrap();
@@ -647,6 +741,7 @@ async fn early_not_executed_stops_a_stalled_request_source() {
             3,
             source,
             budget.try_reserve_memory(1).unwrap(),
+            &EMPTY_METADATA,
         ),
     )
     .await
@@ -674,6 +769,7 @@ async fn lifecycle_cancel_before_open_wakes_stalled_upload() {
             3,
             stream::pending::<Result<Vec<u8>, std::io::Error>>(),
             budget.try_reserve_memory(1).unwrap(),
+            &EMPTY_METADATA,
         )
         .await
         .unwrap();
@@ -714,7 +810,14 @@ async fn check_unpublished_forward_shm(unary: bool, cancel: bool) {
         let send = budget.try_reserve_memory(1).unwrap();
         unary_task = Some(tokio::spawn(async move {
             client
-                .forward_unary_bound_sized_phased(&binding, "ping", 32768, source, send)
+                .forward_unary_bound_sized_phased(
+                    &binding,
+                    "ping",
+                    32768,
+                    source,
+                    send,
+                    &EMPTY_METADATA,
+                )
                 .await
         }));
     } else {
@@ -727,6 +830,7 @@ async fn check_unpublished_forward_shm(unary: bool, cancel: bool) {
                     32768,
                     source,
                     budget.try_reserve_memory(1).unwrap(),
+                    &EMPTY_METADATA,
                 )
                 .await
                 .unwrap(),
@@ -810,6 +914,7 @@ async fn forward_request_shm_checks_source_eof_and_declared_length_before_open()
                         32768,
                         source,
                         budget.try_reserve_memory(1).unwrap(),
+                        &EMPTY_METADATA,
                     )
                     .await
                     .unwrap_err()
@@ -822,6 +927,7 @@ async fn forward_request_shm_checks_source_eof_and_declared_length_before_open()
                         32768,
                         source,
                         budget.try_reserve_memory(1).unwrap(),
+                        &EMPTY_METADATA,
                     )
                     .await
                     .unwrap()
@@ -855,6 +961,7 @@ async fn forward_request_shm_checks_source_eof_and_declared_length_before_open()
                 Err(std::io::Error::other("error after all bytes")),
             ]),
             budget.try_reserve_memory(1).unwrap(),
+            &EMPTY_METADATA,
         )
         .await
         .unwrap_err();
@@ -894,6 +1001,7 @@ async fn forward_request_shm_publishes_after_complete_source() {
             budget
                 .try_reserve_memory(SOURCE_CHUNK_BYTES as u64)
                 .unwrap(),
+            &EMPTY_METADATA,
         )
         .await
         .unwrap();
@@ -914,6 +1022,7 @@ async fn forward_request_shm_publishes_after_complete_source() {
             budget
                 .try_reserve_memory(SOURCE_CHUNK_BYTES as u64)
                 .unwrap(),
+            &EMPTY_METADATA,
         )
         .await
         .unwrap();
@@ -947,7 +1056,11 @@ async fn queued_forward_frame_keeps_its_charge_after_deactivation() {
     let first = tokio::spawn({
         let client = fixture.client.clone();
         let binding = fixture.binding.clone();
-        async move { client.call_bound(&binding, "ping", b"").await }
+        async move {
+            client
+                .call_bound(&binding, "ping", b"", &EMPTY_METADATA)
+                .await
+        }
     });
     wait_for_signal(paused_rx).await;
     let budget = memory_budget(1);
@@ -968,7 +1081,14 @@ async fn queued_forward_frame_keeps_its_charge_after_deactivation() {
         let send = budget.try_reserve_memory(1).unwrap();
         async move {
             client
-                .forward_unary_bound_sized_phased(&binding, "ping", 1, source, send)
+                .forward_unary_bound_sized_phased(
+                    &binding,
+                    "ping",
+                    1,
+                    source,
+                    send,
+                    &EMPTY_METADATA,
+                )
                 .await
         }
     });
@@ -1010,4 +1130,162 @@ fn download_slice(budget: &c2_mem::DomainBudget, bytes: u64) -> c2_mem::WindowSl
     futures_util::FutureExt::now_or_never(window.reserve(bytes))
         .unwrap()
         .unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn forwarded_topic_admission_uses_original_subscription_and_live_head() {
+    use c2_ipc::{IpcCallError, IpcError, TransportPhase};
+    use c2_wire::rpc::{WireSubscribeOptions, WireTopicStart};
+    use tokio::sync::{mpsc, watch};
+
+    fn rejection(error: IpcCallError, expected: ErrorCode) {
+        assert_eq!(error.phase(), TransportPhase::PreDispatch);
+        let IpcError::CallRejected(error) = error.source_error() else {
+            panic!("expected a Host refusal, got {error:?}");
+        };
+        assert_eq!(error.code, expected);
+    }
+
+    let (entered, mut waiting) = mpsc::unbounded_channel();
+    let (open_capacity, capacity) = watch::channel(false);
+    let (open_pinned, pinned) = watch::channel(false);
+    let hook = Arc::new(move |ctx: &AdmissionContext<'_>| {
+        let mut release = match ctx.metadata().get("role") {
+            Some("deny") => return AdmissionDecision::deny("subscriber denied"),
+            Some("fill") => capacity.clone(),
+            Some("pin") => pinned.clone(),
+            _ => return AdmissionDecision::allow(),
+        };
+        entered.send(ctx.operation()).unwrap();
+        // Retain the hook's physical invocation until explicitly released.
+        tokio::runtime::Handle::current().block_on(async {
+            let _ = release.wait_for(|released| *released).await;
+        });
+        AdmissionDecision::allow()
+    });
+    let fixture = Harness::start_with_admission(ServerIpcConfig::default(), None, Some(hook)).await;
+    let options = WireSubscribeOptions {
+        start: WireTopicStart::Next,
+        ..Default::default()
+    };
+    assert_eq!(
+        fixture.publisher.publish_bytes(b"before attach").unwrap(),
+        1
+    );
+    let mut forwarded = fixture
+        .client
+        .forward_subscribe_bound(&fixture.binding, "latest", options, &EMPTY_METADATA)
+        .await
+        .unwrap();
+    assert!(forwarded.requires_admission());
+    assert_eq!((forwarded.start_seq(), forwarded.head_seq()), (2, 1));
+    let direct = fixture
+        .client
+        .subscribe_bound(
+            &fixture.binding,
+            "latest",
+            options,
+            memory_budget(1024),
+            &EMPTY_METADATA,
+        )
+        .await
+        .unwrap();
+    assert_eq!((direct.start_seq(), direct.head_seq()), (2, 1));
+    drop(direct);
+
+    let sync = forwarded.synchronizer();
+    assert_eq!(fixture.publisher.publish_bytes(b"after attach").unwrap(), 2);
+    let deadline = || Some(std::time::Instant::now() + WAIT);
+    assert_eq!(
+        sync.admit_subscriber(&EMPTY_METADATA, deadline())
+            .await
+            .unwrap(),
+        2
+    );
+    let denied = CallMetadata::from_entries([("role", "deny")]).unwrap();
+    rejection(
+        sync.admit_subscriber(&denied, deadline())
+            .await
+            .unwrap_err(),
+        ErrorCode::AdmissionDenied,
+    );
+
+    let admission_capacity = std::thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(4)
+        .clamp(4, 64);
+    let fill = CallMetadata::from_entries([("role", "fill")]).unwrap();
+    let mut busy = Vec::new();
+    for _ in 0..admission_capacity {
+        let mut peer = IpcClient::with_endpoint(fixture.server.local_endpoint().clone()).unwrap();
+        peer.connect().await.unwrap();
+        let binding = peer.acquire_route(&expected_contract()).await.unwrap();
+        let metadata = fill.clone();
+        busy.push(tokio::spawn(async move {
+            let response = peer
+                .call_bound(&binding, "ping", b"", &metadata)
+                .await
+                .unwrap();
+            assert_eq!(response.into_owned_bytes().unwrap(), b"pong");
+        }));
+    }
+    for _ in 0..admission_capacity {
+        assert_eq!(
+            timeout(WAIT, waiting.recv()).await.unwrap(),
+            Some(AdmissionOperation::Unary)
+        );
+    }
+    rejection(
+        sync.admit_subscriber(&EMPTY_METADATA, deadline())
+            .await
+            .unwrap_err(),
+        ErrorCode::CallCapacityExceeded,
+    );
+    open_capacity.send_replace(true);
+    for call in busy {
+        timeout(WAIT, call).await.unwrap().unwrap();
+    }
+
+    // Finish the item already begun by the subscription. Unregistration
+    // drains that item before it ends the stream.
+    let c2_ipc::ForwardTopicRecord::ItemBegin { seq, total_bytes } =
+        timeout(WAIT, forwarded.next_record())
+            .await
+            .unwrap()
+            .unwrap()
+    else {
+        panic!("expected the item published after attachment");
+    };
+    assert_eq!(seq, 2);
+    let item_size = total_bytes as usize;
+    let budget = memory_budget(total_bytes);
+    let item = timeout(
+        WAIT,
+        forwarded.read_chunk(download_slice(&budget, total_bytes), item_size),
+    )
+    .await
+    .unwrap()
+    .unwrap()
+    .unwrap();
+    assert_eq!(item.as_ref(), b"after attach");
+    drop(item);
+
+    let pin = CallMetadata::from_entries([("role", "pin")]).unwrap();
+    let result = tokio::spawn(async move { sync.admit_subscriber(&pin, deadline()).await });
+    assert_eq!(
+        timeout(WAIT, waiting.recv()).await.unwrap(),
+        Some(AdmissionOperation::Subscribe)
+    );
+    assert!(
+        timeout(WAIT, fixture.server.unregister_route("portable"))
+            .await
+            .unwrap()
+    );
+    open_pinned.send_replace(true);
+    rejection(
+        timeout(WAIT, result).await.unwrap().unwrap().unwrap_err(),
+        ErrorCode::ResourceClosed,
+    );
+    drop(forwarded);
+    fixture.stop().await;
 }

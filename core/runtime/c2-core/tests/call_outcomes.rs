@@ -4,10 +4,10 @@ use std::time::{Duration, Instant};
 
 use c2_contract::{ContractRelease, MethodAccess};
 use c2_core::{
-    CallOutcomeStatus, CallTimeout, Client, ConfigField, Connect, DomainLimits,
+    CallOptions, CallOutcomeStatus, CallTimeout, Client, ConfigField, Connect, DomainLimits,
     DomainLimitsOverrides, EncodedClient, EncodedService, Error, Host, HostOptions,
     MethodDefinition, ResultUnavailableReason, Runtime, RuntimeOptions, ServerConfigPatch,
-    ServiceDefinition, TransportPhase, UnaryCallOptions,
+    ServiceDefinition, TransportPhase,
 };
 use c2_error::{C2Error, ErrorCode};
 use c2_http::relay::{RelayConfig, RelayServer};
@@ -100,6 +100,7 @@ fn connect(runtime: &Runtime, url: &str, route: &str) -> Client {
             },
         )
         .unwrap()
+        .with_call_options(CallOptions::with_timeout(TIMEOUT))
 }
 
 fn connect_ipc(runtime: &Runtime, host: &Host, route: &str) -> Client {
@@ -111,13 +112,7 @@ fn connect_ipc(runtime: &Runtime, host: &Host, route: &str) -> Client {
             },
         )
         .unwrap()
-}
-
-fn keyed(id: &str, timeout: CallTimeout) -> UnaryCallOptions {
-    UnaryCallOptions::new()
-        .with_timeout(timeout)
-        .with_call_id(id)
-        .unwrap()
+        .with_call_options(CallOptions::with_timeout(TIMEOUT))
 }
 
 fn assert_semantic(error: Error, code: ErrorCode, phase: Option<TransportPhase>) -> C2Error {
@@ -145,16 +140,16 @@ fn relay_outcomes_round_trip_route_names_that_cannot_be_url_segments() {
         let expected = [route.as_bytes(), b"payload"].concat();
         assert_eq!(
             client
-                .call_unary_with_options("echo", b"payload", keyed("same-key", TIMEOUT))
+                .call_unary_with_call_id("echo", b"payload", "same-key")
                 .unwrap(),
             expected
         );
-        let outcome = client.query_call("same-key", TIMEOUT).unwrap();
+        let outcome = client.query_call("same-key").unwrap();
         assert_eq!(outcome.status, CallOutcomeStatus::Succeeded, "{route}");
         assert_eq!(outcome.method_name.as_deref(), Some("echo"));
         assert_eq!(
             client
-                .recover_unary_call_held("echo", "same-key", TIMEOUT)
+                .recover_unary_call_held("echo", "same-key")
                 .unwrap()
                 .bytes(),
             expected
@@ -190,7 +185,9 @@ fn outcome_query_bypasses_all_three_busy_unary_slots() {
         let client = client.clone();
         let payload = payload.clone();
         move || {
-            client.call_unary_with_options("echo", &payload, keyed("busy", CallTimeout::Unlimited))
+            client
+                .with_call_options(CallOptions::with_timeout(CallTimeout::Unlimited))
+                .call_unary_with_call_id("echo", &payload, "busy")
         }
     });
     entered_rx.recv_timeout(WAIT).unwrap();
@@ -210,17 +207,14 @@ fn outcome_query_bypasses_all_three_busy_unary_slots() {
         (1, 1)
     );
 
-    let inflight = client.query_call("busy", TIMEOUT);
+    let inflight = client.query_call("busy");
     release_tx.send(()).unwrap();
     assert_eq!(inflight.unwrap().status, CallOutcomeStatus::InFlight);
     assert_eq!(original.join().unwrap().unwrap(), payload);
-    let outcome = client.query_call("busy", TIMEOUT).unwrap();
+    let outcome = client.query_call("busy").unwrap();
     assert_eq!(outcome.status, CallOutcomeStatus::Succeeded);
     assert!(outcome.result_available);
-    assert_eq!(
-        client.recover_unary_call("echo", "busy", TIMEOUT).unwrap(),
-        payload
-    );
+    assert_eq!(client.recover_unary_call("echo", "busy").unwrap(), payload);
     registration.close().unwrap();
     host.shutdown();
     relay.stop().unwrap();
@@ -263,11 +257,11 @@ fn verify_nested_result_unavailable(over_http: bool) {
     let client_b = connect_route(&runtime_b, &host_b, "nested-b");
     assert_eq!(
         client_b
-            .call_unary_with_options("echo", b"done", keyed("b-key", TIMEOUT))
+            .call_unary_with_call_id("echo", b"done", "b-key")
             .unwrap(),
         b"done"
     );
-    let b_outcome = client_b.query_call("b-key", TIMEOUT).unwrap();
+    let b_outcome = client_b.query_call("b-key").unwrap();
     assert_eq!(b_outcome.status, CallOutcomeStatus::Succeeded);
     assert_eq!(
         b_outcome.result_unavailable_reason,
@@ -277,20 +271,20 @@ fn verify_nested_result_unavailable(over_http: bool) {
     let runtime_a = runtime(16);
     let host_a = runtime_a.host(host_options()).unwrap();
     let mut registration_a = register(&host_a, "nested-a", move |_, _| {
-        match client_b.recover_unary_call("echo", "b-key", TIMEOUT) {
+        match client_b.recover_unary_call("echo", "b-key") {
             Err(Error::Semantic(error)) => Err(error),
             other => panic!("expected B to report 722, got {other:?}"),
         }
     });
     let client_a = connect_route(&runtime_a, &host_a, "nested-a");
     let error = client_a
-        .call_unary_with_options("echo", b"a", keyed("a-key", TIMEOUT))
+        .call_unary_with_call_id("echo", b"a", "a-key")
         .unwrap_err();
     let error = assert_semantic(error, ErrorCode::ResourceFunctionExecuting, None);
     assert_eq!(error.details["cause_code"], "722");
     assert!(!error.details.contains_key("outcome"));
     assert!(!error.details.contains_key("reason"));
-    let outcome = client_a.query_call("a-key", TIMEOUT).unwrap();
+    let outcome = client_a.query_call("a-key").unwrap();
     assert_eq!(outcome.status, CallOutcomeStatus::Failed);
     assert_eq!(
         outcome.error_code,
@@ -299,9 +293,7 @@ fn verify_nested_result_unavailable(over_http: bool) {
     assert!(outcome.error_details_available);
     assert_eq!(
         assert_semantic(
-            client_a
-                .recover_unary_call("echo", "a-key", TIMEOUT)
-                .unwrap_err(),
+            client_a.recover_unary_call("echo", "a-key").unwrap_err(),
             ErrorCode::ResourceFunctionExecuting,
             None
         ),
@@ -343,29 +335,25 @@ fn relay_outcome_errors_do_not_reacquire_and_uncertain_waits_report_the_key() {
     let counters = runtime.path_counters();
     assert_eq!(
         client
-            .call_unary_with_options("echo", b"first", keyed("existing", TIMEOUT))
+            .call_unary_with_call_id("echo", b"first", "existing")
             .unwrap(),
         b"first"
     );
     let pre_dispatch = Some(TransportPhase::PreDispatch);
     assert_semantic(
         client
-            .call_unary_with_options("echo", b"different", keyed("existing", TIMEOUT))
+            .call_unary_with_call_id("echo", b"different", "existing")
             .unwrap_err(),
         ErrorCode::CallIdConflict,
         pre_dispatch,
     );
     assert_semantic(
-        client
-            .recover_unary_call("echo", "existing", TIMEOUT)
-            .unwrap_err(),
+        client.recover_unary_call("echo", "existing").unwrap_err(),
         ErrorCode::CallResultUnavailable,
         None,
     );
     assert_semantic(
-        client
-            .recover_unary_call("echo", "missing", TIMEOUT)
-            .unwrap_err(),
+        client.recover_unary_call("echo", "missing").unwrap_err(),
         ErrorCode::CallOutcomeUnknown,
         pre_dispatch,
     );
@@ -376,11 +364,11 @@ fn relay_outcome_errors_do_not_reacquire_and_uncertain_waits_report_the_key() {
     let original = std::thread::spawn({
         let client = client.clone();
         move || {
-            client.call_unary_with_options(
-                "echo",
-                b"stall",
-                keyed("timed-out", CallTimeout::After(Duration::from_secs(1))),
-            )
+            client
+                .with_call_options(CallOptions::with_timeout(CallTimeout::After(
+                    Duration::from_secs(1),
+                )))
+                .call_unary_with_call_id("echo", b"stall", "timed-out")
         }
     });
     entered_rx.recv_timeout(WAIT).unwrap();
@@ -453,7 +441,8 @@ fn verify_ipc_outcomes(same_runtime: bool) {
                     anchor_url: url.clone(),
                 },
             )
-            .unwrap(),
+            .unwrap()
+            .with_call_options(CallOptions::with_timeout(TIMEOUT)),
         None => connect_ipc(&caller, &host, "ipc-outcomes"),
     };
     assert_eq!(
@@ -466,8 +455,7 @@ fn verify_ipc_outcomes(same_runtime: bool) {
     );
     let observation = client.connection_observation().unwrap();
     let counters = caller.path_counters();
-    let keyed_reply =
-        |id, payload: &[u8]| client.call_unary_with_options("echo", payload, keyed(id, TIMEOUT));
+    let keyed_reply = |id, payload: &[u8]| client.call_unary_with_call_id("echo", payload, id);
     assert_eq!(keyed_reply("stable", b"one").unwrap(), b"one");
     assert_eq!(keyed_reply("stable", b"one").unwrap(), b"one");
     assert_eq!(invocations.load(Ordering::SeqCst), 1);
@@ -479,24 +467,20 @@ fn verify_ipc_outcomes(same_runtime: bool) {
     );
     assert_eq!(
         client
-            .recover_unary_call_held("echo", "stable", TIMEOUT)
+            .recover_unary_call_held("echo", "stable")
             .unwrap()
             .bytes(),
         b"one"
     );
     assert_semantic(
-        client
-            .recover_unary_call("echo", "absent", TIMEOUT)
-            .unwrap_err(),
+        client.recover_unary_call("echo", "absent").unwrap_err(),
         ErrorCode::CallOutcomeUnknown,
         pre_dispatch,
     );
     assert_eq!(invocations.load(Ordering::SeqCst), 1);
 
     // Build directly into the negotiated slab and publish that same owner as KeyedUnary.
-    let mut prepared = client
-        .begin_unary_with_options("echo", keyed("large", TIMEOUT))
-        .unwrap();
+    let mut prepared = client.begin_keyed_call("echo", "large").unwrap();
     let mut slab = prepared
         .try_alloc_request_slab(80 * 1024)
         .unwrap()
@@ -504,16 +488,15 @@ fn verify_ipc_outcomes(same_runtime: bool) {
     slab.as_mut_slice().fill(83);
     let held = prepared.encode_slab(slab).unwrap().call_held().unwrap();
     assert_eq!(held.bytes(), vec![83; 80 * 1024]);
-    let error = client
-        .recover_unary_call("echo", "large", TIMEOUT)
-        .unwrap_err();
+    let error = client.recover_unary_call("echo", "large").unwrap_err();
     assert_eq!(
         assert_semantic(error, ErrorCode::CallResultUnavailable, None).details["outcome"],
         "succeeded"
     );
     assert_eq!(
         client
-            .query_call("large", CallTimeout::Unlimited)
+            .with_call_options(CallOptions::with_timeout(CallTimeout::Unlimited))
+            .query_call("large")
             .unwrap()
             .result_unavailable_reason,
         Some(ResultUnavailableReason::NotRetained)
@@ -528,11 +511,11 @@ fn verify_ipc_outcomes(same_runtime: bool) {
     let pending = std::thread::spawn({
         let client = client.clone();
         move || {
-            client.call_unary_with_options(
-                "echo",
-                b"busy",
-                keyed("busy", CallTimeout::After(Duration::from_secs(2))),
-            )
+            client
+                .with_call_options(CallOptions::with_timeout(CallTimeout::After(
+                    Duration::from_secs(2),
+                )))
+                .call_unary_with_call_id("echo", b"busy", "busy")
         }
     });
     entered_rx.recv_timeout(WAIT).unwrap();
@@ -545,7 +528,7 @@ fn verify_ipc_outcomes(same_runtime: bool) {
         Some(1)
     );
     assert_eq!(
-        client.query_call("busy", TIMEOUT).unwrap().status,
+        client.query_call("busy").unwrap().status,
         CallOutcomeStatus::InFlight
     );
     let error = pending.join().unwrap().unwrap_err();
@@ -564,13 +547,10 @@ fn verify_ipc_outcomes(same_runtime: bool) {
         std::thread::yield_now();
     }
     assert_eq!(
-        client.query_call("busy", TIMEOUT).unwrap().status,
+        client.query_call("busy").unwrap().status,
         CallOutcomeStatus::Succeeded
     );
-    assert_eq!(
-        client.recover_unary_call("echo", "busy", TIMEOUT).unwrap(),
-        b"busy"
-    );
+    assert_eq!(client.recover_unary_call("echo", "busy").unwrap(), b"busy");
     assert!(observation.snapshot().is_none());
     assert_eq!(caller.path_counters(), counters);
     assert_eq!(
@@ -582,5 +562,174 @@ fn verify_ipc_outcomes(same_runtime: bool) {
     host.shutdown();
     if let Some((relay, _)) = &mut relay {
         relay.stop().unwrap();
+    }
+}
+
+#[test]
+fn metadata_and_admission_are_shared_by_all_unary_and_outcome_views() {
+    use c2_core::{
+        AccessLevel, AdmissionContext, AdmissionDecision, AdmissionOperation, AdmissionTransport,
+        current_call_context,
+    };
+
+    for over_http in [false, true] {
+        let runtime = runtime(16);
+        let mut relay = over_http.then(|| relay(&runtime, 16));
+        let (admitted, observations) = mpsc::channel();
+        let options = HostOptions::default().with_admission_hook(Arc::new(
+            move |context: &AdmissionContext<'_>| {
+                let token = context.metadata().get("token").unwrap();
+                assert_eq!(context.route_name(), "with-metadata");
+                assert_eq!(context.transport(), AdmissionTransport::Ipc);
+                if context.operation() == AdmissionOperation::QueryOutcome {
+                    assert_eq!(context.target(), None);
+                    assert_eq!(context.access(), None);
+                } else {
+                    assert_eq!(context.target(), Some("echo"));
+                    assert_eq!(context.access(), Some(AccessLevel::Write));
+                }
+                admitted
+                    .send((
+                        context.operation(),
+                        context.call_id().map(str::to_owned),
+                        token.to_owned(),
+                    ))
+                    .unwrap();
+                if token == "denied" {
+                    AdmissionDecision::deny("token rejected")
+                } else {
+                    AdmissionDecision::allow_with_extension(Arc::new(token.to_owned()))
+                }
+            },
+        ));
+        let options = match &relay {
+            Some((_, url)) => options.with_relay_anchor_address(url),
+            None => options.without_relay(),
+        };
+        let host = runtime.host(options).unwrap();
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let registration = register(&host, "with-metadata", {
+            let invocations = invocations.clone();
+            move |_, input| {
+                invocations.fetch_add(1, Ordering::Relaxed);
+                let context = current_call_context().expect("bound resource context");
+                assert_eq!(context.operation(), AdmissionOperation::Unary);
+                assert_eq!(context.route_name(), "with-metadata");
+                assert_eq!(context.target(), "echo");
+                let token = context.metadata().get("token").unwrap();
+                assert_eq!(context.extension::<String>().unwrap().as_str(), token,);
+                if input == b"nested-error" {
+                    return Err(
+                        C2Error::new(ErrorCode::AdmissionDenied, "downstream denial").with_details(
+                            std::collections::BTreeMap::from([
+                                ("dispatch_phase".into(), "pre_dispatch".into()),
+                                ("transport_phase".into(), "pre_dispatch".into()),
+                            ]),
+                        ),
+                    );
+                }
+                Ok(input)
+            }
+        });
+        let client = match &relay {
+            Some((_, url)) => connect(&runtime, url, registration.route_name()),
+            None => connect_ipc(&runtime, &host, registration.route_name()),
+        };
+        let view = |token: &str| {
+            client.with_call_options(
+                client
+                    .call_options()
+                    .with_metadata_entry("token", token)
+                    .unwrap(),
+            )
+        };
+        let denied = view("denied");
+        let allowed = view("first");
+        let refreshed = view("refreshed");
+        let pre_dispatch = Some(TransportPhase::PreDispatch);
+
+        assert_semantic(
+            denied.call_owned("echo", b"plain").unwrap_err(),
+            ErrorCode::AdmissionDenied,
+            pre_dispatch,
+        );
+        assert_eq!(allowed.call_owned("echo", b"plain").unwrap(), b"plain");
+        assert_eq!(allowed.call_held("echo", b"held").unwrap().bytes(), b"held",);
+        assert_eq!(
+            allowed
+                .call_unary_held_with_call_id("echo", b"keyed", "view-key")
+                .unwrap()
+                .bytes(),
+            b"keyed",
+        );
+        assert_semantic(
+            denied
+                .call_unary_with_call_id("echo", b"keyed", "view-key")
+                .unwrap_err(),
+            ErrorCode::AdmissionDenied,
+            pre_dispatch,
+        );
+        assert_eq!(
+            refreshed
+                .call_unary_with_call_id("echo", b"keyed", "view-key")
+                .unwrap(),
+            b"keyed",
+        );
+        assert_semantic(
+            denied.recover_unary_call("echo", "view-key").unwrap_err(),
+            ErrorCode::AdmissionDenied,
+            pre_dispatch,
+        );
+        assert_eq!(
+            refreshed.recover_unary_call("echo", "view-key").unwrap(),
+            b"keyed",
+        );
+        assert_semantic(
+            denied.query_call("view-key").unwrap_err(),
+            ErrorCode::AdmissionDenied,
+            pre_dispatch,
+        );
+        assert_eq!(
+            refreshed.query_call("view-key").unwrap().status,
+            CallOutcomeStatus::Succeeded
+        );
+
+        let error = assert_semantic(
+            allowed.call_owned("echo", b"nested-error").unwrap_err(),
+            ErrorCode::ResourceFunctionExecuting,
+            None,
+        );
+        assert_eq!(error.details["cause_code"], "724");
+        assert_eq!(error.details["cause_message"], "downstream denial");
+        assert_eq!(invocations.load(Ordering::Relaxed), 4);
+        use AdmissionOperation::{QueryOutcome, Recover, Unary};
+        let keyed = Some("view-key");
+        let expected = [
+            (Unary, None, "denied"),
+            (Unary, None, "first"),
+            (Unary, None, "first"),
+            (Unary, keyed, "first"),
+            (Unary, keyed, "denied"),
+            (Unary, keyed, "refreshed"),
+            (Recover, keyed, "denied"),
+            (Recover, keyed, "refreshed"),
+            (QueryOutcome, keyed, "denied"),
+            (QueryOutcome, keyed, "refreshed"),
+            (Unary, None, "first"),
+        ];
+        let actual: Vec<_> = observations.try_iter().collect();
+        assert_eq!(
+            actual
+                .iter()
+                .map(|(op, id, token)| (*op, id.as_deref(), token.as_str()))
+                .collect::<Vec<_>>(),
+            expected,
+        );
+
+        drop(registration);
+        host.shutdown();
+        if let Some((relay, _)) = &mut relay {
+            relay.stop().unwrap();
+        }
     }
 }

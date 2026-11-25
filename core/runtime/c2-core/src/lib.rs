@@ -25,7 +25,12 @@ mod topic;
 
 pub use c2_config::{ConnectOptions, ConnectTimeoutError};
 pub use c2_ipc::DirectIpcShutdownOutcome;
-pub use c2_server::{ServerFailure, ServerStartupStage, ServerStartupTimeout};
+pub use c2_server::{
+    AccessLevel, AdmissionContext, AdmissionDecision, AdmissionHook, AdmissionOperation,
+    AdmissionRejection, AdmissionTransport, CallContext, CallContextGuard, ServerFailure,
+    ServerStartupStage, ServerStartupTimeout, current_call_context, enter_call_context,
+    evaluate_admission_hook,
+};
 #[doc(hidden)]
 pub use c2_wire::handshake::ServerIdentity;
 pub use call_scope::{CallScope, CallScopeError, CallState};
@@ -94,10 +99,10 @@ pub use topic::{
 };
 
 pub use c2_config::{
-    CallOptions, CallTimeout, ConfigField, ConfigSources, DomainLimits, DomainLimitsOverrides,
-    DomainLimitsPatch, EnvCatalog, EnvFilePolicy, EnvMap, LocalEndpointContext,
-    LocalEndpointNamespace, LocalEndpointOptions, ServerConfigOverrides, ServerConfigPatch,
-    UnaryCallOptions,
+    CallMetadata, CallMetadataError, CallOptions, CallTimeout, ConfigField, ConfigSources,
+    DomainLimits, DomainLimitsOverrides, DomainLimitsPatch, EnvCatalog, EnvFilePolicy, EnvMap,
+    LocalEndpointContext, LocalEndpointNamespace, LocalEndpointOptions, ServerConfigOverrides,
+    ServerConfigPatch,
 };
 
 /// Shared asynchronous executor for native client projections.

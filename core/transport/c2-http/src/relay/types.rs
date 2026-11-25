@@ -571,9 +571,9 @@ mod tests {
     }
 
     #[test]
-    fn full_sync_seven_rejects_six_and_retired_revision_fields() {
+    fn full_sync_eight_rejects_seven_and_retired_revision_fields() {
         let envelope = FullSyncEnvelope {
-            protocol_version: 6,
+            protocol_version: 7,
             snapshot: FullSyncSnapshot::from_internal(FullSync {
                 routes: vec![local_route("grid")],
                 tombstones: vec![RouteTombstone {
@@ -589,12 +589,12 @@ mod tests {
         assert!(matches!(
             ValidatedFullSync::try_from(envelope.clone()),
             Err(FullSyncValidationError::UnsupportedRouteSnapshotVersion {
-                got: 6,
-                supported: 7
+                got: 7,
+                supported: 8
             })
         ));
         let mut current = serde_json::to_value(envelope).unwrap();
-        current["protocol_version"] = 7.into();
+        current["protocol_version"] = 8.into();
         assert!(
             ValidatedFullSync::try_from(
                 serde_json::from_value::<FullSyncEnvelope>(current.clone()).unwrap()

@@ -12,13 +12,14 @@ use crate::rpc::{
     encode_open_subscribe_frame, encode_ready_frame, encode_subscribe_item_begin_frame,
     encode_value_continuation_frame,
 };
+use c2_config::CallMetadata;
 use c2_error::{C2Error, ErrorCode};
 
 const REQUEST_ID: u64 = 0x0807_0605_0403_0201;
 const RID_BYTES: [u8; 8] = [1, 2, 3, 4, 5, 6, 7, 8];
-const OPEN_UNARY: &[u8] = b"\x01\x01r\x01n\x01G\x01v\x01a\x01s\x00\x34\x12";
-const OPEN_STREAM: &[u8] = b"\x01\x01r\x01n\x01G\x01v\x01a\x01s\x01\x34\x12";
-const OPEN_SUBSCRIBE: &[u8] = b"\x01\x01r\x01n\x01G\x01v\x01a\x01s\x02\x02t1\x03";
+const OPEN_UNARY: &[u8] = b"\x01\x01r\x01n\x01G\x01v\x01a\x01s\x00\x34\x12\x00";
+const OPEN_STREAM: &[u8] = b"\x01\x01r\x01n\x01G\x01v\x01a\x01s\x01\x34\x12\x00";
+const OPEN_SUBSCRIBE: &[u8] = b"\x01\x01r\x01n\x01G\x01v\x01a\x01s\x02\x02t1\x03\x00";
 const SHM_BYTES: [u8; 23] = [
     1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 2, 0, 0, 0, 1, 11, 12, 13, 14, 15, 16, 17, 18,
 ];
@@ -72,10 +73,11 @@ fn open_modes_and_storage_match_whole_frames() {
                 &identity(),
                 0x1234,
                 mode,
+                &CallMetadata::empty(),
                 ValuePart::whole(ValueStorage::Inline(b"xy")),
             )
             .unwrap(),
-            frame([0x1e, 0, 0, 0], [0, 0x10, 0, 0], &inline_body),
+            frame([0x1f, 0, 0, 0], [0, 0x10, 0, 0], &inline_body),
         );
 
         let mut shm_body = prefix.to_vec();
@@ -86,10 +88,11 @@ fn open_modes_and_storage_match_whole_frames() {
                 &identity(),
                 0x1234,
                 mode,
+                &CallMetadata::empty(),
                 ValuePart::whole(ValueStorage::Shm(shm())),
             )
             .unwrap(),
-            frame([0x33, 0, 0, 0], [0x40, 0x10, 0, 0], &shm_body),
+            frame([0x34, 0, 0, 0], [0x40, 0x10, 0, 0], &shm_body),
         );
     }
 }
@@ -104,10 +107,11 @@ fn open_chunks_have_only_first_chunk_metadata() {
             &identity(),
             0x1234,
             CallMode::Unary,
+            &CallMetadata::empty(),
             ValuePart::first(5, ValueStorage::Inline(b"ab")),
         )
         .unwrap(),
-        frame([0x26, 0, 0, 0], [0, 0x32, 0, 0], &first_body),
+        frame([0x27, 0, 0, 0], [0, 0x32, 0, 0], &first_body),
     );
     assert_eq!(
         encode_value_continuation_frame(
@@ -128,10 +132,10 @@ fn open_drafts_and_streaming_prefixes_keep_one_reserved_frame() {
     };
 
     for (chunk, length, flags) in [
-        (ChunkPosition::Whole, [0x1e, 0, 0, 0], [0, 0x10, 0, 0]),
+        (ChunkPosition::Whole, [0x1f, 0, 0, 0], [0, 0x10, 0, 0]),
         (
             ChunkPosition::First { total_bytes: 5 },
-            [0x26, 0, 0, 0],
+            [0x27, 0, 0, 0],
             [0, 0x32, 0, 0],
         ),
     ] {
@@ -147,13 +151,26 @@ fn open_drafts_and_streaming_prefixes_keep_one_reserved_frame() {
             storage: ValueStorage::Inline(b"ab"),
         };
         assert_eq!(
-            encode_open_draft_frame(&identity(), 0x1234, CallMode::Unary, part).unwrap(),
+            encode_open_draft_frame(
+                &identity(),
+                0x1234,
+                CallMode::Unary,
+                &CallMetadata::empty(),
+                part
+            )
+            .unwrap(),
             expected
         );
 
-        let mut prefix =
-            encode_open_inline_draft_prefix(&identity(), 0x1234, CallMode::Unary, chunk, 2)
-                .unwrap();
+        let mut prefix = encode_open_inline_draft_prefix(
+            &identity(),
+            0x1234,
+            CallMode::Unary,
+            &CallMetadata::empty(),
+            chunk,
+            2,
+        )
+        .unwrap();
         let allocation = prefix.as_ptr();
         prefix.extend_from_slice(b"a");
         prefix.extend_from_slice(b"b");
@@ -190,7 +207,14 @@ fn inline_draft_prefixes_reject_unrepresentable_lengths_before_allocation() {
         ),
     ] {
         assert!(matches!(
-            encode_open_inline_draft_prefix(&identity(), 0, CallMode::Unary, chunk, bytes),
+            encode_open_inline_draft_prefix(
+                &identity(),
+                0,
+                CallMode::Unary,
+                &CallMetadata::empty(),
+                chunk,
+                bytes
+            ),
             Err(EncodeError::FieldTooLong {
                 field: "RPC record",
                 ..
@@ -320,21 +344,29 @@ fn subscribe_open_ready_and_item_begin_match_whole_frames() {
     };
     assert_eq!(options.to_byte(), 0x03);
     assert_eq!(
-        encode_open_subscribe_frame(REQUEST_ID, &identity(), "t1", options).unwrap(),
-        frame([0x1e, 0, 0, 0], [0, 0x10, 0, 0], OPEN_SUBSCRIBE),
+        encode_open_subscribe_frame(
+            REQUEST_ID,
+            &identity(),
+            "t1",
+            options,
+            &CallMetadata::empty()
+        )
+        .unwrap(),
+        frame([0x1f, 0, 0, 0], [0, 0x10, 0, 0], OPEN_SUBSCRIBE),
     );
-    let mut expected_draft = frame([0x1e, 0, 0, 0], [0, 0x10, 0, 0], OPEN_SUBSCRIBE);
+    let mut expected_draft = frame([0x1f, 0, 0, 0], [0, 0x10, 0, 0], OPEN_SUBSCRIBE);
     expected_draft[4..12].fill(0);
     assert_eq!(
-        encode_open_subscribe_draft_frame(&identity(), "t1", options).unwrap(),
+        encode_open_subscribe_draft_frame(&identity(), "t1", options, &CallMetadata::empty())
+            .unwrap(),
         expected_draft,
     );
     assert_eq!(
-        encode_ready_frame(REQUEST_ID, 0x0807_0605_0403_0201).unwrap(),
+        encode_ready_frame(REQUEST_ID, 0x0807_0605_0403_0201, 0x1817_1615_1413_1211).unwrap(),
         frame(
-            [0x15, 0, 0, 0],
+            [0x1d, 0, 0, 0],
             [2, 0x10, 0, 0],
-            b"\x08\x01\x02\x03\x04\x05\x06\x07\x08",
+            b"\x08\x01\x02\x03\x04\x05\x06\x07\x08\x11\x12\x13\x14\x15\x16\x17\x18",
         ),
     );
     assert_eq!(
@@ -455,5 +487,100 @@ fn multibyte_call_end_error_truncation_preserves_char_boundaries() {
     assert_eq!(
         decoded.details.get("truncated").map(String::as_str),
         Some("true")
+    );
+}
+
+#[test]
+fn keyed_open_recover_and_query_place_metadata_after_call_id() {
+    use crate::rpc::{
+        ChunkPosition, encode_open_keyed_draft_frame, encode_open_keyed_frame,
+        encode_open_keyed_inline_draft_prefix, encode_open_recover_draft_frame,
+        encode_open_recover_frame, encode_query_call_draft_frame, encode_query_call_frame,
+    };
+    let metadata = CallMetadata::from_entries([("z", ""), ("a", "x y")]).unwrap();
+    let keyed = frame(
+        [0x2d, 0, 0, 0],
+        [0, 0x10, 0, 0],
+        b"\x01\x01r\x01n\x01G\x01v\x01a\x01s\x03\x34\x12\x02id\x02\x01a\x03\x00x y\x01z\x00\x00xy",
+    );
+    let value = ValuePart::whole(ValueStorage::Inline(b"xy"));
+    assert_eq!(
+        encode_open_keyed_frame(REQUEST_ID, &identity(), 0x1234, "id", &metadata, value).unwrap(),
+        keyed
+    );
+    let mut keyed_draft = keyed;
+    keyed_draft[4..12].fill(0);
+    assert_eq!(
+        encode_open_keyed_draft_frame(&identity(), 0x1234, "id", &metadata, value).unwrap(),
+        keyed_draft
+    );
+    let mut prefix = encode_open_keyed_inline_draft_prefix(
+        &identity(),
+        0x1234,
+        "id",
+        &metadata,
+        ChunkPosition::Whole,
+        2,
+    )
+    .unwrap();
+    let allocation = prefix.as_ptr();
+    prefix.extend_from_slice(b"xy");
+    assert_eq!(prefix.as_ptr(), allocation);
+    assert_eq!(prefix, keyed_draft);
+
+    for (wire, draft, mut expected) in [
+        (
+            encode_open_recover_frame(REQUEST_ID, &identity(), 0x1234, "id", &metadata).unwrap(),
+            encode_open_recover_draft_frame(&identity(), 0x1234, "id", &metadata).unwrap(),
+            frame(
+                [0x2b, 0, 0, 0],
+                [0, 0x10, 0, 0],
+                b"\x01\x01r\x01n\x01G\x01v\x01a\x01s\x04\x34\x12\x02id\x02\x01a\x03\x00x y\x01z\x00\x00",
+            ),
+        ),
+        (
+            encode_query_call_frame(REQUEST_ID, &identity(), "id", &metadata).unwrap(),
+            encode_query_call_draft_frame(&identity(), "id", &metadata).unwrap(),
+            frame(
+                [0x28, 0, 0, 0],
+                [0, 0x10, 0, 0],
+                b"\x0b\x01r\x01n\x01G\x01v\x01a\x01s\x02id\x02\x01a\x03\x00x y\x01z\x00\x00",
+            ),
+        ),
+    ] {
+        assert_eq!(wire, expected);
+        expected[4..12].fill(0);
+        assert_eq!(draft, expected);
+    }
+}
+
+#[test]
+fn topic_admission_records_match_whole_frames() {
+    use crate::rpc::{
+        WireAdmitTopicResult, encode_admit_topic_frame, encode_admit_topic_result_frame,
+    };
+
+    let metadata = CallMetadata::from_entries([("k", "")]).unwrap();
+    assert_eq!(
+        encode_admit_topic_frame(REQUEST_ID, 0x1817_1615_1413_1211, &metadata).unwrap(),
+        frame(
+            [0x1a, 0, 0, 0],
+            [0, 0x10, 0, 0],
+            b"\x0d\x11\x12\x13\x14\x15\x16\x17\x18\x01\x01k\x00\x00",
+        ),
+    );
+    assert_eq!(
+        encode_admit_topic_result_frame(
+            REQUEST_ID,
+            &WireAdmitTopicResult::Allowed {
+                head_seq: 0x1817_1615_1413_1211
+            },
+        )
+        .unwrap(),
+        frame(
+            [0x16, 0, 0, 0],
+            [2, 0x10, 0, 0],
+            b"\x0e\x00\x11\x12\x13\x14\x15\x16\x17\x18",
+        ),
     );
 }

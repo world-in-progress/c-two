@@ -389,3 +389,78 @@ def test_prepared_close_keeps_native_dispatch_failure_as_primary(stream):
     assert caught.value.transport_phase == 'pre_dispatch'
     assert str(caught.value.__context__) == 'close failed'
     assert close_calls == ['close']
+
+
+def test_public_call_context_exports():
+    assert set(cc.__all__) == {
+        'crm', 'read', 'write', 'stream', 'topic', 'Stream', 'StreamCloseReceipt',
+        'transfer', 'on_shutdown', 'hold', 'with_call_id', 'recover_call', 'query_call',
+        'CallOutcome', 'HeldResult', 'Delivery', 'Publisher', 'Registration', 'Subscription',
+        'TopicCloseReceipt', 'register', 'connect', 'close', 'unregister', 'serve',
+        'shutdown', 'server_address', 'with_call_options', 'set_relay_anchor', 'set_server',
+        'set_client', 'Runtime', 'ConcurrencyConfig', 'error', 'endpoint', 'observe',
+        'contract', '__version__', 'AdmissionContext', 'AdmissionDecision', 'CallContext',
+        'current_call_context',
+    }
+    assert not hasattr(cc, 'AdmissionDenied')
+    assert cc.error.AdmissionDenied().code == 724
+    assert cc.error.AdmissionDenied().message == 'Admission denied'
+
+
+def test_metadata_view_overlays_and_snapshots_on_a_bare_thread_proxy():
+    from collections import UserDict
+    from dataclasses import FrozenInstanceError
+    from types import MappingProxyType
+
+    class ContextResource:
+        def echo(self, value, timeout):
+            return cc.current_call_context()
+
+    proxy = OptionsContract()
+    proxy.client = CRMProxy.thread_local(ContextResource())
+    entries = UserDict({'trace': 'original', 'only-parent': 'keep'})
+    parent = cc.with_call_options(proxy, metadata=entries)
+    entries['trace'] = 'mutated after options were built'
+    finite = cc.with_call_options(parent, timeout=2, metadata={'trace': 'child'})
+    with pytest.raises(cc.error.UnsupportedCallMode):
+        cc.with_call_options(finite, metadata={}).echo(None)
+    context = cc.with_call_options(finite, timeout=...).echo(None)
+    assert isinstance(context.metadata, MappingProxyType)
+    assert (context.route_name, context.target, context.operation, context.call_id) == (
+        '', 'echo', 'unary', None,
+    )
+    assert dict(context.metadata) == {'trace': 'child', 'only-parent': 'keep'}
+    with pytest.raises(TypeError):
+        context.metadata['trace'] = 'changed'
+    with pytest.raises(FrozenInstanceError):
+        context.target = 'changed'
+    assert parent.echo(None).metadata['trace'] == 'original'
+    assert cc.with_call_options(finite, timeout=None, metadata={}).echo(None).metadata == context.metadata
+    assert cc.with_call_options(parent, metadata=None).echo(None).metadata == {}
+    assert cc.current_call_context() is None
+
+
+@pytest.mark.parametrize('entries', [
+    {'': 'v'}, {'Bad': 'v'}, {'a:b': 'v'}, {'a' * 65: 'v'}, {'a': 'x' * 4097},
+    {'a': ' v'}, {'a': 'v '}, {'a': 'v\t'}, {'a': 'v\r\n'}, {'a': 'é'}, {'a': '\x7f'},
+    {1: 'v'}, {'a': b'v'}, [('a', 'v')], 'a',
+])
+def test_invalid_call_metadata_is_refused_before_call(entries):
+    proxy, resource = thread_connection()
+    with pytest.raises((ValueError, TypeError)):
+        cc.with_call_options(proxy, metadata=entries)
+    assert resource.calls == 0
+
+
+def test_metadata_limits_apply_to_the_final_overlay():
+    proxy, _ = thread_connection()
+    full = cc.with_call_options(proxy, metadata={str(index): '' for index in range(64)})
+    cc.with_call_options(full, metadata={'63': 'overwritten'})
+    with pytest.raises(ValueError):
+        cc.with_call_options(full, metadata={'64': 'new'})
+
+    boundary = {'a': 'x' * 4096, 'b': 'x' * 4096, 'c': 'x' * 4096, 'd': 'x' * 4092}
+    full = cc.with_call_options(proxy, metadata=boundary)
+    cc.with_call_options(full, metadata={'a': '', 'extra': 'x' * 4091})
+    with pytest.raises(ValueError):
+        cc.with_call_options(full, metadata={'d': 'x' * 4093})

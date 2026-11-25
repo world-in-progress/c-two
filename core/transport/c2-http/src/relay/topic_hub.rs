@@ -1,19 +1,20 @@
 //! Registration-scoped shared upstream subscriptions for relay topics.
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Weak};
+use std::sync::{Arc, OnceLock, Weak};
 
 use axum::{
     body::{Body, Bytes},
     http::{StatusCode, header},
     response::Response,
 };
+use c2_config::CallMetadata;
 use c2_error::{C2Error, ErrorCode};
 use c2_ipc::{IpcForwardTopic, IpcTopicSynchronizer, RouteBinding};
 use c2_mem::{DomainBudget, OperationPermit};
 use c2_wire::rpc::{CancelCause, WireLagPolicy, WireSubscribeOptions, WireTopicStart};
 use parking_lot::Mutex;
-use tokio::sync::Notify;
+use tokio::sync::{Notify, oneshot};
 use tokio_util::task::task_tracker::TaskTrackerToken;
 
 use super::conn_pool::UpstreamLease;
@@ -24,6 +25,7 @@ use super::topic_remote::{
     HttpTopicUpstream, HubUpstreamRecord, RemoteConfirm, isolates_hub, open_remote_upstream,
 };
 use super::types::{RouteEntry, local_route_matches};
+use crate::http_wire::{TOPIC_ADMISSION_REQUIRED_HEADER, TOPIC_HEAD_SEQ_HEADER};
 use crate::topic_wire::{self, RecordKind, Status, Terminal};
 
 /// One hub serves exactly one registration of one topic. A local scope names
@@ -139,14 +141,14 @@ impl TopicHubTable {
         false
     }
 
-    /// The live local hub's source for one registration, if its upstream is
-    /// still serving subscribers. Used by the lightweight confirmation.
-    pub(crate) fn active_local(
+    /// Pin the hub and its specific origin-only subscriber for a confirmation.
+    pub(crate) fn confirmation(
         &self,
         instance: &str,
         route_uid: &str,
         topic: &str,
-    ) -> Option<HubSynchronizer> {
+        token: &str,
+    ) -> Option<TopicConfirmation> {
         let hub = self
             .hubs
             .lock()
@@ -158,10 +160,12 @@ impl TopicHubTable {
                 topic: topic.to_string(),
             })?
             .upgrade()?;
-        let state = hub.inner.lock();
-        (state.terminal.is_none() && !state.closing)
-            .then(|| state.source.clone())
-            .flatten()
+        let id = hub.inner.lock().origin_subscribers.get(token)?.id;
+        Some(TopicConfirmation {
+            hub,
+            token: token.into(),
+            id,
+        })
     }
 
     #[cfg(feature = "test-support")]
@@ -193,7 +197,7 @@ impl TopicHubTable {
                 let mut hubs = self.hubs.lock();
                 let waiting = if let Some(hub) = hubs.get(&key).and_then(Weak::upgrade) {
                     let mut state = hub.inner.lock();
-                    if !state.closing && state.terminal.is_none() {
+                    if !state.closing && !state.opening_abandoned && state.terminal.is_none() {
                         state.joiners += 1;
                         drop(state);
                         return (
@@ -205,7 +209,7 @@ impl TopicHubTable {
                             },
                         );
                     }
-                    if state.terminal.is_none() {
+                    if !state.opening_abandoned && state.terminal.is_none() {
                         let notified = hub.changed.clone().notified_owned();
                         Some(Box::pin(notified))
                     } else {
@@ -250,7 +254,8 @@ impl TopicHubTable {
         let mut hubs = self.hubs.lock();
         if hubs
             .get(&hub.key)
-            .is_some_and(|current| Weak::ptr_eq(current, &Arc::downgrade(hub)))
+            .and_then(Weak::upgrade)
+            .is_some_and(|current| Arc::ptr_eq(&current, hub))
         {
             hubs.remove(&hub.key);
         }
@@ -300,7 +305,8 @@ impl Drop for LatestFrame {
 struct HubState {
     joiners: usize,
     next_subscriber: u64,
-    source: Option<HubSynchronizer>,
+    source: Option<HubSource>,
+    opening_abandoned: bool,
     source_cancel: Option<HubCancel>,
     /// Cancelled as soon as this hub stops needing an upstream that may still
     /// be opening: relay shutdown, the last downstream leaving, or a terminal
@@ -312,6 +318,7 @@ struct HubState {
     latest_eligible: HashSet<u64>,
     incoming: Option<(u64, HashSet<u64>)>,
     subscribers: HashMap<u64, Weak<Subscriber>>,
+    origin_subscribers: HashMap<String, OriginSubscriber>,
     retired: Vec<Weak<Subscriber>>,
     terminal: Option<C2Error>,
     closing: bool,
@@ -327,18 +334,93 @@ struct HubState {
 /// acknowledgement when this relay is the source, or the merged cross-relay
 /// confirmation when the source registration lives on an origin relay.
 #[derive(Clone)]
-pub(crate) enum HubSynchronizer {
+enum HubSynchronizer {
     Ipc(IpcTopicSynchronizer),
     Remote(Arc<RemoteConfirm>),
 }
 
-impl HubSynchronizer {
-    pub(crate) async fn head_seq(&self) -> Result<u64, C2Error> {
-        match self {
-            Self::Ipc(synchronizer) => synchronizer.sync_head_seq().await.map_err(upstream_error),
-            Self::Remote(confirm) => confirm.head_seq().await,
+#[derive(Clone)]
+struct HubSource {
+    synchronizer: HubSynchronizer,
+    requires_admission: bool,
+}
+
+impl HubSource {
+    async fn confirm(&self, metadata: &CallMetadata) -> Result<u64, C2Error> {
+        match (&self.synchronizer, self.requires_admission) {
+            (HubSynchronizer::Ipc(sync), true) => sync
+                .admit_subscriber(
+                    metadata,
+                    Some(std::time::Instant::now() + super::router::OUTCOME_QUERY_TIMEOUT),
+                )
+                .await
+                .map_err(upstream_error),
+            (HubSynchronizer::Ipc(sync), false) => {
+                sync.sync_head_seq().await.map_err(upstream_error)
+            }
+            (HubSynchronizer::Remote(confirm), true) => confirm.admit_subscriber(metadata).await,
+            (HubSynchronizer::Remote(confirm), false) => confirm.head_seq().await,
         }
     }
+}
+
+struct LeaderOpened {
+    head_seq: u64,
+    requires_admission: bool,
+}
+
+type LeaderResult = oneshot::Sender<Result<LeaderOpened, C2Error>>;
+
+enum JoinedSource {
+    Ready(HubSource),
+    RetryJoin,
+}
+
+struct OriginSubscriber {
+    id: u64,
+    control: Arc<StreamCancellation>,
+}
+
+pub(crate) struct TopicConfirmation {
+    hub: Arc<Hub>,
+    token: String,
+    id: u64,
+}
+
+impl TopicConfirmation {
+    fn source(&self) -> Option<HubSource> {
+        let state = self.hub.inner.lock();
+        let origin = state.origin_subscribers.get(&self.token)?;
+        let subscriber = state.subscribers.get(&self.id)?.upgrade()?;
+        if origin.id != self.id
+            || origin.control.cause().is_some()
+            || origin.control.is_consumer_requested()
+            || subscriber.detached.load(Ordering::Acquire)
+            || state.closing
+            || state.terminal.is_some()
+        {
+            return None;
+        }
+        state.source.clone()
+    }
+
+    pub(crate) fn is_live(&self) -> bool {
+        self.source().is_some()
+    }
+
+    pub(crate) async fn confirm(&self, metadata: &CallMetadata) -> Result<u64, C2Error> {
+        self.source()
+            .ok_or_else(closed_confirmation)?
+            .confirm(metadata)
+            .await
+    }
+}
+
+pub(crate) fn closed_confirmation() -> C2Error {
+    C2Error::new(
+        ErrorCode::ResourceClosed,
+        "source topic subscription is no longer active",
+    )
 }
 
 /// Cancellation of one hub's upstream, uniform over the IPC and cross-relay
@@ -489,6 +571,7 @@ struct Subscriber {
     _permit: OperationPermit,
     _tracked: TaskTrackerToken,
     connection: Option<Arc<ConnectionControl>>,
+    origin_token: OnceLock<String>,
     detached: AtomicBool,
     selected: AtomicBool,
     frame_started: AtomicBool,
@@ -529,6 +612,9 @@ impl Hub {
         }
         let mut state = self.inner.lock();
         state.subscribers.remove(&id);
+        if let Some(token) = subscriber.origin_token.get() {
+            state.origin_subscribers.remove(token);
+        }
         state.retired.retain(|old| old.strong_count() != 0);
         state.retired.push(Arc::downgrade(subscriber));
         state.latest_eligible.remove(&id);
@@ -552,7 +638,7 @@ impl Hub {
         drop(state);
         self.changed.notify_waiters();
     }
-    async fn source(&self) -> Result<HubSynchronizer, C2Error> {
+    async fn source(&self) -> Result<JoinedSource, C2Error> {
         loop {
             let notified = self.changed.notified();
             tokio::pin!(notified);
@@ -563,7 +649,10 @@ impl Hub {
                     return Err(error.clone());
                 }
                 if let Some(source) = &state.source {
-                    return Ok(source.clone());
+                    return Ok(JoinedSource::Ready(source.clone()));
+                }
+                if state.opening_abandoned {
+                    return Ok(JoinedSource::RetryJoin);
                 }
             }
             notified.await;
@@ -571,7 +660,7 @@ impl Hub {
     }
     fn set_source(
         &self,
-        source: HubSynchronizer,
+        source: HubSource,
         cancel: HubCancel,
         shutdown: &tokio_util::sync::CancellationToken,
     ) {
@@ -694,13 +783,23 @@ fn capacity(message: impl Into<String>) -> C2Error {
     C2Error::new(ErrorCode::CallCapacityExceeded, message)
 }
 fn upstream_error(error: c2_ipc::IpcCallError) -> C2Error {
+    let phase = match error.phase() {
+        c2_ipc::TransportPhase::PreDispatch => "pre_dispatch",
+        c2_ipc::TransportPhase::DispatchUncertain => "dispatch_uncertain",
+    };
+    let transport_error = |code, message| {
+        C2Error::new(code, message)
+            .with_details(BTreeMap::from([("dispatch_phase".into(), phase.into())]))
+    };
     match error.into_source() {
         c2_ipc::IpcError::CallRejected(error) | c2_ipc::IpcError::LocalCallRejected(error) => error,
         c2_ipc::IpcError::CrmError(bytes) => C2Error::from_wire_bytes(&bytes)
             .ok()
             .flatten()
-            .unwrap_or_else(|| C2Error::new(ErrorCode::ProtocolViolation, "invalid upstream C2E1")),
-        error => C2Error::new(ErrorCode::ResourceUnavailable, error.to_string()),
+            .unwrap_or_else(|| {
+                transport_error(ErrorCode::ProtocolViolation, "invalid upstream C2E1".into())
+            }),
+        error => transport_error(ErrorCode::ResourceUnavailable, error.to_string()),
     }
 }
 
@@ -714,6 +813,7 @@ pub(crate) async fn subscribe(
     route: RouteEntry,
     topic: String,
     options: WireSubscribeOptions,
+    metadata: CallMetadata,
     lease: UpstreamLease,
     binding: RouteBinding,
     permit: OperationPermit,
@@ -732,24 +832,26 @@ pub(crate) async fn subscribe(
         )
     });
     let driver_state = state.clone();
-    let driver_route = route;
-    let driver_topic = topic.clone();
+    let lease = Arc::new(lease);
     attach(
         state,
         key,
         options,
+        metadata,
         permit,
         tracked,
         connection,
         registration_header,
-        move |hub| {
+        move |hub, metadata, leader_result| {
             drive(
-                driver_state,
+                driver_state.clone(),
                 hub,
-                driver_route,
-                driver_topic,
-                lease,
-                binding,
+                route.clone(),
+                topic.clone(),
+                lease.clone(),
+                binding.clone(),
+                metadata,
+                leader_result,
             )
         },
     )
@@ -765,6 +867,7 @@ pub(crate) async fn subscribe_remote(
     expected: c2_contract::ExpectedRouteContract,
     topic: String,
     options: WireSubscribeOptions,
+    metadata: CallMetadata,
     permit: OperationPermit,
     tracked: TaskTrackerToken,
     connection: Option<Arc<ConnectionControl>>,
@@ -774,17 +877,26 @@ pub(crate) async fn subscribe_remote(
         topic: topic.clone(),
     };
     let driver_state = state.clone();
-    let driver_entry = entry;
-    let driver_topic = topic.clone();
     attach(
         state,
         key,
         options,
+        metadata,
         permit,
         tracked,
         connection,
         None,
-        move |hub| drive_remote(driver_state, hub, driver_entry, expected, driver_topic),
+        move |hub, metadata, leader_result| {
+            drive_remote(
+                driver_state.clone(),
+                hub,
+                entry.clone(),
+                expected.clone(),
+                topic.clone(),
+                metadata,
+                leader_result,
+            )
+        },
     )
     .await
 }
@@ -796,6 +908,7 @@ async fn attach<F, Fut>(
     state: Arc<RelayState>,
     key: HubKey,
     options: WireSubscribeOptions,
+    metadata: CallMetadata,
     permit: OperationPermit,
     tracked: TaskTrackerToken,
     connection: Option<Arc<ConnectionControl>>,
@@ -803,13 +916,14 @@ async fn attach<F, Fut>(
     launch: F,
 ) -> Result<Response, C2Error>
 where
-    F: FnOnce(Arc<Hub>) -> Fut + Send + 'static,
+    F: Fn(Arc<Hub>, CallMetadata, LeaderResult) -> Fut + Send + 'static,
     Fut: Future<Output = ()> + Send + 'static,
 {
     let subscriber = Arc::new(Subscriber {
         _permit: permit,
         _tracked: tracked,
         connection,
+        origin_token: OnceLock::new(),
         detached: AtomicBool::new(false),
         selected: AtomicBool::new(false),
         frame_started: AtomicBool::new(false),
@@ -820,23 +934,42 @@ where
         inflight_chunks: AtomicUsize::new(0),
         changed: Notify::new(),
     });
-    let (hub, leader, guard) = state.topics.join(key, subscriber.clone()).await;
-    if leader {
-        state.forwarding.spawn_driver(launch(hub.clone()));
-    }
-    let source = hub.source().await?;
-    let head = match source.head_seq().await {
-        Ok(head) => head,
-        Err(error) => {
-            // A refusal that proves the registration no longer serves the
-            // route isolates the shared hub now; the upstream cleanup that
-            // follows only releases its slot.
-            if isolates_hub(&error) {
-                hub.fail(error.clone());
+    let (hub, guard, opened) = loop {
+        let (hub, leader, guard) = state.topics.join(key.clone(), subscriber.clone()).await;
+        if leader {
+            let (tx, rx) = oneshot::channel();
+            state
+                .forwarding
+                .spawn_driver(launch(hub.clone(), metadata.clone(), tx));
+            let opened = rx.await.map_err(|_| {
+                C2Error::new(ErrorCode::ResourceUnavailable, "topic source driver ended")
+            })??;
+            break (hub, guard, opened);
+        }
+        let source = match hub.source().await? {
+            JoinedSource::Ready(source) => source,
+            JoinedSource::RetryJoin => {
+                drop(guard);
+                continue;
             }
-            return Err(error);
+        };
+        match source.confirm(&metadata).await {
+            Ok(head_seq) => {
+                let opened = LeaderOpened {
+                    head_seq,
+                    requires_admission: source.requires_admission,
+                };
+                break (hub, guard, opened);
+            }
+            Err(error) => {
+                if isolates_hub(&error) {
+                    hub.fail(error.clone());
+                }
+                return Err(error);
+            }
         }
     };
+    let head = opened.head_seq;
     let start_seq = match options.start {
         WireTopicStart::Latest => head.max(1),
         WireTopicStart::Next => head
@@ -865,6 +998,19 @@ where
         let id = inner.next_subscriber;
         subscriber.next_seq.store(start_seq, Ordering::Release);
         inner.subscribers.insert(id, Arc::downgrade(&subscriber));
+        if registration_header.is_some() {
+            subscriber
+                .origin_token
+                .set(token.clone())
+                .expect("subscriber origin token assigned once");
+            inner.origin_subscribers.insert(
+                token.clone(),
+                OriginSubscriber {
+                    id,
+                    control: control.clone(),
+                },
+            );
+        }
         if let Some((seq, eligible)) = &mut inner.incoming {
             if start_seq <= *seq {
                 eligible.insert(id);
@@ -950,6 +1096,13 @@ where
         header::CONTENT_TYPE,
         header::HeaderValue::from_static(topic_wire::MEDIA_TYPE),
     );
+    response.headers_mut().insert(
+        TOPIC_ADMISSION_REQUIRED_HEADER,
+        header::HeaderValue::from_static(if opened.requires_admission { "1" } else { "0" }),
+    );
+    response
+        .headers_mut()
+        .insert(TOPIC_HEAD_SEQ_HEADER, header::HeaderValue::from(head));
     if let Ok(value) = header::HeaderValue::from_str(&token) {
         response.headers_mut().insert(
             axum::http::HeaderName::from_static("x-c2-call-token"),
@@ -1458,8 +1611,10 @@ async fn drive(
     hub: Arc<Hub>,
     route: RouteEntry,
     topic_name: String,
-    lease: UpstreamLease,
+    lease: Arc<UpstreamLease>,
     binding: RouteBinding,
+    metadata: CallMetadata,
+    leader_result: LeaderResult,
 ) {
     let shutdown = relay.forwarding.shutdown_token();
     let upstream_wait = hub.inner.lock().upstream_wait.clone();
@@ -1472,23 +1627,20 @@ async fn drive(
     // attestation waits select on the hub's wait token: shutdown, the last
     // downstream leaving, or a terminal outcome unblocks a stalled source.
     let source = match tokio::select! {
-        source = client.forward_subscribe_bound(&binding, &topic_name, options) => source,
+        source = client.forward_subscribe_bound(&binding, &topic_name, options, &metadata) => source,
         _ = upstream_wait.cancelled() => {
-            abandon_opening(&relay, &hub, &shutdown);
+            finish_failed_open(&relay.topics, &hub, leader_result, cancelled_open(&shutdown));
             return;
         }
     } {
         Ok(source) => source,
         Err(error) => {
-            hub.fail(upstream_error(error));
-            hub.finish_upstream();
-            relay.topics.remove(&hub);
+            finish_failed_open(&relay.topics, &hub, leader_result, upstream_error(error));
             return;
         }
     };
-    // OPEN follows a name rather than carrying a UID. Confirm after OPEN, then
-    // use SYNC on that subscription so a replaced registration cannot be
-    // mistaken for the route whose UID keys this hub.
+    // OPEN follows a name rather than carrying a UID. Attest that the accepted
+    // subscription belongs to the registration that keys this hub.
     let attestation_expected = c2_contract::ExpectedRouteContract {
         route_name: route.name.clone(),
         crm_ns: route.crm_ns.clone(),
@@ -1502,7 +1654,7 @@ async fn drive(
         _ = upstream_wait.cancelled() => {
             let _ = source.cancellation().cancel(CancelCause::Consumer);
             let _ = source.completion().await;
-            abandon_opening(&relay, &hub, &shutdown);
+            finish_failed_open(&relay.topics, &hub, leader_result, cancelled_open(&shutdown));
             return;
         }
     };
@@ -1515,38 +1667,68 @@ async fn drive(
     if !valid {
         let _ = source.cancellation().cancel(CancelCause::Consumer);
         let _ = source.completion().await;
-        hub.fail(C2Error::new(
+        let error = C2Error::new(
             ErrorCode::ResourceUnavailable,
             "route registration changed while opening subscription",
-        ));
-        hub.finish_upstream();
-        relay.topics.remove(&hub);
+        );
+        finish_failed_open(&relay.topics, &hub, leader_result, error);
         return;
     }
+    let opened = LeaderOpened {
+        head_seq: source.head_seq(),
+        requires_admission: source.requires_admission(),
+    };
     hub.set_source(
-        HubSynchronizer::Ipc(source.synchronizer()),
+        HubSource {
+            synchronizer: HubSynchronizer::Ipc(source.synchronizer()),
+            requires_admission: opened.requires_admission,
+        },
         HubCancel::Ipc(source.cancellation()),
         &shutdown,
     );
+    let _ = leader_result.send(Ok(opened));
     run_source(relay, hub, TopicSource::Ipc(source)).await;
     drop(lease);
 }
 
-/// Fail a hub whose opening wait was cancelled by the hub's wait token, after
-/// any caller-owned source cleanup, and finish its upstream lifecycle.
-fn abandon_opening(
-    relay: &Arc<RelayState>,
+/// Release the old hub before notifying its waiters to join again. Only its
+/// creator receives a private refusal from the attempted OPEN.
+fn finish_failed_open(
+    topics: &TopicHubTable,
     hub: &Arc<Hub>,
-    shutdown: &tokio_util::sync::CancellationToken,
+    leader_result: LeaderResult,
+    error: C2Error,
 ) {
-    let cause = if shutdown.is_cancelled() {
+    if matches!(
+        error.code,
+        ErrorCode::AdmissionDenied | ErrorCode::CallCapacityExceeded
+    ) || (error.code == ErrorCode::ProtocolViolation
+        && error
+            .details
+            .get("stage")
+            .is_some_and(|stage| stage == "call_metadata_validation"))
+    {
+        let mut state = hub.inner.lock();
+        state.opening_abandoned = true;
+        state.closing = true;
+        state.upstream_done = true;
+        state.last_hold.take();
+        drop(state);
+    } else {
+        hub.fail(error.clone());
+        hub.finish_upstream();
+    }
+    topics.remove(hub);
+    hub.changed.notify_waiters();
+    let _ = leader_result.send(Err(error));
+}
+
+fn cancelled_open(shutdown: &tokio_util::sync::CancellationToken) -> C2Error {
+    if shutdown.is_cancelled() {
         cancellation("relay_shutdown")
     } else {
         cancellation("consumer_cancelled")
-    };
-    hub.fail(cause);
-    hub.finish_upstream();
-    relay.topics.remove(hub);
+    }
 }
 
 /// Open the single cross-relay upstream for a hub whose route this relay knows
@@ -1559,26 +1741,28 @@ async fn drive_remote(
     entry: RouteEntry,
     expected: c2_contract::ExpectedRouteContract,
     topic_name: String,
+    metadata: CallMetadata,
+    leader_result: LeaderResult,
 ) {
     let shutdown = relay.forwarding.shutdown_token();
     let upstream_wait = hub.inner.lock().upstream_wait.clone();
     let client = crate::relay_client_builder_with_proxy(relay.config().use_proxy)
+        .retry(reqwest::retry::never())
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .expect("c-two: failed to build reqwest Client for relay traffic");
     // A hub still opening has no source handle to cancel, so the cross-relay
     // subscription request selects on the hub's wait token.
     let opened = match tokio::select! {
-        opened = open_remote_upstream(client.clone(), &entry.relay_url, &expected, &topic_name) => opened,
+        opened = open_remote_upstream(client.clone(), &entry.relay_url, &expected, &topic_name, &metadata) => opened,
         _ = upstream_wait.cancelled() => {
-            abandon_opening(&relay, &hub, &shutdown);
+            finish_failed_open(&relay.topics, &hub, leader_result, cancelled_open(&shutdown));
             return;
         }
     } {
         Ok(opened) => opened,
         Err(error) => {
-            hub.fail(error);
-            hub.finish_upstream();
-            relay.topics.remove(&hub);
+            finish_failed_open(&relay.topics, &hub, leader_result, error);
             return;
         }
     };
@@ -1586,12 +1770,11 @@ async fn drive_remote(
     if !relay.peer_entry_matches(&entry) {
         source.cancel_handle().cancel(CancelCause::Consumer);
         let _ = source.completion().await;
-        hub.fail(C2Error::new(
+        let error = C2Error::new(
             ErrorCode::ResourceUnavailable,
             "route registration changed while opening subscription",
-        ));
-        hub.finish_upstream();
-        relay.topics.remove(&hub);
+        );
+        finish_failed_open(&relay.topics, &hub, leader_result, error);
         return;
     }
     let confirm = Arc::new(RemoteConfirm::new(
@@ -1600,12 +1783,20 @@ async fn drive_remote(
         &expected,
         &topic_name,
         &opened.registration,
+        &opened.token,
     ));
     hub.set_source(
-        HubSynchronizer::Remote(confirm),
+        HubSource {
+            synchronizer: HubSynchronizer::Remote(confirm),
+            requires_admission: opened.requires_admission,
+        },
         HubCancel::Http(source.cancel_handle()),
         &shutdown,
     );
+    let _ = leader_result.send(Ok(LeaderOpened {
+        head_seq: opened.head_seq,
+        requires_admission: opened.requires_admission,
+    }));
     run_source(relay, hub, TopicSource::Http(source)).await;
 }
 
@@ -2002,6 +2193,7 @@ mod tests {
             _permit: permit,
             _tracked: tracked,
             connection: None,
+            origin_token: OnceLock::new(),
             detached: AtomicBool::new(false),
             selected: AtomicBool::new(false),
             frame_started: AtomicBool::new(false),
@@ -2331,6 +2523,7 @@ mod tests {
             _permit: permit,
             _tracked: tracked,
             connection: None,
+            origin_token: OnceLock::new(),
             detached: AtomicBool::new(false),
             selected: AtomicBool::new(false),
             frame_started: AtomicBool::new(false),
@@ -2373,6 +2566,7 @@ mod tests {
             _permit: permit,
             _tracked: tracked,
             connection: None,
+            origin_token: OnceLock::new(),
             detached: AtomicBool::new(false),
             selected: AtomicBool::new(false),
             frame_started: AtomicBool::new(false),
@@ -2417,6 +2611,7 @@ mod tests {
                 _permit: permit,
                 _tracked: tracked,
                 connection: None,
+                origin_token: OnceLock::new(),
                 detached: AtomicBool::new(false),
                 selected: AtomicBool::new(false),
                 frame_started: AtomicBool::new(false),
@@ -2484,6 +2679,7 @@ mod tests {
             _permit: permit,
             _tracked: tracked,
             connection: Some(stalled_control.clone()),
+            origin_token: OnceLock::new(),
             detached: AtomicBool::new(false),
             selected: AtomicBool::new(false),
             frame_started: AtomicBool::new(false),
@@ -2512,6 +2708,7 @@ mod tests {
             _permit: permit,
             _tracked: tracked,
             connection: None,
+            origin_token: OnceLock::new(),
             detached: AtomicBool::new(false),
             selected: AtomicBool::new(false),
             frame_started: AtomicBool::new(false),
@@ -2558,29 +2755,30 @@ mod tests {
         assert!(!healthy.evicted.load(Ordering::Acquire));
     }
 
+    fn joining_subscriber(domain: &ForwardingDomain) -> Arc<Subscriber> {
+        let (permit, tracked) = domain.admit_subscription().unwrap();
+        Arc::new(Subscriber {
+            _permit: permit,
+            _tracked: tracked,
+            connection: None,
+            origin_token: OnceLock::new(),
+            detached: AtomicBool::new(false),
+            selected: AtomicBool::new(false),
+            frame_started: AtomicBool::new(false),
+            evicted: AtomicBool::new(false),
+            unsent: Mutex::new(VecDeque::new()),
+            next_seq: AtomicU64::new(0),
+            sequence_exhausted: AtomicBool::new(false),
+            inflight_chunks: AtomicUsize::new(0),
+            changed: Notify::new(),
+        })
+    }
+
     #[tokio::test]
-    async fn closing_hub_does_not_overlap_a_new_upstream() {
+    async fn private_topic_open_refusals_wake_an_already_joined_follower() {
         let domain = ForwardingDomain::new(DomainBudget::from_limits(
             &c2_config::DomainLimits::default(),
         ));
-        let table = Arc::new(TopicHubTable::default());
-        let make_subscriber = || {
-            let (permit, tracked) = domain.admit_subscription().unwrap();
-            Arc::new(Subscriber {
-                _permit: permit,
-                _tracked: tracked,
-                connection: None,
-                detached: AtomicBool::new(false),
-                selected: AtomicBool::new(false),
-                frame_started: AtomicBool::new(false),
-                evicted: AtomicBool::new(false),
-                unsent: Mutex::new(VecDeque::new()),
-                next_seq: AtomicU64::new(1),
-                sequence_exhausted: AtomicBool::new(false),
-                inflight_chunks: AtomicUsize::new(0),
-                changed: Notify::new(),
-            })
-        };
         let key = HubKey {
             scope: HubScope::Local {
                 instance: "i".into(),
@@ -2588,9 +2786,59 @@ mod tests {
             },
             topic: "state".into(),
         };
-        let (old, _, guard) = table.join(key.clone(), make_subscriber()).await;
+        for error in [
+            C2Error::new(ErrorCode::AdmissionDenied, "denied"),
+            C2Error::new(ErrorCode::CallCapacityExceeded, "admission full"),
+            C2Error::new(ErrorCode::ProtocolViolation, "invalid metadata").with_details(
+                BTreeMap::from([("stage".into(), "call_metadata_validation".into())]),
+            ),
+        ] {
+            let table = TopicHubTable::default();
+            let (hub, leader, guard) = table.join(key.clone(), joining_subscriber(&domain)).await;
+            assert!(leader);
+            let waiter = joining_subscriber(&domain);
+            let (waiting_hub, leader, waiter_guard) = table.join(key.clone(), waiter.clone()).await;
+            assert!(!leader);
+            assert!(Arc::ptr_eq(&hub, &waiting_hub));
+
+            let pending = waiting_hub.source();
+            tokio::pin!(pending);
+            assert!(futures::poll!(&mut pending).is_pending());
+            let (tx, rx) = oneshot::channel();
+            let code = error.code;
+            finish_failed_open(&table, &hub, tx, error);
+            assert!(matches!(rx.await.unwrap(), Err(error) if error.code == code));
+            assert!(matches!(
+                tokio::time::timeout(std::time::Duration::from_secs(5), pending).await,
+                Ok(Ok(JoinedSource::RetryJoin))
+            ));
+            drop(waiter_guard);
+            drop(guard);
+            assert_eq!(domain.snapshot().used_operations, 1);
+
+            let (new, leader, _guard) = table.join(key.clone(), waiter).await;
+            assert!(leader);
+            assert!(!Arc::ptr_eq(&hub, &new));
+            assert_eq!(domain.snapshot().used_operations, 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn closing_hub_does_not_overlap_a_new_upstream() {
+        let domain = ForwardingDomain::new(DomainBudget::from_limits(
+            &c2_config::DomainLimits::default(),
+        ));
+        let table = Arc::new(TopicHubTable::default());
+        let key = HubKey {
+            scope: HubScope::Local {
+                instance: "i".into(),
+                route_uid: "r".into(),
+            },
+            topic: "state".into(),
+        };
+        let (old, _, guard) = table.join(key.clone(), joining_subscriber(&domain)).await;
         drop(guard);
-        let subscriber = make_subscriber();
+        let subscriber = joining_subscriber(&domain);
         let next = {
             let table = table.clone();
             let key = key.clone();

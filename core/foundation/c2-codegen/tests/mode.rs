@@ -71,5 +71,5 @@ fn all_targets_generate_server_stream() {
     ] {
         assert!(source.contains(required), "missing {required:?}");
     }
-    assert!(source.contains("async method_0_ping(options?: C2UnaryCallOptions): Promise<void>"));
+    assert!(source.contains("async method_0_ping(options?: C2CallIdOptions): Promise<void>"));
 }

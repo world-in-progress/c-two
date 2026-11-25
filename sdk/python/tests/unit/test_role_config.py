@@ -182,9 +182,18 @@ def test_completed_retirement_adopts_both_roles_and_owner_backed_stats(runtimes,
 
 @pytest.mark.parametrize('mode', ['parallel', 'read_parallel'])
 def test_local_stream_owns_the_host_slot(runtimes, mode):
+    class MultiItemEcho(EchoResource):
+        def stream(self):
+            # CoreLocalResponseStream uses a 1-slot receiver channel and prefetches
+            # one step ahead; yielding 3 items ensures the driver parks on send(3)
+            # after next(stream) == 1 without finishing cleanup before the snapshot.
+            yield 1
+            yield 2
+            yield 3
+
     runtime = runtimes()
     runtime.set_server(max_outstanding_calls=1)
-    runtime.register(Echo, EchoResource(), name='echo', concurrency=cc.ConcurrencyConfig(mode=mode))
+    runtime.register(Echo, MultiItemEcho(), name='echo', concurrency=cc.ConcurrencyConfig(mode=mode))
     with runtime.connect(Echo, name='echo') as proxy:
         assert proxy.client._scheduler.is_unconstrained == (mode == 'parallel')
         stream = proxy.stream()

@@ -5,6 +5,8 @@
 //! PyO3 and Python-specific buffer, exception, and module semantics.
 
 #[cfg(feature = "python")]
+mod admission_ffi;
+#[cfg(feature = "python")]
 mod codegen_ffi;
 #[cfg(feature = "python")]
 mod config_ffi;

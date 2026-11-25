@@ -255,6 +255,7 @@ mod ipc16_tests {
             &identity("grid"),
             7,
             crate::rpc::CallMode::Unary,
+            &c2_config::CallMetadata::empty(),
             ValuePart::whole(ValueStorage::Inline(b"input")),
         )
         .unwrap();
@@ -262,7 +263,7 @@ mod ipc16_tests {
         assert_eq!(header.flags, FLAG_RPC_RECORD);
         assert_eq!(
             payload,
-            [&[1][..], call_golden().as_slice(), b"input"].concat()
+            [&[1][..], call_golden().as_slice(), b"\0input"].concat()
         );
         let RpcRecord::Open {
             identity,
@@ -305,6 +306,7 @@ mod ipc16_tests {
                     &value,
                     7,
                     crate::rpc::CallMode::Unary,
+                    &c2_config::CallMetadata::empty(),
                     ValuePart::whole(ValueStorage::Inline(&[])),
                 )
                 .unwrap_err(),
@@ -321,6 +323,7 @@ mod ipc16_tests {
             &identity(&route),
             19,
             crate::rpc::CallMode::Unary,
+            &c2_config::CallMetadata::empty(),
             ValuePart::whole(ValueStorage::Inline(&[])),
         )
         .unwrap();
@@ -344,6 +347,7 @@ mod ipc16_tests {
             &identity("grid"),
             7,
             crate::rpc::CallMode::Unary,
+            &c2_config::CallMetadata::empty(),
             ValuePart::whole(ValueStorage::Inline(&[])),
         )
         .unwrap();
@@ -374,6 +378,7 @@ mod ipc16_tests {
                 &value,
                 7,
                 crate::rpc::CallMode::Unary,
+                &c2_config::CallMetadata::empty(),
                 ValuePart::whole(ValueStorage::Inline(&[])),
             )
             .unwrap();
@@ -445,6 +450,7 @@ mod ipc16_tests {
             &identity("grid"),
             7,
             crate::rpc::CallMode::Unary,
+            &c2_config::CallMetadata::empty(),
             ValuePart::first(5, ValueStorage::Inline(b"ab")),
         )
         .unwrap();
@@ -463,6 +469,7 @@ mod ipc16_tests {
             [
                 &[1][..],
                 call_golden().as_slice(),
+                &[0],
                 &5u64.to_le_bytes(),
                 b"ab"
             ]
@@ -559,6 +566,31 @@ mod ipc16_tests {
         for caps in [1, 2, 4, 0xffff] {
             assert!(decode_handshake(&encode_client_handshake(caps, "p").unwrap(), false).is_err());
         }
+    }
+
+    #[test]
+    fn admission_hook_capability_is_server_only() {
+        let caps = CAP_SHM_REQUEST | CAP_SHM_RESPONSE | CAP_ADMISSION_HOOK;
+        let hello = encode_client_handshake(caps, "p").unwrap();
+        assert_eq!(
+            decode_handshake(&hello, false),
+            Err(DecodeError::InvalidValue {
+                field: "capability flags",
+                value: caps.into(),
+            })
+        );
+
+        let ack = encode_server_handshake(caps, &[route()], "p", &server()).unwrap();
+        assert_eq!(decode_handshake(&ack, true).unwrap().capability_flags, caps);
+        let unknown = caps | (1 << 6);
+        let ack = encode_server_handshake(unknown, &[route()], "p", &server()).unwrap();
+        assert_eq!(
+            decode_handshake(&ack, true),
+            Err(DecodeError::InvalidValue {
+                field: "capability flags",
+                value: unknown.into(),
+            })
+        );
     }
 
     #[test]

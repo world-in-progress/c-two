@@ -211,27 +211,40 @@ async fn full_memory_budget_answers_pre_admission_errors_without_waiting() {
     ));
     let missing = app
         .clone()
-        .oneshot(call_request("/missing/produce"))
+        .oneshot(call_request("/_c2/calls/call?route=missing&method=produce"))
         .await
         .unwrap();
     assert_eq!(missing.status(), StatusCode::NOT_FOUND);
     drop(missing);
 
     let occupied = budget.try_reserve_memory(memory).unwrap();
-    let mut request = Box::pin(app.oneshot(call_request("/missing/produce")));
+    let mut request =
+        Box::pin(app.oneshot(call_request("/_c2/calls/call?route=missing&method=produce")));
     let std::task::Poll::Ready(Ok(refused)) = futures::poll!(&mut request) else {
         panic!("a pre-admission refusal must not wait on the memory budget");
     };
-    capacity_refusal(refused).await;
+    assert_eq!(refused.status(), StatusCode::NOT_FOUND);
+    let body = to_bytes(
+        refused.into_body(),
+        crate::http_wire::MAX_CONTROL_ERROR_BYTES,
+    )
+    .await
+    .unwrap();
+    let error = crate::decode_control_error(404, &body).unwrap();
+    assert_eq!(error.code, c2_error::ErrorCode::ResourceNotFound);
+    assert_eq!(error.details["dispatch_phase"], "pre_dispatch");
     assert_eq!(budget.snapshot().memory.used_bytes, memory);
+    assert_eq!(budget.snapshot().memory.rejected_allocations, 0);
     drop(occupied);
 }
 
 #[tokio::test]
 async fn zero_memory_budget_immediately_refuses_even_a_zero_byte_call() {
     let fixture = Fixture::start("adm-zero", 0, 0, 0).await;
-    let mut request =
-        Box::pin(build_router(fixture.state.clone()).oneshot(call_request("/output/produce")));
+    let mut request = Box::pin(
+        build_router(fixture.state.clone())
+            .oneshot(call_request("/_c2/calls/call?route=output&method=produce")),
+    );
     let std::task::Poll::Ready(Ok(refused)) = futures::poll!(&mut request) else {
         panic!("a closed domain must refuse admission immediately");
     };
@@ -247,7 +260,7 @@ async fn unary_response_holds_slot_through_eof_abort_and_last_transport_frame() 
     for abort in [false, true] {
         let response = app
             .clone()
-            .oneshot(call_request("/output/produce"))
+            .oneshot(call_request("/_c2/calls/call?route=output&method=produce"))
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
@@ -267,7 +280,7 @@ async fn unary_response_holds_slot_through_eof_abort_and_last_transport_frame() 
         assert_eq!(fixture.state.call_execution_snapshot().used_operations, 1);
         capacity_refusal(
             app.clone()
-                .oneshot(call_request("/output/produce"))
+                .oneshot(call_request("/_c2/calls/call?route=output&method=produce"))
                 .await
                 .unwrap(),
         )
@@ -295,7 +308,7 @@ async fn tiny_memory_budget_recycles_download_window_while_a_second_call_waits()
     tokio::time::timeout(WAIT, async {
         let first = app
             .clone()
-            .oneshot(call_request("/output/produce"))
+            .oneshot(call_request("/_c2/calls/call?route=output&method=produce"))
             .await
             .unwrap();
         assert_eq!(first.status(), StatusCode::OK);
@@ -307,7 +320,8 @@ async fn tiny_memory_budget_recycles_download_window_while_a_second_call_waits()
         assert_eq!(snapshot.memory.used_bytes, memory);
         assert!(snapshot.file_spill.used_bytes >= RESPONSE_BYTES as u64);
 
-        let mut second = Box::pin(app.oneshot(call_request("/output/produce")));
+        let mut second =
+            Box::pin(app.oneshot(call_request("/_c2/calls/call?route=output&method=produce")));
         assert!(futures::poll!(&mut second).is_pending());
         assert_eq!(state.call_execution_snapshot().used_operations, 2);
 

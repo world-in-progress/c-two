@@ -111,9 +111,9 @@ pub(crate) struct ConnectionWriter {
     /// that stops reading exhausts only its own connection; every other
     /// connection keeps its independent budget.
     control_budget: Arc<Semaphore>,
-    /// One pending overload reply per connection, with read-side backpressure
-    /// if the peer sends further queries without reading replies.
-    query_overflow: Arc<Semaphore>,
+    /// One pending overflow reply per connection. The reader applies
+    /// backpressure if the peer keeps writing without reading replies.
+    control_overflow: Arc<Semaphore>,
     pub(crate) conn: Arc<Connection>,
 }
 
@@ -159,7 +159,7 @@ impl ConnectionWriter {
             queue,
             controls,
             control_budget: Arc::new(Semaphore::new(1024)),
-            query_overflow: Arc::new(Semaphore::new(1)),
+            control_overflow: Arc::new(Semaphore::new(1)),
             conn: conn.clone(),
         });
         let task = tokio::spawn(async move {
@@ -189,7 +189,7 @@ impl ConnectionWriter {
             // One bounded control budget per physical connection: exhaustion
             // ends only this connection with `reply_pending_capacity`.
             control_budget: Arc::new(Semaphore::new(control_reply_capacity)),
-            query_overflow: Arc::new(Semaphore::new(1)),
+            control_overflow: Arc::new(Semaphore::new(1)),
             conn: conn.clone(),
         });
         // Keep the physical retirement owner until the write half has gone.
@@ -484,13 +484,37 @@ impl ConnectionWriter {
     }
 
     pub(crate) async fn queue_query_overflow(&self, bytes: Vec<u8>) -> io::Result<()> {
-        let pending = tokio::select! {
-            permit = self.query_overflow.clone().acquire_owned() => {
-                permit.map_err(|_| broken_pipe())?
-            }
-            _ = self.controls.closed() => return Err(broken_pipe()),
-        };
+        let pending = self.acquire_overflow().await?;
         self.queue_query_reply(bytes, pending)
+    }
+
+    /// Semantically invalid metadata is a call-specific error. Even a full
+    /// control queue must not deactivate the connection on this path.
+    pub(crate) async fn queue_recoverable_refusal(&self, bytes: Vec<u8>) -> io::Result<()> {
+        let pending = match self.control_budget.clone().try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => self.acquire_overflow().await?,
+        };
+        let frame = self.conn.core.prepare_call_record().map_err(core_error)?;
+        QueuedReplyPermit {
+            queue: self.controls.clone(),
+            pending,
+            request: WriteRequest::CallEnd {
+                frame,
+                loans: Vec::new(),
+            },
+            flight: WriteGuard::new(&self.conn),
+        }
+        .try_send(bytes)
+    }
+
+    async fn acquire_overflow(&self) -> io::Result<OwnedSemaphorePermit> {
+        tokio::select! {
+            permit = self.control_overflow.clone().acquire_owned() => {
+                permit.map_err(|_| broken_pipe())
+            }
+            _ = self.controls.closed() => Err(broken_pipe()),
+        }
     }
 }
 

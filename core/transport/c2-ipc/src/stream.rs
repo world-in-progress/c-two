@@ -987,9 +987,19 @@ impl IpcClient {
         method_name: &str,
         data: &[u8],
         budget: DomainBudget,
+        metadata: &CallMetadata,
     ) -> Result<IpcResponseStream, crate::IpcCallError> {
-        self.stream_bound_inner(binding, method_name, data, budget, Box::new(()), None, None)
-            .await
+        self.stream_bound_inner(
+            binding,
+            method_name,
+            data,
+            budget,
+            Box::new(()),
+            None,
+            None,
+            metadata,
+        )
+        .await
     }
 
     /// Transfer an owned request and an operation-slot owner to the original
@@ -1003,6 +1013,7 @@ impl IpcClient {
         completion_owner: Box<dyn Send>,
         cancellation: IpcStreamCancellation,
         control: &IpcCallControl,
+        metadata: &CallMetadata,
     ) -> Result<IpcResponseStream, crate::IpcCallError>
     where
         B: AsRef<[u8]> + Send + 'static,
@@ -1015,6 +1026,7 @@ impl IpcClient {
             completion_owner,
             Some(cancellation),
             Some(control),
+            metadata,
         )
         .await
     }
@@ -1028,6 +1040,7 @@ impl IpcClient {
         completion_owner: Box<dyn Send>,
         cancellation: Option<IpcStreamCancellation>,
         control: Option<&IpcCallControl>,
+        metadata: &CallMetadata,
     ) -> Result<IpcResponseStream, crate::IpcCallError>
     where
         B: AsRef<[u8]> + Send,
@@ -1081,6 +1094,7 @@ impl IpcClient {
                         &identity,
                         index,
                         CallMode::ServerStream,
+                        metadata,
                         ValuePart::whole(ValueStorage::Shm(descriptor)),
                     )
                     .map_err(|error| IpcError::Protocol(error.to_string()))?;
@@ -1095,7 +1109,11 @@ impl IpcClient {
                         .await;
                 }
             }
-            let size = c2_config::CHUNK_SIZE as usize;
+            let size = request_chunk_size(
+                data.as_ref().len(),
+                u64::MAX,
+                open_metadata_len(&identity, None, metadata)?,
+            )?;
             if data.as_ref().len() > size {
                 for (part, bytes) in data.as_ref().chunks(size).enumerate() {
                     if *stop_upload.borrow() {
@@ -1109,6 +1127,7 @@ impl IpcClient {
                         (&identity, index, CallMode::ServerStream, None),
                         bytes,
                         if part == 0 { control.cloned() } else { None },
+                        metadata,
                     )
                     .await?;
                 }
@@ -1118,6 +1137,7 @@ impl IpcClient {
                     &identity,
                     index,
                     CallMode::ServerStream,
+                    metadata,
                     ValuePart::whole(ValueStorage::Inline(data.as_ref())),
                 )
                 .map_err(|error| IpcError::Protocol(error.to_string()))?;

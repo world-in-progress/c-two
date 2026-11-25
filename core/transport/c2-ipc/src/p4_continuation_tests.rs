@@ -1,4 +1,5 @@
 use super::*;
+use crate::tests::EMPTY_METADATA;
 use crate::tests::memory_budget;
 
 #[tokio::test]
@@ -30,14 +31,18 @@ async fn incomplete_call_end_waits_for_peer_end_while_other_calls_finish() {
     let client = Arc::new(client);
     let incomplete = tokio::spawn({
         let client = client.clone();
-        async move { client.call_inline(&identity(), 0, b"incomplete").await }
+        async move {
+            client
+                .call_inline(&identity(), 0, b"incomplete", &EMPTY_METADATA)
+                .await
+        }
     });
     first_received.await.unwrap();
     let call_identity = identity();
     let (running, queued) = timeout(WAIT, async {
         tokio::join!(
-            client.call_inline(&call_identity, 0, b"running"),
-            client.call_inline(&call_identity, 0, b"queued"),
+            client.call_inline(&call_identity, 0, b"running", &EMPTY_METADATA),
+            client.call_inline(&call_identity, 0, b"queued", &EMPTY_METADATA),
         )
     })
     .await
@@ -107,11 +112,15 @@ async fn rejected_reply_discards_late_chunks_and_preserves_other_calls() {
         let client = Arc::new(client);
         let rejected = tokio::spawn({
             let client = client.clone();
-            async move { client.call_inline(&identity(), 0, b"reject").await }
+            async move {
+                client
+                    .call_inline(&identity(), 0, b"reject", &EMPTY_METADATA)
+                    .await
+            }
         });
         first_received.await.unwrap();
         let other_identity = identity();
-        let other = client.call_inline(&other_identity, 0, b"other");
+        let other = client.call_inline(&other_identity, 0, b"other", &EMPTY_METADATA);
         let (rejected, other) = timeout(WAIT, async { tokio::join!(rejected, other) })
             .await
             .unwrap();
@@ -129,7 +138,7 @@ async fn rejected_reply_discards_late_chunks_and_preserves_other_calls() {
         ));
         assert_eq!(
             client
-                .call_inline(&identity(), 0, b"after")
+                .call_inline(&identity(), 0, b"after", &EMPTY_METADATA)
                 .await
                 .unwrap()
                 .into_owned_bytes()
@@ -141,7 +150,7 @@ async fn rejected_reply_discards_late_chunks_and_preserves_other_calls() {
         send_unknown.send(()).unwrap();
         assert_eq!(
             client
-                .call_inline(&identity(), 0, b"tail")
+                .call_inline(&identity(), 0, b"tail", &EMPTY_METADATA)
                 .await
                 .unwrap()
                 .into_owned_bytes()
@@ -239,14 +248,18 @@ async fn writer_assigns_monotonic_ids_after_input_preparation() {
                 Ok::<Vec<u8>, std::io::Error>(b"A".to_vec())
             });
             client
-                .call_bound_sized_stream_phased(&binding, "echo", 1, source, None)
+                .call_bound_sized_stream_phased(&binding, "echo", 1, source, None, &EMPTY_METADATA)
                 .await
         }
     });
     timeout(WAIT, source_waiting).await.unwrap().unwrap();
     let b = tokio::spawn({
         let client = client.clone();
-        async move { client.call_inline(&identity(), 0, b"B").await }
+        async move {
+            client
+                .call_inline(&identity(), 0, b"B", &EMPTY_METADATA)
+                .await
+        }
     });
     let b_id = timeout(WAIT, b_received).await.unwrap().unwrap();
     assert_eq!(
@@ -312,7 +325,7 @@ async fn writer_rejection_preserves_error_and_connection_for_zero_inline_and_chu
         })
         .with_before_prepare(|| Ok(()));
         let error = client
-            .call_bound_controlled_phased(&binding, "echo", data, &control)
+            .call_bound_controlled_phased(&binding, "echo", data, &control, &EMPTY_METADATA)
             .await
             .unwrap_err();
         assert_eq!(error.phase(), crate::TransportPhase::PreDispatch);
@@ -326,7 +339,7 @@ async fn writer_rejection_preserves_error_and_connection_for_zero_inline_and_chu
     }
     assert_eq!(
         client
-            .call_bound(&binding, "echo", b"healthy")
+            .call_bound(&binding, "echo", b"healthy", &EMPTY_METADATA)
             .await
             .unwrap()
             .into_owned_bytes()
@@ -376,17 +389,29 @@ async fn deactivation_distinguishes_unpublished_calls_from_started_dispatch() {
         let first = tokio::spawn({
             let client = client.clone();
             let binding = binding.clone();
-            async move { client.call_bound_phased(&binding, "echo", b"first").await }
+            async move {
+                client
+                    .call_bound_phased(&binding, "echo", b"first", &EMPTY_METADATA)
+                    .await
+            }
         });
         paused.await.unwrap();
         let control = IpcCallControl::new(|| Ok(()));
         let queued = async {
             if controlled {
                 client
-                    .call_bound_controlled_phased(&binding, "echo", &data, &control)
+                    .call_bound_controlled_phased(
+                        &binding,
+                        "echo",
+                        &data,
+                        &control,
+                        &EMPTY_METADATA,
+                    )
                     .await
             } else {
-                client.call_bound_phased(&binding, "echo", &data).await
+                client
+                    .call_bound_phased(&binding, "echo", &data, &EMPTY_METADATA)
+                    .await
             }
         };
         let mut queued = Box::pin(queued);
@@ -454,11 +479,16 @@ async fn deactivation_before_shm_dispatch_reports_pre_dispatch_and_releases_its_
         *conn.pause.lock() = Some((entered, resumed));
         let first = tokio::spawn({
             let client = client.clone();
-            async move { client.call_inline(&identity(), 0, b"first").await }
+            async move {
+                client
+                    .call_inline(&identity(), 0, b"first", &EMPTY_METADATA)
+                    .await
+            }
         });
         paused.await.unwrap();
         let data = vec![3; SHM_THRESHOLD as usize + 1];
-        let mut queued = Box::pin(client.call_bound_phased(&binding, "echo", &data));
+        let mut queued =
+            Box::pin(client.call_bound_phased(&binding, "echo", &data, &EMPTY_METADATA));
         assert!(futures_util::poll!(queued.as_mut()).is_pending());
         assert_eq!(
             pool.read().stats().alloc_count,
@@ -543,6 +573,7 @@ async fn writer_rejection_after_real_buddy_or_dedicated_preparation_releases_blo
                 "echo",
                 &[3; SHM_THRESHOLD as usize + 1],
                 &control,
+                &EMPTY_METADATA,
             )
             .await
             .unwrap_err();
@@ -559,7 +590,7 @@ async fn writer_rejection_after_real_buddy_or_dedicated_preparation_releases_blo
         assert_eq!(calls.0.load(Ordering::SeqCst), 0);
         assert_eq!(
             client
-                .call_bound(&binding, "echo", b"ok")
+                .call_bound(&binding, "echo", b"ok", &EMPTY_METADATA)
                 .await
                 .unwrap()
                 .into_owned_bytes()
@@ -637,6 +668,7 @@ async fn expired_scope_after_first_chunk_does_not_recheck_dispatch_and_invokes_o
                     stream,
                     DEFAULT_MAX_PAYLOAD_SIZE,
                     Some(control),
+                    &EMPTY_METADATA,
                 )
                 .await;
             (client, binding, result)
@@ -660,7 +692,7 @@ async fn expired_scope_after_first_chunk_does_not_recheck_dispatch_and_invokes_o
     assert_eq!(client.pending_len_for_test(), 0);
     assert_eq!(
         client
-            .call_bound(&binding, "echo", b"next")
+            .call_bound(&binding, "echo", b"next", &EMPTY_METADATA)
             .await
             .unwrap()
             .into_owned_bytes()
@@ -692,6 +724,7 @@ async fn source_failures_before_publication_leave_unrelated_calls_healthy() {
                 8193,
                 futures_util::stream::iter(items),
                 None,
+                &EMPTY_METADATA,
             )
             .await
             .unwrap_err();
@@ -704,7 +737,7 @@ async fn source_failures_before_publication_leave_unrelated_calls_healthy() {
         assert_eq!(calls.0.load(Ordering::SeqCst), 0);
         assert_eq!(
             client
-                .call_bound(&binding, "echo", b"other")
+                .call_bound(&binding, "echo", b"other", &EMPTY_METADATA)
                 .await
                 .unwrap()
                 .into_owned_bytes()
@@ -754,7 +787,14 @@ async fn source_error_after_first_chunk_is_uncertain_and_records_request_source(
     });
     let call = tokio::spawn(async move {
         let error = client
-            .call_bound_sized_stream_phased(&binding, "echo", CHUNK_SIZE * 2 + 1, source, None)
+            .call_bound_sized_stream_phased(
+                &binding,
+                "echo",
+                CHUNK_SIZE * 2 + 1,
+                source,
+                None,
+                &EMPTY_METADATA,
+            )
             .await
             .unwrap_err();
         (client, error)
@@ -793,7 +833,12 @@ async fn queued_control_and_business_cancellation_remove_only_their_waiters() {
     *conn.pause.lock() = Some((entered, resumed));
     let first = tokio::spawn({
         let client = client.clone();
-        async move { client.call_inline(&identity(), 0, b"first").await.unwrap() }
+        async move {
+            client
+                .call_inline(&identity(), 0, b"first", &EMPTY_METADATA)
+                .await
+                .unwrap()
+        }
     });
     paused.await.unwrap();
     assert_eq!(client.pending_len_for_test(), 1);
@@ -811,7 +856,11 @@ async fn queued_control_and_business_cancellation_remove_only_their_waiters() {
     eventually(|| client.pending_len_for_test() == 1).await;
     let queued_business = tokio::spawn({
         let client = client.clone();
-        async move { client.call_inline(&identity(), 0, b"queued business").await }
+        async move {
+            client
+                .call_inline(&identity(), 0, b"queued business", &EMPTY_METADATA)
+                .await
+        }
     });
     eventually(|| client.pending_len_for_test() == 2).await;
     queued_business.abort();
@@ -850,7 +899,11 @@ async fn repeated_response_wait_cancellation_never_accumulates_pending_entries()
     for index in 0..8 {
         let waiting = tokio::spawn({
             let client = client.clone();
-            async move { client.call_inline(&identity(), 0, &[index]).await }
+            async move {
+                client
+                    .call_inline(&identity(), 0, &[index], &EMPTY_METADATA)
+                    .await
+            }
         });
         timeout(WAIT, seen.recv()).await.unwrap().unwrap();
         waiting.abort();
@@ -862,7 +915,7 @@ async fn repeated_response_wait_cancellation_never_accumulates_pending_entries()
     }
     assert_eq!(
         client
-            .call_inline(&identity(), 0, b"healthy")
+            .call_inline(&identity(), 0, b"healthy", &EMPTY_METADATA)
             .await
             .unwrap()
             .into_owned_bytes()
@@ -918,7 +971,7 @@ async fn started_control_send_survives_caller_cancellation_and_keeps_connection(
     resume.send(()).unwrap();
     assert_eq!(
         client
-            .call_inline(&identity(), 0, b"business")
+            .call_inline(&identity(), 0, b"business", &EMPTY_METADATA)
             .await
             .unwrap()
             .into_owned_bytes()
@@ -962,7 +1015,7 @@ async fn sync_client_controlled_async_call_uses_caller_runtime_without_nested_bl
         }
     });
     let response = client
-        .call_bound_controlled_async(&binding, "echo", b"async caller", &control)
+        .call_bound_controlled_async(&binding, "echo", b"async caller", &control, &EMPTY_METADATA)
         .await
         .unwrap();
     assert_eq!(response.into_owned_bytes().unwrap(), b"async caller");
@@ -993,7 +1046,7 @@ async fn inline_stream_copy_reserves_before_polling_its_charged_source() {
         polled.fetch_add(1, Ordering::SeqCst);
     });
     let error = client
-        .call_bound_sized_stream_phased(&binding, "echo", 4, source, Some(&budget))
+        .call_bound_sized_stream_phased(&binding, "echo", 4, source, Some(&budget), &EMPTY_METADATA)
         .await
         .unwrap_err();
     assert_eq!(error.phase(), crate::TransportPhase::PreDispatch);
@@ -1010,7 +1063,7 @@ async fn inline_stream_copy_reserves_before_polling_its_charged_source() {
     assert!(client.is_connected());
     assert_eq!(
         client
-            .call_bound(&binding, "echo", b"healthy")
+            .call_bound(&binding, "echo", b"healthy", &EMPTY_METADATA)
             .await
             .unwrap()
             .into_owned_bytes()
@@ -1040,7 +1093,7 @@ async fn owned_input_survives_unpublished_shm_fallback_without_an_extra_copy() {
         Ok(())
     });
     let reply = client
-        .call_bound_owned_controlled_phased(&binding, "echo", input, &control)
+        .call_bound_owned_controlled_phased(&binding, "echo", input, &control, &EMPTY_METADATA)
         .await
         .unwrap();
     assert_eq!(reply.into_owned_bytes().unwrap(), vec![7; 8193]);
@@ -1141,7 +1194,14 @@ async fn source_error_terminal_receipt_race(rejected: bool) {
         let client = client.clone();
         async move {
             client
-                .call_bound_sized_stream_phased(&binding, "echo", CHUNK_SIZE * 2, source, None)
+                .call_bound_sized_stream_phased(
+                    &binding,
+                    "echo",
+                    CHUNK_SIZE * 2,
+                    source,
+                    None,
+                    &EMPTY_METADATA,
+                )
                 .await
         }
     });

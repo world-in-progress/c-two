@@ -1,10 +1,11 @@
 use std::sync::Arc;
 
 use c_two::generated::{
-    C2Error, EncodedClient, EncodedService, ErrorCode, MethodAccess, MethodDefinition,
-    ServiceDefinition,
+    C2Error, EncodedService, ErrorCode, MethodAccess, MethodDefinition, ServiceDefinition,
 };
-use c_two::{Connect, ContractRelease, HostOptions, Runtime, RuntimeOptions};
+use c_two::{
+    CallOptions, CallOutcomeStatus, Connect, ContractRelease, HostOptions, Runtime, RuntimeOptions,
+};
 
 const DESCRIPTOR: &str = r#"{"schema":"c-two.contract.v2","crm":{"namespace":"test.contract-release","name":"Portable","version":"0.1.0"},"fingerprints":{"abi_hash":"bec2fee73f9a2476c311de20e40e584d0c7ff6bcadd38c0b4fe3e683ec2540fe","signature_hash":"c4cd2cf04caa63f12f702868524787c95c4f5bc00a7c7212bd1f807b32647940"},"methods":[{"access":"read","name":"ping","parameters":[],"return":{"kind":"none"},"bindings":{"input":null,"output":null}},{"access":"write","name":"echo","parameters":[{"name":"payload","kind":"POSITIONAL_OR_KEYWORD","default":{"kind":"missing"},"type":{"kind":"payload"}}],"return":{"kind":"payload"},"bindings":{"input":{"kind":"fastdb","spec":{"schema":"fastdb.payload.v1","profile":"record.v1","entries":[{"id":"value","cardinality":"one","type":{"kind":"str","nullable":true}}],"components":[]}},"output":{"kind":"fastdb","spec":{"schema":"fastdb.payload.v1","profile":"record.v1","entries":[{"id":"value","cardinality":"one","type":{"kind":"str","nullable":true}}],"components":[]}}}}]}"#;
 
@@ -62,8 +63,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .ok_or("host did not publish an IPC address")?,
         },
     )?;
-    let response = client.call_owned("echo", b"real route-bound call")?;
+    let client =
+        client.with_call_options(CallOptions::new().with_metadata_entry("source", "example")?);
+    let call_id = "example-echo";
+    let response = client.call_unary_with_call_id("echo", b"real route-bound call", call_id)?;
     assert_eq!(response, b"real route-bound call");
+    assert_eq!(
+        client.query_call(call_id)?.status,
+        CallOutcomeStatus::Succeeded
+    );
+    assert_eq!(client.recover_unary_call("echo", call_id)?, response);
 
     registration.close()?;
     Ok(())

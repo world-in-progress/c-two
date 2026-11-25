@@ -7,10 +7,11 @@
 use c2_config::{CallOptions, CallTimeout, ConfigSources, DomainLimits};
 use c2_contract::{ContractRelease, MethodAccess, derive_contract_fingerprints_json};
 use c2_core::{
+    AdmissionContext, AdmissionDecision, AdmissionHook, AdmissionOperation, AdmissionTransport,
     Connect, EncodedService, HostOptions, LocalEndpointOptions, MethodDefinition, Runtime,
-    RuntimeOptions, ServiceDefinition, SubscribeOptions,
+    RuntimeOptions, ServiceDefinition, SubscribeOptions, TopicStart,
 };
-use c2_error::C2Error;
+use c2_error::{C2Error, ErrorCode};
 use c2_http::relay::{RelayConfig, RelayServer};
 use serde_json::{Value, json};
 use std::{
@@ -344,6 +345,10 @@ impl DualRelay {
     }
 
     fn with_limits(limits: DualRelayLimits) -> Self {
+        Self::with_limits_and_hook(limits, None)
+    }
+
+    fn with_limits_and_hook(limits: DualRelayLimits, hook: Option<Arc<dyn AdmissionHook>>) -> Self {
         let root = tempfile::Builder::new()
             .prefix("c2-dual-relay-")
             .tempdir()
@@ -389,12 +394,13 @@ impl DualRelay {
         )
         .unwrap();
         b.set_target(relay_b.local_addr());
-        let host = host_rt
-            .host(
-                HostOptions::default()
-                    .with_relay_anchor_address(format!("http://{}", relay_a.local_addr())),
-            )
-            .unwrap();
+        let options = HostOptions::default()
+            .with_relay_anchor_address(format!("http://{}", relay_a.local_addr()));
+        let options = match hook {
+            Some(hook) => options.with_admission_hook(hook),
+            None => options,
+        };
+        let host = host_rt.host(options).unwrap();
         let registration = Self::register_route(&host, "topic-route");
         let client_rt = runtime(&root);
         Self {
@@ -433,7 +439,7 @@ impl DualRelay {
             )
             .unwrap()
             .with_topic_capacity("state", 2)
-            .unwrap()
+            .unwrap(),
         )
         .unwrap()
     }
@@ -445,17 +451,33 @@ impl DualRelay {
         let anchor = self.b.url();
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
-            match self
-                .client_rt
-                .connect(expected.clone(), Connect::ExplicitRelay { relay_url: anchor.clone() })
-            {
+            match self.client_rt.connect(
+                expected.clone(),
+                Connect::ExplicitRelay {
+                    relay_url: anchor.clone(),
+                },
+            ) {
                 Ok(client) => return client,
                 Err(error) => {
-                    assert!(Instant::now() < deadline, "connect through B failed: {error:?}");
+                    assert!(
+                        Instant::now() < deadline,
+                        "connect through B failed: {error:?}"
+                    );
                     std::thread::sleep(Duration::from_millis(10));
                 }
             }
         }
+    }
+
+    fn source_client(&self) -> c2_core::Client {
+        self.client_rt
+            .connect(
+                release().expected_route("topic-route").unwrap(),
+                Connect::ExplicitRelay {
+                    relay_url: format!("http://{}", self.relay_a.local_addr()),
+                },
+            )
+            .unwrap()
     }
 
     fn sub(&self, client: &c2_core::Client) -> c2_core::CoreTopicSubscription {
@@ -502,8 +524,14 @@ fn raw_topic_request_bytes(path: &str, extra_headers: &[(&str, &str)]) -> String
         expected.crm_ver,
     );
     let mut extra_headers: Vec<(&str, &str)> = extra_headers.to_vec();
-    if !extra_headers.iter().any(|(name, _)| *name == "x-c2-expected-abi-hash") {
-        extra_headers.push(("x-c2-expected-abi-hash", leak_str(expected.abi_hash.to_string())));
+    if !extra_headers
+        .iter()
+        .any(|(name, _)| *name == "x-c2-expected-abi-hash")
+    {
+        extra_headers.push((
+            "x-c2-expected-abi-hash",
+            leak_str(expected.abi_hash.to_string()),
+        ));
     }
     if !extra_headers
         .iter()
@@ -527,7 +555,9 @@ fn raw_topic_request(
     extra_headers: &[(&str, &str)],
 ) -> (u16, Vec<u8>) {
     let mut stream = std::net::TcpStream::connect(address).unwrap();
-    stream.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
     let request = raw_topic_request_bytes(path, extra_headers);
     stream.write_all(request.as_bytes()).unwrap();
     let mut bytes = Vec::new();
@@ -559,10 +589,21 @@ fn raw_topic_response_headers(
     path: &str,
     extra_headers: &[(&str, &str)],
 ) -> (u16, String) {
+    let (_, headers) = open_raw_topic(address, path, extra_headers);
+    (200, headers)
+}
+
+fn open_raw_topic(
+    address: SocketAddr,
+    path: &str,
+    extra_headers: &[(&str, &str)],
+) -> (std::net::TcpStream, String) {
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         let mut stream = std::net::TcpStream::connect(address).unwrap();
-        stream.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
         stream
             .write_all(raw_topic_request_bytes(path, extra_headers).as_bytes())
             .unwrap();
@@ -585,11 +626,24 @@ fn raw_topic_response_headers(
             .and_then(|code| code.parse().ok())
             .unwrap_or(0);
         if ok && status == 200 {
-            return (status, text);
+            return (stream, text);
         }
-        assert!(Instant::now() < deadline, "no topic response, status {status}");
+        assert!(
+            Instant::now() < deadline,
+            "no topic response, status {status}"
+        );
         std::thread::sleep(Duration::from_millis(20));
     }
+}
+
+fn response_header<'a>(headers: &'a str, name: &str) -> &'a str {
+    headers
+        .lines()
+        .filter_map(|line| line.split_once(':'))
+        .find(|(key, _)| key.eq_ignore_ascii_case(name))
+        .unwrap()
+        .1
+        .trim()
 }
 
 #[test]
@@ -707,6 +761,189 @@ fn late_joiners_confirm_in_causal_batches_and_keep_causal_start_points() {
 }
 
 #[test]
+fn admission_denied_to_one_subscriber_preserves_local_and_remote_hubs() {
+    for at_anchor in [false, true] {
+        let (leader_entered, entered) = std::sync::mpsc::channel();
+        let (release, leader_release) = std::sync::mpsc::channel();
+        let leader_release = StdMutex::new(leader_release);
+        let seen = Arc::new(StdMutex::new(Vec::new()));
+        let hook_seen = seen.clone();
+        let hook = Arc::new(move |context: &AdmissionContext<'_>| {
+            assert_eq!(context.operation(), AdmissionOperation::Subscribe);
+            assert_eq!(context.transport(), AdmissionTransport::Ipc);
+            assert_eq!(context.target(), Some("state"));
+            let credential = context.metadata().get("credential").unwrap();
+            hook_seen.lock().unwrap().push(credential.to_string());
+            match credential {
+                "denied-leader" => {
+                    leader_entered.send(()).unwrap();
+                    leader_release
+                        .lock()
+                        .unwrap()
+                        .recv_timeout(Duration::from_secs(10))
+                        .unwrap();
+                    AdmissionDecision::deny("leader denied")
+                }
+                "denied-follower" => AdmissionDecision::deny("follower denied"),
+                _ => AdmissionDecision::allow(),
+            }
+        });
+        let fixture = DualRelay::with_limits_and_hook(DualRelayLimits::default(), Some(hook));
+        let relay = if at_anchor {
+            &fixture.relay_b
+        } else {
+            &fixture.relay_a
+        };
+        let client = if at_anchor {
+            fixture.client()
+        } else {
+            fixture.source_client()
+        };
+        let publisher = fixture.registration.publisher("state").unwrap();
+        publisher.publish(b"one".to_vec()).unwrap();
+        let subscribe = |credential, start| {
+            client
+                .with_call_options(
+                    CallOptions::new()
+                        .with_metadata_entry("credential", credential)
+                        .unwrap(),
+                )
+                .subscribe_with_options(
+                    "state",
+                    SubscribeOptions {
+                        start,
+                        ..Default::default()
+                    },
+                    CallOptions::with_timeout(CallTimeout::After(Duration::from_secs(10))),
+                )
+        };
+        let mut first = std::thread::scope(|scope| {
+            let leader = scope.spawn(|| subscribe("denied-leader", TopicStart::Latest));
+            entered.recv_timeout(Duration::from_secs(10)).unwrap();
+            let waiter = scope.spawn(|| subscribe("allowed-waiter", TopicStart::Next));
+            wait_until(|| relay.call_execution_snapshot().used_operations == 2);
+            release.send(()).unwrap();
+            let error = leader.join().unwrap().unwrap_err();
+            assert!(matches!(error, c2_core::Error::Semantic(ref e)
+                if e.code == ErrorCode::AdmissionDenied && e.message == "leader denied"));
+            waiter.join().unwrap().unwrap()
+        });
+        assert_eq!(first.start_seq(), 2);
+        assert_eq!(fixture.registration.active_subscribers(), 1);
+        assert_eq!(fixture.relay_a.topic_confirm_count_for_test(), 0);
+        assert_eq!(&*seen.lock().unwrap(), &["denied-leader", "allowed-waiter"]);
+
+        let error = subscribe("denied-follower", TopicStart::Latest).unwrap_err();
+        assert!(matches!(error, c2_core::Error::Semantic(ref e)
+            if e.code == ErrorCode::AdmissionDenied && e.message == "follower denied"));
+        publisher.publish(b"two".to_vec()).unwrap();
+        assert_eq!(first.next_delivery().unwrap().bytes(), b"two");
+        let mut late = subscribe("allowed-follower", TopicStart::Latest).unwrap();
+        assert_eq!(late.start_seq(), 2);
+        assert_eq!(late.next_delivery().unwrap().bytes(), b"two");
+        assert_eq!(fixture.registration.active_subscribers(), 1);
+        assert_eq!(
+            fixture.relay_a.topic_confirm_count_for_test(),
+            if at_anchor { 2 } else { 0 }
+        );
+        assert_eq!(
+            &*seen.lock().unwrap(),
+            &[
+                "denied-leader",
+                "allowed-waiter",
+                "denied-follower",
+                "allowed-follower"
+            ]
+        );
+        fixture.close_all(std::slice::from_mut(&mut first));
+        fixture.close_all(std::slice::from_mut(&mut late));
+        wait_until(|| fixture.registration.active_subscribers() == 0);
+    }
+}
+
+#[test]
+fn deleting_origin_token_while_host_confirms_preserves_source_relay_subscribers() {
+    let (hook_entered, entered) = std::sync::mpsc::channel();
+    let (release, hook_release) = std::sync::mpsc::channel();
+    let hook_release = StdMutex::new(hook_release);
+    let hook = Arc::new(move |context: &AdmissionContext<'_>| {
+        if context.metadata().get("credential") == Some("blocked") {
+            hook_entered.send(()).unwrap();
+            hook_release
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(10))
+                .unwrap();
+        }
+        AdmissionDecision::allow()
+    });
+    let fixture = DualRelay::with_limits_and_hook(DualRelayLimits::default(), Some(hook));
+    let ordinary = fixture.sub(&fixture.source_client());
+    let addr = fixture.relay_a.local_addr();
+    let subscribe_path = "/_c2/topics/subscribe?route=topic-route&topic=state";
+    let confirm_path = "/_c2/topics/confirm?route=topic-route&topic=state";
+    let origin_headers = [("x-c2-relay-origin-only", "1")];
+    let (origin, headers) = open_raw_topic(addr, subscribe_path, &origin_headers);
+    assert_eq!(
+        response_header(&headers, "x-c2-topic-admission-required"),
+        "1"
+    );
+    assert_eq!(response_header(&headers, "x-c2-topic-head-seq"), "0");
+    let token = response_header(&headers, "x-c2-call-token");
+    let registration = response_header(&headers, "x-c2-topic-registration");
+    let wrong_topic = "/_c2/topics/confirm?route=topic-route&topic=other";
+    let confirm_headers = [
+        ("x-c2-relay-origin-only", "1"),
+        ("x-c2-expected-registration", registration),
+        ("x-c2-topic-upstream-token", token),
+    ];
+    let assert_closed = |(status, body): (u16, Vec<u8>)| {
+        assert_eq!(status, 503);
+        let error = c2_http::decode_control_error(status, &body).unwrap();
+        assert_eq!(error.code, ErrorCode::ResourceClosed);
+    };
+    assert_closed(raw_topic_request(addr, wrong_topic, &confirm_headers));
+    std::thread::scope(|scope| {
+        let in_flight = scope.spawn(|| {
+            let mut headers = confirm_headers.to_vec();
+            headers.push(("x-c2-meta-credential", "blocked"));
+            raw_topic_request(addr, confirm_path, &headers)
+        });
+        entered.recv_timeout(Duration::from_secs(10)).unwrap();
+        let mut delete = std::net::TcpStream::connect(addr).unwrap();
+        delete
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        write!(
+            delete,
+            "DELETE /_calls/{token} HTTP/1.1\r\nHost: relay\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"
+        )
+        .unwrap();
+        let mut response = String::new();
+        delete.read_to_string(&mut response).unwrap();
+        assert!(response.starts_with("HTTP/1.1 204"), "{response}");
+        assert_closed(raw_topic_request(addr, confirm_path, &confirm_headers));
+        release.send(()).unwrap();
+        assert_closed(in_flight.join().unwrap());
+    });
+    drop(origin);
+
+    let (origin, headers) = open_raw_topic(addr, subscribe_path, &origin_headers);
+    let mut new_headers = confirm_headers;
+    new_headers[2].1 = response_header(&headers, "x-c2-call-token");
+    assert_ne!(new_headers[2].1, token);
+    assert_eq!(raw_topic_request(addr, confirm_path, &new_headers).0, 200);
+    drop(origin);
+    wait_until(|| fixture.relay_a.call_execution_snapshot().used_operations == 1);
+    assert_closed(raw_topic_request(addr, confirm_path, &new_headers));
+    let publisher = fixture.registration.publisher("state").unwrap();
+    publisher.publish(b"still live".to_vec()).unwrap();
+    assert_eq!(ordinary.next_delivery().unwrap().bytes(), b"still live");
+    assert_eq!(fixture.registration.active_subscribers(), 1);
+    let _ = ordinary.close_with_timeout(Some(Duration::from_secs(5)));
+}
+
+#[test]
 fn re_registration_on_the_source_gives_late_joiners_a_fresh_remote_hub() {
     let mut fixture = DualRelay::new();
     let client = fixture.client();
@@ -743,7 +980,9 @@ fn re_registration_on_the_source_gives_late_joiners_a_fresh_remote_hub() {
 fn dual_relay_refusals_keep_canonical_codes_through_the_anchor() {
     let fixture = DualRelay::new();
     let client = fixture.client();
-    let error = client.subscribe("unknown", SubscribeOptions::default()).unwrap_err();
+    let error = client
+        .subscribe("unknown", SubscribeOptions::default())
+        .unwrap_err();
     assert!(
         matches!(error, c2_core::Error::Semantic(ref e) if e.code == c2_error::ErrorCode::ProtocolViolation
             && e.details.get("reason").map(String::as_str) == Some("unknown_topic")),
@@ -757,8 +996,11 @@ fn dual_relay_refusals_keep_canonical_codes_through_the_anchor() {
     loop {
         let (status, body) = raw_topic_request(
             fixture.relay_b.local_addr(),
-            "/topic-route/_topics/state",
-            &[("x-c2-expected-signature-hash", "0000000000000000000000000000000000000000000000000000000000000000")],
+            "/_c2/topics/subscribe?route=topic-route&topic=state",
+            &[(
+                "x-c2-expected-signature-hash",
+                "0000000000000000000000000000000000000000000000000000000000000000",
+            )],
         );
         if status == 409 {
             let json: Value = serde_json::from_slice(&body).unwrap();
@@ -774,20 +1016,24 @@ fn dual_relay_refusals_keep_canonical_codes_through_the_anchor() {
     // subscriber on B receives it in the subscription response headers.
     let (_, headers) = raw_topic_response_headers(
         fixture.relay_b.local_addr(),
-        "/topic-route/_topics/state",
+        "/_c2/topics/subscribe?route=topic-route&topic=state",
         &[],
     );
     assert!(
-        !headers.to_ascii_lowercase().contains("x-c2-topic-registration"),
+        !headers
+            .to_ascii_lowercase()
+            .contains("x-c2-topic-registration"),
         "anchor response leaked the registration fingerprint: {headers}"
     );
     let (_, headers) = raw_topic_response_headers(
         fixture.relay_a.local_addr(),
-        "/topic-route/_topics/state",
+        "/_c2/topics/subscribe?route=topic-route&topic=state",
         &[],
     );
     assert!(
-        !headers.to_ascii_lowercase().contains("x-c2-topic-registration"),
+        !headers
+            .to_ascii_lowercase()
+            .contains("x-c2-topic-registration"),
         "source relay response leaked the registration fingerprint: {headers}"
     );
 }
@@ -839,22 +1085,16 @@ fn same_host_reregistration_confirm_never_leaks_the_new_head() {
     u2_publisher.publish(b"new".to_vec()).unwrap();
     assert_eq!(u2.next_delivery().unwrap().bytes(), b"new");
 
-    // Release the held confirmation of the old registration: A now serves the
-    // replacement, so the old fingerprint is refused with 718 and the joiner
-    // never receives the replacement's head sequence.
+    // The old subscription observes its real Host terminal. Its held
+    // confirmation is then refused independently of the replacement's head.
+    cancelled_cause(old.next_delivery().unwrap_err(), "route_unregistered");
     release_confirm.send(()).unwrap();
     match joiner.join().unwrap() {
         Err(c2_core::Error::Semantic(error)) => {
-            assert_eq!(error.code, c2_error::ErrorCode::CallCancelled);
-            assert_eq!(
-                error.details.get("cause").map(String::as_str),
-                Some("route_unregistered")
-            );
+            assert_eq!(error.code, ErrorCode::ResourceClosed);
         }
         other => panic!("the stale confirmation must refuse, got {other:?}"),
     }
-    // The old hub is isolated everywhere it still had readers.
-    cancelled_cause(old.next_delivery().unwrap_err(), "route_unregistered");
 
     // New subscribers follow the name cleanly onto the replacement.
     let newcomer_client = fixture.client();
@@ -909,13 +1149,15 @@ fn relay_aware_clients_fan_out_through_the_anchor() {
     let expected = release().expected_route("topic-route").unwrap();
     let deadline = Instant::now() + Duration::from_secs(10);
     let clients: Vec<_> = (0..2)
-        .map(|_| loop {
-            match rt.connect(expected.clone(), Connect::RelayAware) {
-                Ok(client) => return client,
-                Err(error) => assert!(
-                    Instant::now() < deadline,
-                    "relay-aware connect through B failed: {error:?}"
-                ),
+        .map(|_| {
+            loop {
+                match rt.connect(expected.clone(), Connect::RelayAware) {
+                    Ok(client) => return client,
+                    Err(error) => assert!(
+                        Instant::now() < deadline,
+                        "relay-aware connect through B failed: {error:?}"
+                    ),
+                }
             }
         })
         .collect();
@@ -969,12 +1211,13 @@ fn mesh_route_conflict_refuses_remote_subscriptions_pre_dispatch() {
     wait_until(|| {
         let (status, body) = raw_topic_request(
             fixture.relay_b.local_addr(),
-            "/topic-route/_topics/state",
+            "/_c2/topics/subscribe?route=topic-route&topic=state",
             &[],
         );
         status == 409
-            && serde_json::from_slice::<Value>(&body)
-                .is_ok_and(|json| json["code"] == 719 && json["details"]["dispatch_phase"] == "pre_dispatch")
+            && serde_json::from_slice::<Value>(&body).is_ok_and(|json| {
+                json["code"] == 719 && json["details"]["dispatch_phase"] == "pre_dispatch"
+            })
     });
     assert_eq!(fixture.registration.active_subscribers(), 0);
     let _ = b_registration.close();
@@ -1001,7 +1244,8 @@ fn source_relay_loss_reports_the_route_unavailable() {
                 panic!("subscriptions must not be accepted while the source is unreachable");
             }
             Err(error) => {
-                if matches!(error, c2_core::Error::Semantic(ref e) if e.code == c2_error::ErrorCode::ResourceUnavailable) {
+                if matches!(error, c2_core::Error::Semantic(ref e) if e.code == c2_error::ErrorCode::ResourceUnavailable)
+                {
                     break error;
                 }
                 assert!(Instant::now() < deadline, "expected 702, got {error:?}");
@@ -1140,7 +1384,7 @@ fn anchor_stopped_tcp_reader_is_evicted_and_the_fast_reader_advances() {
     });
     let expected = release().expected_route("topic-route").unwrap();
     let request = format!(
-        "POST /topic-route/_topics/state HTTP/1.1\r\nHost: {}\r\nConnection: close\r\nAccept: {}\r\nx-c2-topic-start: latest\r\nx-c2-topic-on-lag: skip\r\nx-c2-expected-crm-ns: {}\r\nx-c2-expected-crm-name: {}\r\nx-c2-expected-crm-ver: {}\r\nx-c2-expected-abi-hash: {}\r\nx-c2-expected-signature-hash: {}\r\nContent-Length: 0\r\n\r\n",
+        "POST /_c2/topics/subscribe?route=topic-route&topic=state HTTP/1.1\r\nHost: {}\r\nConnection: close\r\nAccept: {}\r\nx-c2-topic-start: latest\r\nx-c2-topic-on-lag: skip\r\nx-c2-expected-crm-ns: {}\r\nx-c2-expected-crm-name: {}\r\nx-c2-expected-crm-ver: {}\r\nx-c2-expected-abi-hash: {}\r\nx-c2-expected-signature-hash: {}\r\nContent-Length: 0\r\n\r\n",
         fixture.relay_b.local_addr(),
         c2_http::topic_wire::MEDIA_TYPE,
         expected.crm_ns,
@@ -1152,7 +1396,9 @@ fn anchor_stopped_tcp_reader_is_evicted_and_the_fast_reader_advances() {
     let headers;
     let mut slow = loop {
         let mut stream = std::net::TcpStream::connect(fixture.relay_b.local_addr()).unwrap();
-        stream.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
         stream.write_all(request.as_bytes()).unwrap();
         let mut received = Vec::new();
         while !received.ends_with(b"\r\n\r\n") {
@@ -1181,9 +1427,8 @@ fn anchor_stopped_tcp_reader_is_evicted_and_the_fast_reader_advances() {
             stream.read_exact(&mut byte).unwrap();
             line.push(byte[0]);
         }
-        let size =
-            usize::from_str_radix(std::str::from_utf8(&line[..line.len() - 2]).unwrap(), 16)
-                .unwrap();
+        let size = usize::from_str_radix(std::str::from_utf8(&line[..line.len() - 2]).unwrap(), 16)
+            .unwrap();
         let mut bytes = vec![0; size];
         stream.read_exact(&mut bytes).unwrap();
         let mut crlf = [0; 2];
@@ -1233,7 +1478,9 @@ fn anchor_single_slot_boundary_holds_until_the_upstream_cleans_up() {
     let second_client = fixture.client();
     let sub = fixture.sub(&first_client);
     assert_eq!(fixture.registration.active_subscribers(), 1);
-    let error = second_client.subscribe("state", SubscribeOptions::default()).unwrap_err();
+    let error = second_client
+        .subscribe("state", SubscribeOptions::default())
+        .unwrap_err();
     assert!(
         matches!(error, c2_core::Error::Semantic(ref e) if e.code == c2_error::ErrorCode::CallCapacityExceeded),
         "the single anchor slot must refuse a second subscription: {error:?}"

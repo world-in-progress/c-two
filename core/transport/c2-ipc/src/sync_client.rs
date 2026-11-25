@@ -6,6 +6,7 @@
 use parking_lot::{Mutex, RwLock};
 use std::sync::{Arc, OnceLock};
 
+use c2_config::CallMetadata;
 use c2_mem::MemPool;
 
 use crate::client::stream::{IpcResponseStream, IpcStreamCancellation};
@@ -226,9 +227,10 @@ impl SyncClient {
         binding: &RouteBinding,
         method_name: &str,
         data: &[u8],
+        metadata: &CallMetadata,
     ) -> Result<ResponseData, IpcError> {
         self.rt
-            .block_on(self.call_bound_async(binding, method_name, data))
+            .block_on(self.call_bound_async(binding, method_name, data, metadata))
     }
 
     /// Synchronous CRM call with an explicit dispatch-safety phase on failure.
@@ -237,9 +239,10 @@ impl SyncClient {
         binding: &RouteBinding,
         method_name: &str,
         data: &[u8],
+        metadata: &CallMetadata,
     ) -> Result<ResponseData, IpcCallError> {
         self.rt
-            .block_on(self.call_bound_async_phased(binding, method_name, data))
+            .block_on(self.call_bound_async_phased(binding, method_name, data, metadata))
     }
 
     /// Await the actual IPC future on the caller's runtime. The receive task
@@ -250,8 +253,11 @@ impl SyncClient {
         binding: &RouteBinding,
         method_name: &str,
         data: &[u8],
+        metadata: &CallMetadata,
     ) -> Result<ResponseData, IpcError> {
-        self.inner.call_bound(binding, method_name, data).await
+        self.inner
+            .call_bound(binding, method_name, data, metadata)
+            .await
     }
 
     pub async fn call_bound_async_phased(
@@ -259,9 +265,10 @@ impl SyncClient {
         binding: &RouteBinding,
         method_name: &str,
         data: &[u8],
+        metadata: &CallMetadata,
     ) -> Result<ResponseData, IpcCallError> {
         self.inner
-            .call_bound_phased(binding, method_name, data)
+            .call_bound_phased(binding, method_name, data, metadata)
             .await
     }
 
@@ -274,9 +281,10 @@ impl SyncClient {
         method_name: &str,
         data: &[u8],
         control: &IpcCallControl,
+        metadata: &CallMetadata,
     ) -> Result<ResponseData, IpcError> {
         self.inner
-            .call_bound_controlled(binding, method_name, data, control)
+            .call_bound_controlled(binding, method_name, data, control, metadata)
             .await
     }
 
@@ -288,12 +296,13 @@ impl SyncClient {
         method_name: &str,
         data: B,
         control: &IpcCallControl,
+        metadata: &CallMetadata,
     ) -> Result<ResponseData, IpcCallError>
     where
         B: AsRef<[u8]> + Send + 'static,
     {
         self.inner
-            .call_bound_owned_controlled_phased(binding, method_name, data, control)
+            .call_bound_owned_controlled_phased(binding, method_name, data, control, metadata)
             .await
     }
 
@@ -305,6 +314,7 @@ impl SyncClient {
         data: B,
         call_id: Option<&str>,
         control: &IpcCallControl,
+        metadata: &CallMetadata,
     ) -> Result<ResponseData, IpcCallError>
     where
         B: AsRef<[u8]> + Send + 'static,
@@ -316,6 +326,7 @@ impl SyncClient {
                 data,
                 call_id,
                 control,
+                metadata,
             )
             .await
     }
@@ -328,6 +339,7 @@ impl SyncClient {
         slab: c2_mem::WritableSlab,
         call_id: Option<&str>,
         control: &IpcCallControl,
+        metadata: &CallMetadata,
     ) -> Result<ResponseData, IpcCallError> {
         self.inner
             .call_bound_slab_with_key_controlled_phased(
@@ -336,6 +348,7 @@ impl SyncClient {
                 slab,
                 call_id,
                 control,
+                metadata,
             )
             .await
     }
@@ -347,9 +360,10 @@ impl SyncClient {
         method_name: &str,
         call_id: &str,
         control: &IpcCallControl,
+        metadata: &CallMetadata,
     ) -> Result<ResponseData, IpcCallError> {
         self.inner
-            .recover_call_bound_controlled_phased(binding, method_name, call_id, control)
+            .recover_call_bound_controlled_phased(binding, method_name, call_id, control, metadata)
             .await
     }
 
@@ -359,9 +373,10 @@ impl SyncClient {
         binding: &RouteBinding,
         call_id: &str,
         deadline: Option<std::time::Instant>,
+        metadata: &CallMetadata,
     ) -> Result<c2_wire::rpc::WireCallOutcome, IpcError> {
         self.inner
-            .query_call_with_deadline(binding, call_id, deadline)
+            .query_call_with_deadline(binding, call_id, deadline, metadata)
             .await
     }
 
@@ -378,9 +393,10 @@ impl SyncClient {
         method_name: &str,
         slab: c2_mem::WritableSlab,
         control: &IpcCallControl,
+        metadata: &CallMetadata,
     ) -> Result<ResponseData, IpcCallError> {
         self.inner
-            .call_bound_slab_controlled_async_phased(binding, method_name, slab, control)
+            .call_bound_slab_controlled_async_phased(binding, method_name, slab, control, metadata)
             .await
     }
 
@@ -393,6 +409,7 @@ impl SyncClient {
         completion_owner: Box<dyn Send>,
         cancellation: IpcStreamCancellation,
         control: &IpcCallControl,
+        metadata: &CallMetadata,
     ) -> Result<IpcResponseStream, IpcCallError>
     where
         B: AsRef<[u8]> + Send + 'static,
@@ -406,6 +423,7 @@ impl SyncClient {
                 completion_owner,
                 cancellation,
                 control,
+                metadata,
             )
             .await
     }
@@ -419,6 +437,7 @@ impl SyncClient {
         completion_owner: Box<dyn Send>,
         cancellation: crate::IpcSubscribeCancellation,
         control: &IpcCallControl,
+        metadata: &CallMetadata,
     ) -> Result<crate::IpcTopicSubscription, IpcCallError> {
         self.inner
             .subscribe_bound_controlled_phased(
@@ -429,6 +448,7 @@ impl SyncClient {
                 completion_owner,
                 cancellation,
                 control,
+                metadata,
             )
             .await
     }

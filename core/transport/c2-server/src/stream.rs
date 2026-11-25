@@ -207,21 +207,7 @@ async fn acquire_step(
 }
 
 fn crm_error_bytes(error: CrmError) -> Vec<u8> {
-    match error {
-        CrmError::UserError(bytes) => match C2Error::from_wire_bytes(&bytes) {
-            // Re-encode through the bounded path: a resource error envelope
-            // larger than the frame budget is truncated instead of producing
-            // an unbounded inline CALL_END.
-            Ok(Some(error)) => rpc::bounded_call_end_error_bytes(&error),
-            _ => error_wire(
-                ErrorCode::ResourceFunctionExecuting,
-                "invalid CRM error payload",
-            ),
-        },
-        CrmError::InternalError(message) => {
-            error_wire(ErrorCode::ResourceFunctionExecuting, message)
-        }
-    }
+    rpc::bounded_call_end_error_bytes(&super::callback_error(error))
 }
 
 fn acquire_error_bytes(error: SchedulerAcquireError) -> Vec<u8> {
@@ -450,6 +436,7 @@ async fn finish_stream(
     id: u64,
     slot: &SchedulerCallSlot,
     stream: Box<dyn crate::dispatcher::CrmStream>,
+    context: crate::CallContext,
 ) -> Result<Result<(), CrmError>, ExecutorStopped> {
     let flight = crate::connection::FlightGuard::new(conn);
     let pending = match slot.reserve_step() {
@@ -471,6 +458,7 @@ async fn finish_stream(
         route_guard
             .commit()
             .map_err(|error| CrmError::InternalError(error.to_string()))?;
+        let _context = crate::enter_call_context(context);
         stream.finish()
     })
     .await;
@@ -489,6 +477,7 @@ pub(super) async fn dispatch_stream_call(
         route,
         method_idx,
         pending_permit,
+        context,
         keyed,
         _flight,
     } = admission;
@@ -497,8 +486,8 @@ pub(super) async fn dispatch_stream_call(
         "stream methods never carry keyed bookkeeping"
     );
     let _call_owners = _flight;
-    let mut pending_permit =
-        pending_permit.expect("stream admission carries its route permit");
+    let context = context.expect("server stream call context");
+    let mut pending_permit = pending_permit.expect("stream admission carries its route permit");
     let slot = pending_permit.retain_call_slot();
     if conn.is_work_cancelled() {
         return;
@@ -538,6 +527,7 @@ pub(super) async fn dispatch_stream_call(
     let execution_conn = writer.conn.clone();
     let first_slot = slot.clone();
     let budget = server.domain_budget.clone();
+    let first_context = context.clone();
     let first = tokio::task::spawn_blocking(move || {
         let mut route_guard = route_guard;
         let _execution_guard = execution_guard;
@@ -557,6 +547,7 @@ pub(super) async fn dispatch_stream_call(
         }
         first_slot.mark_resource_entry();
         drop(_start);
+        let _context = crate::enter_call_context(first_context);
         let mut stream = callback
             .open_stream_recycled(&route_name, method_idx, bytes, response_pool)
             .map_err(FirstError::Crm)?;
@@ -624,7 +615,7 @@ pub(super) async fn dispatch_stream_call(
                         // Cleanup uses neither demand nor output storage. Keep
                         // polling the original send while cleanup runs, so no
                         // accepted frame or owned item is abandoned.
-                        let finishing = finish_stream(server, &writer.conn, id, &slot, stream.take().expect("live stream"));
+                        let finishing = finish_stream(server, &writer.conn, id, &slot, stream.take().expect("live stream"), context.clone());
                         // A stopped executor cannot finish either queued
                         // worker. Poll encoding first and stop without
                         // scheduling or awaiting further cleanup in that case.
@@ -729,6 +720,7 @@ pub(super) async fn dispatch_stream_call(
             break None;
         };
         let mut advancing = stream.take().expect("live stream");
+        let step_context = context.clone();
         let result = tokio::task::spawn_blocking(move || {
             let mut route_guard = route_guard;
             let _execution_guard = execution_guard;
@@ -743,6 +735,7 @@ pub(super) async fn dispatch_stream_call(
                 return (advancing, StepResult::Cancelled);
             }
             drop(_start);
+            let _context = crate::enter_call_context(step_context);
             let result = advancing.step();
             (advancing, StepResult::Advanced(result))
         })
@@ -774,6 +767,7 @@ pub(super) async fn dispatch_stream_call(
                 id,
                 &slot,
                 stream.take().expect("live stream"),
+                context,
             )
             .await
         }

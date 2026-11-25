@@ -259,6 +259,8 @@ fn typescript_target_generates_typed_topic_subscriptions() {
     for required in [
         "  subscribe_topic_0_state(options?: TopicSubscribeOptions): Promise<C2TopicSubscription<Payload>>",
         "  hold_subscribe_topic_0_state(options?: TopicSubscribeOptions): Promise<C2TopicSubscription<C2HeldResult<Payload>>>",
+        "decode_topic_0_state_output, options, false, this.callOptions",
+        "decode_topic_0_state_output, options, true, this.callOptions",
         "export function decode_topic_0_state_output(data: Uint8Array): Payload",
         "export interface TopicBinding {",
         "  readonly index: number;",

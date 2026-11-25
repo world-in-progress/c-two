@@ -1,7 +1,7 @@
 //! One complete-value receiver per IPC 18 topic subscription.
 //!
 //! Mirrors `stream.rs`: the socket reader never blocks on `DomainBudget`
-//! memory reservation or SHM copy. Each subscription awaits `READY(start_seq)`
+//! memory reservation or SHM copy. Each subscription awaits `READY(start_seq, head_seq)`
 //! before returning its handle, computes `dropped` locally from `(expected_seq,
 //! frame.seq)`, copies SHM blocks into a local `BudgetedBuffer` before
 //! releasing the server loan, and keeps its operation-slot `completion_owner`
@@ -91,7 +91,7 @@ struct SubscribeReceiveState {
     start_seq: Option<u64>,
     next_expected: u64,
     sequence_exhausted: bool,
-    ready_tx: Option<oneshot::Sender<Result<u64, crate::IpcCallError>>>,
+    ready_tx: Option<oneshot::Sender<SubscriptionReady>>,
     item: Option<ActiveItemBuffer>,
     copying: bool,
     deferred_terminal: Option<(stream::StreamTerminal, PendingResponse)>,
@@ -106,6 +106,8 @@ struct SubscribeReceiveState {
     pending_cancel: bool,
     deliveries: usize,
 }
+
+type SubscriptionReady = Result<(u64, u64), crate::IpcCallError>;
 
 pub(crate) struct SubscribeReceive {
     state: StdMutex<SubscribeReceiveState>,
@@ -132,12 +134,18 @@ pub struct IpcTopicSubscription {
     call: Arc<SubscribeReceive>,
     input: mpsc::Receiver<IpcTopicDelivery>,
     start_seq: u64,
+    head_seq: u64,
     topic_name: String,
 }
 
 impl IpcTopicSubscription {
     pub fn start_seq(&self) -> u64 {
         self.start_seq
+    }
+
+    /// The topic head observed by the Host when it admitted this subscription.
+    pub fn head_seq(&self) -> u64 {
+        self.head_seq
     }
 
     pub fn topic_name(&self) -> &str {
@@ -277,7 +285,7 @@ impl SubscribeReceive {
     ) -> (
         Arc<Self>,
         mpsc::Receiver<IpcTopicDelivery>,
-        oneshot::Receiver<Result<u64, crate::IpcCallError>>,
+        oneshot::Receiver<SubscriptionReady>,
     ) {
         let (output, input) = mpsc::channel(1);
         let (ready_tx, ready_rx) = oneshot::channel();
@@ -391,7 +399,7 @@ impl SubscribeReceive {
         self.fail_local(C2Error::new(code, error.to_string()));
     }
 
-    pub(crate) fn ready(&self, start_seq: u64) -> Result<(), IpcError> {
+    pub(crate) fn ready(&self, start_seq: u64, head_seq: u64) -> Result<(), IpcError> {
         if start_seq == 0 {
             return Err(IpcError::Protocol("zero READY start_seq".into()));
         }
@@ -407,7 +415,7 @@ impl SubscribeReceive {
             state.ready_tx.take()
         };
         if let Some(tx) = tx {
-            let _ = tx.send(Ok(start_seq));
+            let _ = tx.send(Ok((start_seq, head_seq)));
         }
         self.changed.notify_waiters();
         Ok(())
@@ -826,6 +834,7 @@ impl IpcClient {
         topic_name: &str,
         options: rpc::WireSubscribeOptions,
         budget: DomainBudget,
+        metadata: &CallMetadata,
     ) -> Result<IpcTopicSubscription, crate::IpcCallError> {
         self.subscribe_bound_inner(
             binding,
@@ -835,6 +844,7 @@ impl IpcClient {
             Box::new(()),
             None,
             None,
+            metadata,
         )
         .await
     }
@@ -848,6 +858,7 @@ impl IpcClient {
         completion_owner: Box<dyn Send>,
         cancellation: IpcSubscribeCancellation,
         control: &IpcCallControl,
+        metadata: &CallMetadata,
     ) -> Result<IpcTopicSubscription, crate::IpcCallError> {
         self.subscribe_bound_inner(
             binding,
@@ -857,6 +868,7 @@ impl IpcClient {
             completion_owner,
             Some(cancellation),
             Some(control),
+            metadata,
         )
         .await
     }
@@ -871,6 +883,7 @@ impl IpcClient {
         completion_owner: Box<dyn Send>,
         cancellation: Option<IpcSubscribeCancellation>,
         control: Option<&IpcCallControl>,
+        metadata: &CallMetadata,
     ) -> Result<IpcTopicSubscription, crate::IpcCallError> {
         c2_contract::validate_contract_text_field("topic_name", topic_name)
             .map_err(|error| pre_dispatch_call_error(IpcError::Protocol(error.to_string())))?;
@@ -896,8 +909,9 @@ impl IpcClient {
             entry.subscription = Some(call.clone());
         }
 
-        let bytes = rpc::encode_open_subscribe_draft_frame(&identity, topic_name, options)
-            .map_err(|error| pre_dispatch_call_error(IpcError::Protocol(error.to_string())))?;
+        let bytes =
+            rpc::encode_open_subscribe_draft_frame(&identity, topic_name, options, metadata)
+                .map_err(|error| pre_dispatch_call_error(IpcError::Protocol(error.to_string())))?;
         let mut opening = CancelOpeningSubscription(Some(call));
         let submit = send
             .conn
@@ -917,7 +931,7 @@ impl IpcClient {
             return Err(err);
         }
 
-        // Wait for READY(start_seq), early refusal CALL_END(NotExecuted), or
+        // Wait for READY, early refusal CALL_END(NotExecuted), or
         // opening cancellation.
         let ready = if let Some(cancel) = &cancellation {
             tokio::select! {
@@ -937,10 +951,11 @@ impl IpcClient {
         };
 
         match ready {
-            Ok(Ok(start_seq)) => Ok(IpcTopicSubscription {
+            Ok(Ok((start_seq, head_seq))) => Ok(IpcTopicSubscription {
                 call: opening.0.take().expect("opening subscription"),
                 input,
                 start_seq,
+                head_seq,
                 topic_name: topic_name.to_string(),
             }),
             Ok(Err(error)) => Err(error),

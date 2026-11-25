@@ -118,11 +118,11 @@ def test_relay_qps_headers_form_a_valid_hey_request(monkeypatch, tmp_path):
             'hey', '-n', '1', '-c', '1', '-t', '2', '-m', 'POST',
             '-D', str(payload), '-T', 'application/octet-stream',
             *module._route_hey_args(expected),
-            f'http://127.0.0.1:{server.server_port}/echo/greeting',
+            module._greeting_url(f'http://127.0.0.1:{server.server_port}', 'echo & test/'),
         ])
         assert result.returncode == 0
         path, headers, body = received.get_nowait()
-        assert path == '/echo/greeting'
+        assert path == '/_c2/calls/call?route=echo%20%26%20test%2F&method=greeting'
         assert body == payload.read_bytes()
         assert '-'.join(('x', 'c2', 'route', 'uid')) not in headers
         assert headers['x-c2-expected-abi-hash'] == expected.abi_hash

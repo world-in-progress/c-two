@@ -46,8 +46,57 @@ export interface C2TransportObservation {
 
 export type C2TransportObserver = (observation: C2TransportObservation) => void;
 
-export interface C2UnaryCallOptions {
+export interface C2CallIdOptions {
   readonly callId?: string;
+}
+
+export interface C2CallOptions {
+  readonly timeoutMs?: number | null;
+  readonly metadata?: Readonly<Record<string, string>> | null;
+}
+
+function mergeCallOptions(parent: C2CallOptions, overlay: C2CallOptions): C2CallOptions {
+  const timeout = overlay.timeoutMs === undefined ? parent.timeoutMs : overlay.timeoutMs;
+  const metadata = overlay.metadata === undefined
+    ? parent.metadata
+    : overlay.metadata === null ? undefined : mergeCallMetadata(parent.metadata, overlay.metadata);
+  return Object.freeze({
+    ...(timeout === undefined ? {} : { timeoutMs: validateViewTimeout(timeout) }),
+    ...(metadata == null ? {} : { metadata }),
+  });
+}
+
+function mergeCallMetadata(
+  parent: C2CallOptions["metadata"],
+  overlay: Readonly<Record<string, string>>,
+): Readonly<Record<string, string>> {
+  if (typeof overlay !== "object" || overlay === null || Array.isArray(overlay)) {
+    throw new TypeError("Call metadata must be a record of strings.");
+  }
+  const merged = { ...parent, ...overlay };
+  const entries = Object.entries(merged);
+  if (entries.length > 64) throw new TypeError("Call metadata has more than 64 entries.");
+
+  let totalBytes = 0;
+  for (const [key, value] of entries) {
+    if (key.length < 1 || key.length > 64 || /[^a-z0-9_.-]/.test(key)) {
+      throw new TypeError(`Invalid call metadata key ${JSON.stringify(key)}.`);
+    }
+    if (typeof value !== "string" || value.length > 4096 || /[^ -~]/.test(value) ||
+        value.startsWith(" ") || value.endsWith(" ")) {
+      throw new TypeError(`Invalid call metadata value for ${key}.`);
+    }
+    totalBytes += key.length + value.length;
+  }
+  if (totalBytes > 16_384) throw new TypeError("Call metadata exceeds 16384 bytes.");
+  return Object.freeze(merged);
+}
+
+function validateViewTimeout(timeout: number | null): number | null {
+  if (timeout !== null && (!Number.isSafeInteger(timeout) || timeout < 0)) {
+    throw new TypeError("C-Two call timeoutMs must be a non-negative safe integer or null.");
+  }
+  return timeout;
 }
 
 export interface C2CallOutcome {
@@ -64,16 +113,16 @@ type C2UnaryRequest =
   | { readonly encode?: undefined; readonly callId: string };
 
 export interface C2EncodedClientTransport {
-  call(routeName: string, contract: C2ContractIdentity, method: string, encode: () => C2ByteArray, options?: C2UnaryCallOptions): Promise<C2ResponsePayload>;
-  recoverCall(routeName: string, contract: C2ContractIdentity, method: string, callId: string): Promise<C2ResponsePayload>;
-  queryCall(routeName: string, contract: C2ContractIdentity, callId: string): Promise<C2CallOutcome>;
+  call(routeName: string, contract: C2ContractIdentity, method: string, encode: () => C2ByteArray, options?: C2CallIdOptions, view?: C2CallOptions): Promise<C2ResponsePayload>;
+  recoverCall(routeName: string, contract: C2ContractIdentity, method: string, callId: string, view?: C2CallOptions): Promise<C2ResponsePayload>;
+  queryCall(routeName: string, contract: C2ContractIdentity, callId: string, view?: C2CallOptions): Promise<C2CallOutcome>;
 }
 
 export interface TopicSubscribeOptions {
   readonly start?: "latest" | "next";
   readonly onLag?: "skip" | "error";
   readonly callId?: never;
-  /** One deadline for acquisition, READY and deliveries. Defaults to unlimited. */
+  /** One deadline for acquisition, READY and deliveries. Inherits the client view when omitted. */
   readonly timeoutMs?: number | null;
 }
 
@@ -92,23 +141,23 @@ export interface C2TopicSubscription<T> extends AsyncIterableIterator<TopicDeliv
 }
 
 export interface C2ClientTransport extends C2EncodedClientTransport {
-  subscribe<T>(routeName: string, contract: C2ContractIdentity, topic: string, decode: (bytes: Uint8Array) => T, options?: TopicSubscribeOptions, hold?: false): Promise<C2TopicSubscription<T>>;
-  subscribe<T>(routeName: string, contract: C2ContractIdentity, topic: string, decode: (bytes: Uint8Array) => T, options: TopicSubscribeOptions | undefined, hold: true): Promise<C2TopicSubscription<C2HeldResult<T>>>;
+  subscribe<T>(routeName: string, contract: C2ContractIdentity, topic: string, decode: (bytes: Uint8Array) => T, options?: TopicSubscribeOptions, hold?: false, view?: C2CallOptions): Promise<C2TopicSubscription<T>>;
+  subscribe<T>(routeName: string, contract: C2ContractIdentity, topic: string, decode: (bytes: Uint8Array) => T, options: TopicSubscribeOptions | undefined, hold: true, view?: C2CallOptions): Promise<C2TopicSubscription<C2HeldResult<T>>>;
 }
 
 export interface C2StreamEncodedClientTransport extends C2EncodedClientTransport {
-  stream<T>(routeName: string, contract: C2ContractIdentity, method: string, encode: () => C2ByteArray, decode: (bytes: Uint8Array) => T, hold?: false): C2ResponseStream<T>;
-  stream<T>(routeName: string, contract: C2ContractIdentity, method: string, encode: () => C2ByteArray, decode: (bytes: Uint8Array) => T, hold: true): C2ResponseStream<C2HeldResult<T>>;
+  stream<T>(routeName: string, contract: C2ContractIdentity, method: string, encode: () => C2ByteArray, decode: (bytes: Uint8Array) => T, hold?: false, view?: C2CallOptions): C2ResponseStream<T>;
+  stream<T>(routeName: string, contract: C2ContractIdentity, method: string, encode: () => C2ByteArray, decode: (bytes: Uint8Array) => T, hold: true, view?: C2CallOptions): C2ResponseStream<C2HeldResult<T>>;
 }
 
 export interface C2HttpRelayEncodedTransport<Payload extends C2ResponsePayload = C2ByteArray> extends C2StreamEncodedClientTransport, C2ClientTransport {
-  call(routeName: string, contract: C2ContractIdentity, method: string, encode: () => C2ByteArray, options?: C2UnaryCallOptions): Promise<Payload>;
-  recoverCall(routeName: string, contract: C2ContractIdentity, method: string, callId: string): Promise<Payload>;
+  call(routeName: string, contract: C2ContractIdentity, method: string, encode: () => C2ByteArray, options?: C2CallIdOptions, view?: C2CallOptions): Promise<Payload>;
+  recoverCall(routeName: string, contract: C2ContractIdentity, method: string, callId: string, view?: C2CallOptions): Promise<Payload>;
 }
 
 export interface C2RelayAwareHttpEncodedTransport<Payload extends C2ResponsePayload = C2ByteArray> extends C2StreamEncodedClientTransport, C2ClientTransport {
-  call(routeName: string, contract: C2ContractIdentity, method: string, encode: () => C2ByteArray, options?: C2UnaryCallOptions): Promise<Payload>;
-  recoverCall(routeName: string, contract: C2ContractIdentity, method: string, callId: string): Promise<Payload>;
+  call(routeName: string, contract: C2ContractIdentity, method: string, encode: () => C2ByteArray, options?: C2CallIdOptions, view?: C2CallOptions): Promise<Payload>;
+  recoverCall(routeName: string, contract: C2ContractIdentity, method: string, callId: string, view?: C2CallOptions): Promise<Payload>;
   close(): Promise<void>;
 }
 
@@ -144,11 +193,11 @@ export interface C2NativeSubscription extends C2TopicSubscription<C2NativeBuffer
 export interface C2NativeEndpointContext {
   prepare(routeName: string, contract: C2RouteContractIdentity, timeoutMs?: number): Promise<unknown>;
   connectionSnapshot(routeName: string): C2ConnectionSnapshot | null;
-  beginCall(routeName: string, method: string, serverStream: boolean, timeoutMs: number | null): C2NativeCall;
-  beginCall(routeName: string, method: string, serverStream: false, timeoutMs: number | null, callId?: string): C2NativeCall;
-  recoverCall(routeName: string, method: string, callId: string, timeoutMs: number | null): Promise<C2NativeBuffer>;
-  queryCall(routeName: string, callId: string, timeoutMs: number | null): Promise<C2CallOutcome>;
-  openSubscription(routeName: string, topic: string, options: Omit<TopicSubscribeOptions, "timeoutMs">, timeoutMs: number | null): Promise<C2NativeSubscription>;
+  beginCall(routeName: string, method: string, serverStream: boolean, timeoutMs: number | null, callId?: undefined, metadata?: Readonly<Record<string, string>>): C2NativeCall;
+  beginCall(routeName: string, method: string, serverStream: false, timeoutMs: number | null, callId?: string, metadata?: Readonly<Record<string, string>>): C2NativeCall;
+  recoverCall(routeName: string, method: string, callId: string, timeoutMs: number | null, metadata?: Readonly<Record<string, string>>): Promise<C2NativeBuffer>;
+  queryCall(routeName: string, callId: string, timeoutMs: number | null, metadata?: Readonly<Record<string, string>>): Promise<C2CallOutcome>;
+  openSubscription(routeName: string, topic: string, options: Omit<TopicSubscribeOptions, "timeoutMs"> & { readonly metadata?: Readonly<Record<string, string>> }, timeoutMs: number | null): Promise<C2NativeSubscription>;
   deactivate(): void;
   close(): Promise<void>;
 }
@@ -182,8 +231,8 @@ export interface C2IpcTransportOptions<Payload extends C2ResponsePayload = C2Byt
 
 export interface C2IpcEncodedTransport<Payload extends C2ResponsePayload = C2ByteArray> extends C2StreamEncodedClientTransport, C2ClientTransport {
   prepare(routeName: string, contract: C2ContractIdentity): Promise<void>;
-  call(routeName: string, contract: C2ContractIdentity, method: string, encode: () => C2ByteArray, options?: C2UnaryCallOptions): Promise<Payload>;
-  recoverCall(routeName: string, contract: C2ContractIdentity, method: string, callId: string): Promise<Payload>;
+  call(routeName: string, contract: C2ContractIdentity, method: string, encode: () => C2ByteArray, options?: C2CallIdOptions, view?: C2CallOptions): Promise<Payload>;
+  recoverCall(routeName: string, contract: C2ContractIdentity, method: string, callId: string, view?: C2CallOptions): Promise<Payload>;
   close(): Promise<void>;
 }
 
@@ -274,7 +323,10 @@ interface C2RelayRouteInfo {
 
 const C2_STRICT_UTF8_DECODER = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
 const C2_LOSSY_UTF8_DECODER = new TextDecoder("utf-8");
-const C2_PRE_DISPATCH_HTTP_STATUSES = new Set([404, 406, 409, 410, 413, 429, 502, 503]);
+const C2_HTTP_CONTROL_CODES: Readonly<Record<number, readonly number[]>> = {
+  400: [713], 403: [724], 404: [701], 406: [716], 409: [709, 710, 719, 702, 721, 723, 714],
+  410: [708], 413: [717], 429: [717], 502: [702, 713, 718], 503: [702, 707, 712, 717, 718, 715],
+};
 
 function isWellFormedUnicodeString(value: string): boolean {
   for (let index = 0; index < value.length; index += 1) {
@@ -310,11 +362,11 @@ function resolveHttpCallRelayErrorPhase(
   status: number,
   decoded: { readonly body: string; readonly validUtf8: boolean },
 ): "pre_dispatch" | "dispatch_uncertain" {
-  if (!decoded.validUtf8 || !C2_PRE_DISPATCH_HTTP_STATUSES.has(status)) {
+  if (!decoded.validUtf8 || C2_HTTP_CONTROL_CODES[status] === undefined) {
     return "dispatch_uncertain";
   }
   const canonical = parseCanonicalRelayError(decoded.body);
-  if (canonical === undefined || canonical.code === 0) {
+  if (canonical === undefined || !C2_HTTP_CONTROL_CODES[status]?.includes(canonical.code)) {
     return "dispatch_uncertain";
   }
   const dispatchPhase = ownDetail(canonical.details, "dispatch_phase");
@@ -325,7 +377,7 @@ function resolveHttpCallRelayErrorPhase(
   if (transportPhase !== undefined && transportPhase !== "pre_dispatch") {
     return "dispatch_uncertain";
   }
-  if ((status === 404 && canonical.code === 701) || dispatchPhase === "pre_dispatch") {
+  if (status === 403 || status === 404 || dispatchPhase === "pre_dispatch") {
     return "pre_dispatch";
   }
   return "dispatch_uncertain";
@@ -418,7 +470,9 @@ export class C2IpcTransportError extends Error {
   readonly code: number | null;
   readonly canonicalName: string | null;
   readonly details: Readonly<Record<string, string>>;
-  get retrySafe(): boolean { return this.transportPhase === "pre_dispatch"; }
+  get retrySafe(): boolean {
+    return this.transportPhase === "pre_dispatch" && permitsRouteRetry(this.code, this.details);
+  }
   constructor(message: string, readonly nativeDetails?: C2NativeErrorDetails) {
     super(message);
     this.name = "C2IpcTransportError";
@@ -452,7 +506,9 @@ export class C2CoreError extends Error {
   readonly canonicalName: string | null;
   readonly details: Readonly<Record<string, string>>;
   readonly transportPhase: "pre_dispatch" | "dispatch_uncertain" | null;
-  get retrySafe(): boolean { return this.transportPhase === "pre_dispatch"; }
+  get retrySafe(): boolean {
+    return this.transportPhase === "pre_dispatch" && permitsRouteRetry(this.code, this.details);
+  }
   constructor(message: string, readonly nativeDetails: C2NativeErrorDetails) {
     super(message);
     this.name = nativeDetails.canonicalName ?? "C2CoreError";
@@ -797,18 +853,23 @@ class DeferredC2ResponseStream<T> implements C2ResponseStream<T> {
 }
 
 class C2CallBudget {
-  private readonly deadline: number | null;
-  constructor(timeoutMs: number | null) {
-    this.deadline = timeoutMs === null ? null : performance.now() + timeoutMs;
+  private readonly startedAt = performance.now();
+  private readonly timeoutMs: number | null;
+  readonly metadata: Readonly<Record<string, string>> | undefined;
+  readonly explicitTimeout: boolean;
+  constructor(defaultTimeout: number | null, view?: C2CallOptions) {
+    this.timeoutMs = view?.timeoutMs === undefined ? defaultTimeout : validateViewTimeout(view.timeoutMs);
+    this.explicitTimeout = view?.timeoutMs !== undefined;
+    this.metadata = view?.metadata == null ? undefined : mergeCallMetadata(undefined, view.metadata);
   }
   remaining(): number | null {
-    if (this.deadline === null) return null;
-    const remaining = this.deadline - performance.now();
+    if (this.timeoutMs === null) return null;
+    const remaining = this.timeoutMs - (performance.now() - this.startedAt);
     if (remaining <= 0) throw callDeadlineError("pre_dispatch");
     return Math.ceil(remaining);
   }
   expired(): boolean {
-    return this.deadline !== null && performance.now() >= this.deadline;
+    return this.timeoutMs !== null && performance.now() - this.startedAt >= this.timeoutMs;
   }
   async wait<T>(pending: Promise<T>): Promise<T> {
     // Native setup may have exhausted the budget before returning its Promise.
@@ -848,16 +909,19 @@ interface C2IpcTargetTransport<Payload extends C2ResponsePayload> extends C2IpcE
 function nativeTopicSubscribe(
   acquire: (route: string, contract: C2ContractIdentity, budget: C2CallBudget) => Promise<C2NativeEndpointContext>,
 ): C2ClientTransport["subscribe"] {
-  function subscribe<T>(route: string, contract: C2ContractIdentity, topic: string, decode: (bytes: Uint8Array) => T, options?: TopicSubscribeOptions, hold?: false): Promise<C2TopicSubscription<T>>;
-  function subscribe<T>(route: string, contract: C2ContractIdentity, topic: string, decode: (bytes: Uint8Array) => T, options: TopicSubscribeOptions | undefined, hold: true): Promise<C2TopicSubscription<C2HeldResult<T>>>;
-  async function subscribe<T>(route: string, contract: C2ContractIdentity, topic: string, decode: (bytes: Uint8Array) => T, options: TopicSubscribeOptions = {}, hold = false): Promise<C2TopicSubscription<T | C2HeldResult<T>>> {
+  function subscribe<T>(route: string, contract: C2ContractIdentity, topic: string, decode: (bytes: Uint8Array) => T, options?: TopicSubscribeOptions, hold?: false, view?: C2CallOptions): Promise<C2TopicSubscription<T>>;
+  function subscribe<T>(route: string, contract: C2ContractIdentity, topic: string, decode: (bytes: Uint8Array) => T, options: TopicSubscribeOptions | undefined, hold: true, view?: C2CallOptions): Promise<C2TopicSubscription<C2HeldResult<T>>>;
+  async function subscribe<T>(route: string, contract: C2ContractIdentity, topic: string, decode: (bytes: Uint8Array) => T, options: TopicSubscribeOptions = {}, hold = false, view?: C2CallOptions): Promise<C2TopicSubscription<T | C2HeldResult<T>>> {
     if ("callId" in options) throw new TypeError("Topic subscriptions do not accept a callId.");
-    const { timeoutMs = null, ...policy } = options;
-    const budget = new C2CallBudget(timeoutMs);
+    const { timeoutMs, ...policy } = options;
+    const budget = new C2CallBudget(null, timeoutMs === undefined ? view : { ...view, timeoutMs });
+    budget.remaining();
     let native: C2NativeSubscription;
     try {
       const endpoint = await acquire(route, contract, budget);
-      native = await endpoint.openSubscription(route, topic, policy, budget.remaining());
+      native = await endpoint.openSubscription(route, topic, {
+        ...policy, ...(budget.metadata === undefined ? {} : { metadata: budget.metadata }),
+      }, budget.remaining());
     } catch (error) {
       throw projectNativeError(error);
     }
@@ -966,6 +1030,7 @@ function createIpcTargetTransport<Payload extends C2ResponsePayload>(address: st
   };
   const prepare = async (routeName: string, contract: C2ContractIdentity, budget?: C2CallBudget): Promise<void> => {
     const routeContract = requireRouteContractIdentity(contract);
+    budget?.remaining();
     const native = budget === undefined ? await endpoint() : await budget.wait(endpoint());
     requireOpen();
     if (native.connectionSnapshot(routeName)?.endReason === "protocol_error") {
@@ -989,7 +1054,7 @@ function createIpcTargetTransport<Payload extends C2ResponsePayload>(address: st
   };
   const nativeLimit = (budget: C2CallBudget): number | null => {
     const remaining = budget.remaining();
-    return callTimeoutMs === null ? remaining : remaining === null ? callTimeoutMs : Math.min(callTimeoutMs, remaining);
+    return budget.explicitTimeout || callTimeoutMs === null ? remaining : remaining === null ? callTimeoutMs : Math.min(callTimeoutMs, remaining);
   };
   const callAcquired = async (
     routeName: string,
@@ -1013,9 +1078,9 @@ function createIpcTargetTransport<Payload extends C2ResponsePayload>(address: st
         target = { path: observationPath, serverId: null, serverInstanceId: null, connectionId: null };
         requests += 1;
         onDispatch?.();
-        response = await native.recoverCall(routeName, method, operation.callId, nativeLimit(budget));
+        response = await native.recoverCall(routeName, method, operation.callId, nativeLimit(budget), budget.metadata);
       } else {
-        call = native.beginCall(routeName, method, false, nativeLimit(budget), operation.callId);
+        call = native.beginCall(routeName, method, false, nativeLimit(budget), operation.callId, budget.metadata);
         let request: C2ByteArray;
         try {
           request = requireUint8Array(operation.encode(), "encoded input");
@@ -1123,7 +1188,7 @@ function createIpcTargetTransport<Payload extends C2ResponsePayload>(address: st
       let inputEncodeFailed = false;
       try {
         const { native } = acquired(routeName);
-        const call = native.beginCall(routeName, method, true, nativeLimit(budget));
+        const call = native.beginCall(routeName, method, true, nativeLimit(budget), undefined, budget.metadata);
         state.call = call;
         if (state.collected) {
           call.cancel();
@@ -1157,20 +1222,20 @@ function createIpcTargetTransport<Payload extends C2ResponsePayload>(address: st
       }
     }, decode as (bytes: Uint8Array) => T | C2HeldResult<T>, hold, onTransportFailure);
   };
-  function stream<T>(routeName: string, contract: C2ContractIdentity, method: string, encode: () => C2ByteArray, decode: (bytes: Uint8Array) => T, hold?: false): C2ResponseStream<T>;
-  function stream<T>(routeName: string, contract: C2ContractIdentity, method: string, encode: () => C2ByteArray, decode: (bytes: Uint8Array) => T, hold: true): C2ResponseStream<C2HeldResult<T>>;
-  function stream<T>(routeName: string, contract: C2ContractIdentity, method: string, encode: () => C2ByteArray, decode: (bytes: Uint8Array) => T, hold = false): C2ResponseStream<T | C2HeldResult<T>> {
-    const budget = new C2CallBudget(callTimeoutMs);
+  function stream<T>(routeName: string, contract: C2ContractIdentity, method: string, encode: () => C2ByteArray, decode: (bytes: Uint8Array) => T, hold?: false, view?: C2CallOptions): C2ResponseStream<T>;
+  function stream<T>(routeName: string, contract: C2ContractIdentity, method: string, encode: () => C2ByteArray, decode: (bytes: Uint8Array) => T, hold: true, view?: C2CallOptions): C2ResponseStream<C2HeldResult<T>>;
+  function stream<T>(routeName: string, contract: C2ContractIdentity, method: string, encode: () => C2ByteArray, decode: (bytes: Uint8Array) => T, hold = false, view?: C2CallOptions): C2ResponseStream<T | C2HeldResult<T>> {
+    const budget = new C2CallBudget(callTimeoutMs, view);
     return startStream(routeName, method, encode, decode, hold, budget, prepare(routeName, contract, budget));
   }
-  const unary = async (routeName: string, contract: C2ContractIdentity, method: string, operation: C2UnaryRequest): Promise<Payload> => {
-    const budget = new C2CallBudget(callTimeoutMs);
+  const unary = async (routeName: string, contract: C2ContractIdentity, method: string, operation: C2UnaryRequest, view?: C2CallOptions): Promise<Payload> => {
+    const budget = new C2CallBudget(callTimeoutMs, view);
     await prepare(routeName, contract, budget);
     return callAcquired(routeName, method, operation, budget);
   };
   const queryAcquired = async (routeName: string, callId: string, budget: C2CallBudget): Promise<C2CallOutcome> => {
     try {
-      return await acquired(routeName).native.queryCall(routeName, callId, nativeLimit(budget));
+      return await acquired(routeName).native.queryCall(routeName, callId, nativeLimit(budget), budget.metadata);
     } catch (error) {
       throw withUncertainCallId(projectNativeError(error), callId);
     }
@@ -1182,16 +1247,16 @@ function createIpcTargetTransport<Payload extends C2ResponsePayload>(address: st
     callAcquired,
     streamAcquired: (routeName, method, encode, decode, hold, budget, cancelled, onTransportFailure) =>
       startStream(routeName, method, encode, decode, hold, budget, undefined, cancelled, onTransportFailure),
-    async call(routeName, contract, method, encode, options) {
-      return unary(routeName, contract, method, submitRequest(encode, options));
+    async call(routeName, contract, method, encode, options, view) {
+      return unary(routeName, contract, method, submitRequest(encode, options), view);
     },
-    async recoverCall(routeName, contract, method, callId) {
-      return unary(routeName, contract, method, { callId: requireCallId(callId) });
+    async recoverCall(routeName, contract, method, callId, view) {
+      return unary(routeName, contract, method, { callId: requireCallId(callId) }, view);
     },
     queryAcquired,
-    async queryCall(routeName, contract, callId) {
+    async queryCall(routeName, contract, callId, view) {
       requireCallId(callId);
-      const budget = new C2CallBudget(callTimeoutMs);
+      const budget = new C2CallBudget(callTimeoutMs, view);
       await prepare(routeName, contract, budget);
       return queryAcquired(routeName, callId, budget);
     },
@@ -1454,11 +1519,11 @@ function createRelayTransport<Payload extends C2ResponsePayload>(baseUrl: string
       }
     }
   };
-  function stream<T>(routeName: string, contract: C2ContractIdentity, method: string, encode: () => C2ByteArray, decode: (bytes: Uint8Array) => T, hold?: false): C2ResponseStream<T>;
-  function stream<T>(routeName: string, contract: C2ContractIdentity, method: string, encode: () => C2ByteArray, decode: (bytes: Uint8Array) => T, hold: true): C2ResponseStream<C2HeldResult<T>>;
-  function stream<T>(routeName: string, contract: C2ContractIdentity, method: string, encode: () => C2ByteArray, decode: (bytes: Uint8Array) => T, hold = false): C2ResponseStream<T | C2HeldResult<T>> {
+  function stream<T>(routeName: string, contract: C2ContractIdentity, method: string, encode: () => C2ByteArray, decode: (bytes: Uint8Array) => T, hold?: false, view?: C2CallOptions): C2ResponseStream<T>;
+  function stream<T>(routeName: string, contract: C2ContractIdentity, method: string, encode: () => C2ByteArray, decode: (bytes: Uint8Array) => T, hold: true, view?: C2CallOptions): C2ResponseStream<C2HeldResult<T>>;
+  function stream<T>(routeName: string, contract: C2ContractIdentity, method: string, encode: () => C2ByteArray, decode: (bytes: Uint8Array) => T, hold = false, view?: C2CallOptions): C2ResponseStream<T | C2HeldResult<T>> {
       if (explicit) throw new C2UnsupportedCallModeError();
-      const budget = new C2CallBudget(callTimeoutMs === 0 ? null : callTimeoutMs);
+      const budget = new C2CallBudget(callTimeoutMs === 0 ? null : callTimeoutMs, view);
       return new DeferredC2ResponseStream<T | C2HeldResult<T>>(async state => {
         requireRouteNamePathValue(routeName);
         requireMethodPathValue(method);
@@ -1478,10 +1543,10 @@ function createRelayTransport<Payload extends C2ResponsePayload>(baseUrl: string
         return stream;
       });
   }
-  const unary = async (routeName: string, contract: C2ContractIdentity, method: string, operation: C2UnaryRequest): Promise<Payload> => {
+  const unary = async (routeName: string, contract: C2ContractIdentity, method: string, operation: C2UnaryRequest, view?: C2CallOptions): Promise<Payload> => {
     requireRouteNamePathValue(routeName);
     requireMethodPathValue(method);
-    const budget = new C2CallBudget(callTimeoutMs === 0 ? null : callTimeoutMs);
+    const budget = new C2CallBudget(callTimeoutMs === 0 ? null : callTimeoutMs, view);
     const routeContract = requireRouteContractIdentity(contract);
     const target = await targetForCall(routeName, routeContract, budget);
     if (target.local !== undefined) {
@@ -1497,7 +1562,7 @@ function createRelayTransport<Payload extends C2ResponsePayload>(baseUrl: string
     let delivery: C2PendingResponseDelivery<Payload>;
     try {
       requests += 1;
-      delivery = await callResolvedHttpRoute(fetchImpl, target.relayUrl, routeName, routeContract, method, request, operation.callId, headers, budget.remaining() ?? 0, allocator, unknownLengthStrategy, unknownLengthMaxBytes);
+      delivery = await callResolvedHttpRoute(fetchImpl, target.relayUrl, routeName, routeContract, method, request, operation.callId, headers, budget.remaining() ?? 0, budget.metadata, allocator, unknownLengthStrategy, unknownLengthMaxBytes);
     } catch (error) {
       observeFailure(target, error);
       throw withUncertainCallId(error, operation.callId);
@@ -1513,21 +1578,21 @@ function createRelayTransport<Payload extends C2ResponsePayload>(baseUrl: string
     }
   };
   return {
-    async call(routeName, contract, method, encode, options) {
-      return unary(routeName, contract, method, submitRequest(encode, options));
+    async call(routeName, contract, method, encode, options, view) {
+      return unary(routeName, contract, method, submitRequest(encode, options), view);
     },
-    async recoverCall(routeName, contract, method, callId) {
-      return unary(routeName, contract, method, { callId: requireCallId(callId) });
+    async recoverCall(routeName, contract, method, callId, view) {
+      return unary(routeName, contract, method, { callId: requireCallId(callId) }, view);
     },
-    async queryCall(routeName, contract, callId) {
+    async queryCall(routeName, contract, callId, view) {
       requireCallId(callId);
       requireRouteNamePathValue(routeName);
       const routeContract = requireRouteContractIdentity(contract);
-      const budget = new C2CallBudget(callTimeoutMs === 0 ? null : callTimeoutMs);
+      const budget = new C2CallBudget(callTimeoutMs === 0 ? null : callTimeoutMs, view);
       const target = await targetForCall(routeName, routeContract, budget);
       try {
         if (target.local !== undefined) return await target.local.transport.queryAcquired(routeName, callId, budget);
-        return await queryResolvedHttpRoute(fetchImpl, target.relayUrl, routeName, routeContract, callId, headers, budget.remaining() ?? 0);
+        return await queryResolvedHttpRoute(fetchImpl, target.relayUrl, routeName, routeContract, callId, headers, budget.remaining() ?? 0, budget.metadata);
       } catch (error) {
         observeFailure(target, error);
         throw withUncertainCallId(error, callId);
@@ -1562,7 +1627,7 @@ function requireCallId(value: unknown): string {
   return value;
 }
 
-function submitRequest(encode: () => C2ByteArray, options?: C2UnaryCallOptions): C2UnaryRequest {
+function submitRequest(encode: () => C2ByteArray, options?: C2CallIdOptions): C2UnaryRequest {
   if (typeof encode !== "function") throw new TypeError("C-Two unary input requires an encoder.");
   const callId = options?.callId;
   return { encode, callId: callId === undefined ? undefined : requireCallId(callId) };
@@ -2360,7 +2425,7 @@ function normalizeHttpHeaders(headers: Readonly<Record<string, string>> | undefi
     if (/[\r\n\0]/.test(value)) {
       throw new Error(`${label} ${name} contains invalid HTTP header value.`);
     }
-    if (C2_RESERVED_HTTP_HEADER_NAMES.has(name.toLowerCase())) {
+    if (C2_RESERVED_HTTP_HEADER_NAMES.has(name.toLowerCase()) || name.toLowerCase().startsWith("x-c2-meta-")) {
       throw new Error(`${label} cannot override reserved C-Two HTTP header ${name}.`);
     }
     normalized[name] = value;
@@ -2368,12 +2433,13 @@ function normalizeHttpHeaders(headers: Readonly<Record<string, string>> | undefi
   return normalized;
 }
 
-function requestHeadersForRouteContract(customHeaders: Readonly<Record<string, string>>, routeContract: C2RouteContractIdentity, callId?: string): Readonly<Record<string, string>> {
+function requestHeadersForRouteContract(customHeaders: Readonly<Record<string, string>>, routeContract: C2RouteContractIdentity, callId?: string, metadata?: Readonly<Record<string, string>>): Readonly<Record<string, string>> {
   const headers = Object.create(null) as Record<string, string>;
   for (const [name, value] of Object.entries(customHeaders)) {
     headers[name] = value;
   }
   if (callId !== undefined) headers["x-c2-call-id"] = callId;
+  for (const [key, value] of Object.entries(metadata ?? {})) headers[`x-c2-meta-${key}`] = value;
   headers["Content-Type"] = "application/octet-stream";
   headers["x-c2-expected-crm-ns"] = routeContract.namespace;
   headers["x-c2-expected-crm-name"] = routeContract.name;
@@ -2401,9 +2467,10 @@ function projectHttpCallError(status: number, bytes: Uint8Array): Error {
     }
   }
   const relay = new C2HttpRelayError(status, bytes, undefined, decoded);
-  if (status === 409 && relay.transportPhase === "pre_dispatch") {
+  if (relay.transportPhase === "pre_dispatch") {
     const refusal = parseCanonicalRelayError(decoded.body);
-    if (refusal?.code === 721 || refusal?.code === 723) {
+    if (refusal !== undefined && (refusal.code === 721 || refusal.code === 723 ||
+        refusal.code === 724 || isMetadataRefusal(refusal.code, refusal.details))) {
       return new C2CoreError(refusal.message, {
         message: refusal.message, code: refusal.code, canonicalName: refusal.name,
         details: refusal.details, transportPhase: "pre_dispatch",
@@ -2447,12 +2514,13 @@ async function queryResolvedHttpRoute(
   callId: string,
   headers: Readonly<Record<string, string>>,
   timeoutMs: number,
+  metadata: C2CallBudget["metadata"],
 ): Promise<C2CallOutcome> {
   return fetchWithTimeout(async (signal, internalSignal) => {
     let response: C2FetchResponse;
     try {
       response = await fetchImpl(`${relayUrl}/_c2/calls/outcome?route=${encodeQueryValue(routeName)}`, {
-        method: "GET", headers: requestHeadersForRouteContract(headers, routeContract, callId), signal,
+        method: "GET", headers: requestHeadersForRouteContract(headers, routeContract, callId, metadata), signal,
         redirect: "error",
       });
     } catch (error) {
@@ -2526,6 +2594,7 @@ async function callResolvedHttpRoute<Payload extends C2ResponsePayload>(
   callId: string | undefined,
   headers: Readonly<Record<string, string>>,
   callTimeoutMs: number,
+  metadata: C2CallBudget["metadata"],
   responsePayloadAllocator: C2ResponsePayloadAllocator<Payload> | undefined,
   responsePayloadUnknownLengthStrategy: C2ResponsePayloadUnknownLengthStrategy,
   responsePayloadUnknownLengthMaxBytes: number,
@@ -2541,15 +2610,14 @@ async function callResolvedHttpRoute<Payload extends C2ResponsePayload>(
         },
       };
       let response: C2FetchResponse;
+      const operation = callId === undefined ? "call" : requestPayload === undefined ? "recover" : "keyed";
       try {
         response = await fetchImpl(
-          callId === undefined
-            ? `${relayUrl}/${encodePathSegment(routeName)}/${encodePathSegment(method)}`
-            : `${relayUrl}/_c2/calls/${requestPayload === undefined ? "recover" : "keyed"}?route=${encodeQueryValue(routeName)}&method=${encodeQueryValue(method)}`,
+          `${relayUrl}/_c2/calls/${operation}?route=${encodeQueryValue(routeName)}&method=${encodeQueryValue(method)}`,
           {
             method: "POST",
             redirect: "error",
-            headers: requestHeadersForRouteContract(headers, routeContract, callId),
+            headers: requestHeadersForRouteContract(headers, routeContract, callId, metadata),
             ...(requestPayload === undefined ? {} : { body: requestPayload }),
             signal: fetchSignal,
           },
@@ -2576,7 +2644,19 @@ async function callResolvedHttpRoute<Payload extends C2ResponsePayload>(
       }
       let bodyBytes: Uint8Array;
       try {
-        bodyBytes = await readHttpArrayBufferResponsePayload(response, activeSignal);
+        const controlLimit = C2_HTTP_CONTROL_CODES[response.status] === undefined ? undefined : 8192;
+        if (controlLimit !== undefined && response.body != null) {
+          bodyBytes = await readBoundedStreamBytes(response.body, controlLimit, activeSignal);
+        } else {
+          const declaredLength = responseContentLength(response);
+          if (controlLimit !== undefined && declaredLength !== undefined && declaredLength > controlLimit) {
+            throw new Error("relay control error body exceeds 8192 bytes");
+          }
+          bodyBytes = await readHttpArrayBufferResponsePayload(response, activeSignal);
+          if (controlLimit !== undefined && bodyBytes.byteLength > controlLimit) {
+            throw new Error("relay control error body exceeds 8192 bytes");
+          }
+        }
       } catch (error) {
         throw new C2HttpTransportError(
           `C-Two HTTP relay call body read failed: ${formatCaughtError(error)}`,
@@ -2877,12 +2957,23 @@ async function fetchWithTimeout<T>(
   let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
   const timeoutError = () => callDeadlineError(phase, `${label} timed out after ${timeoutMs}ms.`);
   const timeoutPromise = new Promise<never>((_resolve, reject) => {
-    timeoutHandle = setTimeout(() => {
+    const maxTimerMs = 2_147_483_647;
+    const started = performance.now();
+    const expire = (): void => {
+      // Longer waits need multiple timers; shorter waits use the original timer.
+      if (timeoutMs > maxTimerMs) {
+        const remaining = timeoutMs - (performance.now() - started);
+        if (remaining > 0) {
+          timeoutHandle = setTimeout(expire, Math.min(remaining, maxTimerMs));
+          return;
+        }
+      }
       timedOut = true;
       const error = timeoutError();
       internalController.abort(error);
       reject(error);
-    }, timeoutMs);
+    };
+    timeoutHandle = setTimeout(expire, Math.min(timeoutMs, maxTimerMs));
   });
   const opPromise = operation(nativeController?.signal, internalController.signal);
   if (onLateResult !== undefined) {
@@ -3070,14 +3161,27 @@ function preDispatchRouteCode(error: unknown): number | undefined {
   return undefined;
 }
 
+function isMetadataRefusal(code: number, details: Readonly<Record<string, string>>): boolean {
+  return code === 713 && ownDetail(details, "stage") === "call_metadata_validation";
+}
+
 function terminalRouteRefusal(error: unknown): boolean {
   if (error instanceof C2IpcTransportError && (error.category === "protocol_version_mismatch" || error.category === "runtime_retired")) return true;
   const code = preDispatchRouteCode(error);
-  return code === 710 || code === 713;
+  if (code !== 713) return code === 710;
+  const details = error instanceof C2HttpRelayError
+    ? parseCanonicalRelayError(error.body)?.details
+    : error instanceof C2CoreError || error instanceof C2IpcTransportError ? error.details : undefined;
+  return details === undefined || !isMetadataRefusal(code, details);
 }
 
-function isRetryableRouteError(error: unknown): boolean {
-  return preDispatchRouteCode(error) !== undefined;
+function permitsRouteRetry(code: number | null, details: Readonly<Record<string, string>>): boolean {
+  return code !== 724 && (code !== 713 || !isMetadataRefusal(code, details));
+}
+
+function isRetryableRouteError(error: C2HttpRelayError): boolean {
+  const code = preDispatchRouteCode(error);
+  return code !== undefined && permitsRouteRetry(code, parseCanonicalRelayError(error.body)?.details ?? {});
 }
 
 function httpConnectFailure(error: unknown): boolean {

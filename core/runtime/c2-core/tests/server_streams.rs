@@ -1691,14 +1691,10 @@ fn ipc_and_relay_reject_keyed_submit_and_recovery_for_stream_methods_before_reso
         )
         .unwrap();
     for client in [&fixture.client, &client] {
-        let timeout = CallTimeout::After(WAIT);
-        let options = c2_core::UnaryCallOptions::new()
-            .with_timeout(timeout)
-            .with_call_id("stream-id")
-            .unwrap();
+        let client = client.with_call_options(CallOptions::with_timeout(CallTimeout::After(WAIT)));
         for result in [
-            client.call_unary_with_options("echo", &[1, 0], options),
-            client.recover_unary_call("echo", "stream-id", timeout),
+            client.call_unary_with_call_id("echo", &[1, 0], "stream-id"),
+            client.recover_unary_call("echo", "stream-id"),
         ] {
             let error = result.unwrap_err();
             assert_eq!(
@@ -1711,7 +1707,7 @@ fn ipc_and_relay_reject_keyed_submit_and_recovery_for_stream_methods_before_reso
         }
         assert_eq!(fixture.probe.opens.load(Ordering::SeqCst), 0);
         assert_eq!(
-            client.query_call("stream-id", timeout).unwrap().status,
+            client.query_call("stream-id").unwrap().status,
             c2_core::CallOutcomeStatus::Unknown,
         );
     }
@@ -2077,4 +2073,154 @@ fn async_native_client_projection_shares_the_original_stream_and_unary_driver() 
         assert!(receipt.terminal.unwrap().is_ok());
         assert_eq!(receipt.complete_items, Some(3));
     });
+}
+
+#[test]
+fn metadata_and_extension_survive_each_remote_stream_callback() {
+    use c2_core::{AdmissionContext, AdmissionDecision, AdmissionOperation, current_call_context};
+
+    struct Service(mpsc::Sender<(&'static str, String)>);
+
+    impl EncodedService for Service {
+        fn invoke(&self, _: u16, _: Vec<u8>) -> Result<Vec<u8>, C2Error> {
+            unreachable!()
+        }
+    }
+
+    impl EncodedStreamService for Service {
+        fn open_stream(&self, _: u16, _: Vec<u8>) -> Result<Box<dyn EncodedStream>, C2Error> {
+            observe_context(&self.0, "open");
+            Ok(Box::new(Service(self.0.clone())))
+        }
+    }
+
+    impl EncodedStream for Service {
+        fn step(&mut self) -> Result<Option<Box<dyn EncodedStreamItem>>, C2Error> {
+            observe_context(&self.0, "step");
+            Ok(None)
+        }
+        fn finish(self: Box<Self>) -> Result<(), C2Error> {
+            observe_context(&self.0, "finish");
+            Ok(())
+        }
+    }
+
+    fn observe_context(observed: &mpsc::Sender<(&'static str, String)>, stage: &'static str) {
+        let context = current_call_context().unwrap();
+        assert_eq!(context.operation(), AdmissionOperation::ServerStream);
+        assert_eq!(context.target(), "echo");
+        let token = context.metadata().get("token").unwrap();
+        assert_eq!(context.extension::<String>().unwrap().as_str(), token);
+        observed.send((stage, token.to_owned())).unwrap();
+    }
+
+    let runtime = Runtime::new(RuntimeOptions::default()).unwrap();
+    let mut relay = RelayServer::start_with_context(
+        RelayConfig {
+            bind: "127.0.0.1:0".into(),
+            ..Default::default()
+        },
+        runtime.local_endpoint_context().unwrap(),
+    )
+    .unwrap();
+    let url = format!("http://{}", relay.local_addr());
+    let host = runtime
+        .host(
+            HostOptions::default()
+                .with_relay_anchor_address(&url)
+                .with_admission_hook(Arc::new(|context: &AdmissionContext<'_>| {
+                    assert_eq!(context.operation(), AdmissionOperation::ServerStream);
+                    assert_eq!(context.access(), Some(c2_core::AccessLevel::Write));
+                    match context.metadata().get("token") {
+                        Some(token) => {
+                            AdmissionDecision::allow_with_extension(Arc::new(token.to_owned()))
+                        }
+                        None => AdmissionDecision::deny("missing token"),
+                    }
+                })),
+        )
+        .unwrap();
+    let release = ContractRelease::from_descriptor_json(DESCRIPTOR).unwrap();
+    let route = unique("stream-metadata");
+    let methods = release
+        .descriptor()
+        .methods()
+        .iter()
+        .enumerate()
+        .map(|(index, method)| MethodDefinition {
+            index: index as u16,
+            name: method.name().into(),
+            access: method.access(),
+        });
+    let (observed, callbacks) = mpsc::channel();
+    let registration = host
+        .register(
+            ServiceDefinition::new_stream(
+                &release,
+                release.reference(),
+                &route,
+                methods,
+                Arc::new(Service(observed)),
+            )
+            .unwrap()
+            .with_concurrency(ServiceConcurrencyMode::Parallel, None, None)
+            .unwrap(),
+        )
+        .unwrap();
+    assert_eq!(
+        registration.route_concurrency().method_access(0),
+        Some(MethodAccess::Read)
+    );
+    assert_eq!(
+        registration.route_concurrency().method_access(1),
+        Some(MethodAccess::Write)
+    );
+
+    for (mode, token) in [
+        (
+            Connect::DirectIpc {
+                address: host.local_endpoint().address().into(),
+            },
+            "direct",
+        ),
+        (Connect::ExplicitRelay { relay_url: url }, "http"),
+    ] {
+        let client = runtime
+            .connect(release.expected_route(&route).unwrap(), mode)
+            .unwrap();
+        let open = |client: &Client| {
+            client
+                .begin_stream("echo")?
+                .encode_vec(Vec::new())?
+                .stream()
+        };
+        let error = match open(&client) {
+            Ok(mut stream) => expect_stream_error(&mut stream),
+            Err(error) => error,
+        };
+        assert_eq!(
+            error.transport_phase(),
+            Some(c2_core::TransportPhase::PreDispatch)
+        );
+        assert_semantic(error, ErrorCode::AdmissionDenied, "missing token");
+
+        let client = client.with_call_options(
+            CallOptions::new()
+                .with_metadata_entry("token", token)
+                .unwrap(),
+        );
+        let stream = open(&client).unwrap();
+        assert!(stream.next_item().unwrap().is_none());
+        assert!(stream.close().terminal.unwrap().is_ok());
+        for stage in ["open", "step", "finish"] {
+            assert_eq!(
+                callbacks.recv_timeout(WAIT).unwrap(),
+                (stage, token.to_owned())
+            );
+        }
+        assert!(callbacks.try_recv().is_err());
+    }
+    drop(registration);
+    host.shutdown();
+    relay.stop().unwrap();
 }

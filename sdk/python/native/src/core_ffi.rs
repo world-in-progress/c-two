@@ -1,10 +1,11 @@
 use std::collections::BTreeMap;
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::time::Instant;
 
 use parking_lot::Mutex;
 use pyo3::buffer::PyBuffer;
-use pyo3::exceptions::{PyBufferError, PyRuntimeError, PyValueError};
+use pyo3::exceptions::{PyBufferError, PyRuntimeError, PyTypeError, PyValueError};
 use pyo3::ffi;
 use pyo3::prelude::*;
 use pyo3::pybacked::PyBackedBytes;
@@ -14,11 +15,12 @@ use c2_core::memory::LocalCopyGuard;
 use c2_core::{
     CallBudget, CallOptions, CallOutcomeStatus, CallTimeout, Client, EncodedResponse,
     EncodedService, EncodedStreamService, HeldResponse, LifecycleError, ObservedPath, PreparedCall,
-    ResponseSink, ResultUnavailableReason, ServerFailure, UnaryCallOptions,
+    ResponseSink, ResultUnavailableReason, ServerFailure,
 };
 use c2_error::{C2Error, ErrorCode};
 use c2_mem::{RecycledBytes, WritableSlab};
 
+use crate::admission_ffi::{dispatch_in_call_context, metadata_dict};
 use crate::config_ffi::PyConnectAttempt;
 use crate::core_error_ffi::{core_error_to_py, lifecycle_error_to_py};
 use crate::local_copy_ffi::PyLocalCopyTracker;
@@ -49,8 +51,8 @@ impl PyCoreClient {
 }
 
 #[pyclass(name = "NativeCallOptions", frozen, skip_from_py_object)]
-struct PyNativeCallOptions {
-    options: CallOptions,
+pub(crate) struct PyNativeCallOptions {
+    pub(crate) options: CallOptions,
 }
 
 #[pyclass(name = "NativeCallBudget", frozen, skip_from_py_object)]
@@ -75,17 +77,39 @@ fn inherit_timeout() -> Py<PyAny> {
     Python::attach(|py| py.Ellipsis())
 }
 
-fn call_options(py: Python<'_>, timeout: &Py<PyAny>) -> PyResult<CallOptions> {
-    let timeout = timeout.bind(py);
-    let timeout = if timeout.is(&py.Ellipsis()) {
-        CallTimeout::Inherit
+fn call_timeout(timeout: &Bound<'_, PyAny>) -> PyResult<CallTimeout> {
+    if timeout.is(&timeout.py().Ellipsis()) {
+        Ok(CallTimeout::Inherit)
     } else if timeout.is_none() {
-        CallTimeout::Unlimited
+        Ok(CallTimeout::Unlimited)
     } else {
         CallTimeout::try_after_seconds(timeout.extract::<f64>()?)
-            .map_err(|error| PyValueError::new_err(error.to_string()))?
-    };
-    Ok(CallOptions::with_timeout(timeout))
+            .map_err(|error| PyValueError::new_err(error.to_string()))
+    }
+}
+
+impl PyNativeCallBudget {
+    fn take(&self) -> PyResult<CallBudget> {
+        self.inner
+            .lock()
+            .take()
+            .ok_or_else(|| PyValueError::new_err("call budget has already been consumed"))
+    }
+}
+
+fn outcome_client(client: Client, budget: Option<CallBudget>) -> Client {
+    // Core's recover and query entry points accept a timeout through the
+    // client view. Pass the remaining native connect-and-call budget.
+    match budget.and_then(|budget| budget.scope().deadline()) {
+        Some(deadline) => {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let options = client
+                .call_options()
+                .with_timeout_override(CallTimeout::After(remaining));
+            client.with_call_options(options)
+        }
+        None => client,
+    }
 }
 
 #[pymethods]
@@ -94,8 +118,47 @@ impl PyNativeCallOptions {
     #[pyo3(signature = (*, timeout=inherit_timeout()))]
     fn new(py: Python<'_>, timeout: Py<PyAny>) -> PyResult<Self> {
         Ok(Self {
-            options: call_options(py, &timeout)?,
+            options: CallOptions::with_timeout(call_timeout(timeout.bind(py))?),
         })
+    }
+
+    fn with_overrides(
+        &self,
+        unset: &Bound<'_, PyAny>,
+        timeout: &Bound<'_, PyAny>,
+        metadata: &Bound<'_, PyAny>,
+    ) -> PyResult<Self> {
+        let mut options = self.options.clone();
+        if !timeout.is(unset) {
+            options = options.with_timeout_override(call_timeout(timeout)?);
+        }
+        if metadata.is_none() {
+            options = options.clear_metadata();
+        } else if !metadata.is(unset) {
+            let mapping = metadata
+                .py()
+                .import("collections.abc")?
+                .getattr("Mapping")?;
+            if !metadata.is_instance(&mapping)? {
+                return Err(PyTypeError::new_err(
+                    "metadata must be a mapping of str to str",
+                ));
+            }
+            let entries = metadata
+                .call_method0("items")?
+                .try_iter()?
+                .map(|item| item?.extract::<(String, String)>())
+                .collect::<PyResult<Vec<_>>>()?;
+            options = options
+                .extend_metadata(entries)
+                .map_err(|error| PyValueError::new_err(error.to_string()))?;
+        }
+        Ok(Self { options })
+    }
+
+    #[getter]
+    fn metadata<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        metadata_dict(py, self.options.metadata())
     }
 
     fn validate_thread(&self) -> PyResult<()> {
@@ -116,7 +179,7 @@ impl PyNativeCallOptions {
     }
 
     fn call_budget(&self) -> PyResult<PyNativeCallBudget> {
-        let budget = CallBudget::new(self.options, None).map_err(core_error_to_py)?;
+        let budget = CallBudget::new(self.options.clone(), None).map_err(core_error_to_py)?;
         Ok(PyNativeCallBudget {
             inner: Mutex::new(Some(budget)),
         })
@@ -308,11 +371,10 @@ impl PyCoreClient {
         )
     }
 
-    #[pyo3(signature = (*, timeout=inherit_timeout()))]
-    fn with_call_options(&self, py: Python<'_>, timeout: Py<PyAny>) -> PyResult<Self> {
+    fn with_call_options(&self, options: &PyNativeCallOptions) -> PyResult<Self> {
         let client = self.client().map_err(core_error_to_py)?;
         Ok(Self::new(
-            client.with_call_options(call_options(py, &timeout)?),
+            client.with_call_options(options.options.clone()),
             self.local_copy_tracker.clone(),
         ))
     }
@@ -325,13 +387,9 @@ impl PyCoreClient {
         call_id: Option<&str>,
     ) -> PyResult<PyNativePreparedCall> {
         let client = self.client().map_err(core_error_to_py)?;
-        let options = call_id
-            .map(|id| UnaryCallOptions::from(client.call_options()).with_call_id(id))
-            .transpose()
-            .map_err(PyValueError::new_err)?;
         let prepared = py
-            .detach(|| match options {
-                Some(options) => client.begin_unary_with_options(method_name, options),
+            .detach(|| match call_id {
+                Some(call_id) => client.begin_keyed_call(method_name, call_id),
                 None => client.begin_call(method_name),
             })
             .map_err(core_error_to_py)?;
@@ -340,19 +398,20 @@ impl PyCoreClient {
         })
     }
 
+    #[pyo3(signature = (method_name, budget, *, call_id=None))]
     fn begin_call_with_budget(
         &self,
         py: Python<'_>,
         method_name: &str,
         budget: &PyNativeCallBudget,
+        call_id: Option<&str>,
     ) -> PyResult<PyNativePreparedCall> {
-        let budget = budget
-            .inner
-            .lock()
-            .take()
-            .ok_or_else(|| PyValueError::new_err("call budget has already been consumed"))?;
+        let budget = budget.take()?;
         let prepared = py
-            .detach(|| self.client()?.begin_call_with_budget(method_name, budget))
+            .detach(|| {
+                self.client()?
+                    .begin_unary_with_budget(method_name, budget, call_id)
+            })
             .map_err(core_error_to_py)?;
         Ok(PyNativePreparedCall {
             inner: Mutex::new(Some(prepared)),
@@ -374,11 +433,7 @@ impl PyCoreClient {
         method_name: &str,
         budget: &PyNativeCallBudget,
     ) -> PyResult<PyNativePreparedCall> {
-        let budget = budget
-            .inner
-            .lock()
-            .take()
-            .ok_or_else(|| PyValueError::new_err("call budget has already been consumed"))?;
+        let budget = budget.take()?;
         let prepared = py
             .detach(|| self.client()?.begin_stream_with_budget(method_name, budget))
             .map_err(core_error_to_py)?;
@@ -399,15 +454,17 @@ impl PyCoreClient {
             .call(py, data, false)
     }
 
+    #[pyo3(signature = (method_name, call_id, budget=None))]
     fn recover_call(
         &self,
         py: Python<'_>,
         method_name: &str,
         call_id: &str,
+        budget: Option<&PyNativeCallBudget>,
     ) -> PyResult<PyCoreResponse> {
+        let budget = budget.map(PyNativeCallBudget::take).transpose()?;
         py.detach(|| {
-            let client = self.client()?;
-            client.recover_unary_call_held(method_name, call_id, client.call_options().timeout())
+            outcome_client(self.client()?, budget).recover_unary_call_held(method_name, call_id)
         })
         .map(PyCoreResponse::new)
         .map_err(core_error_to_py)
@@ -422,27 +479,22 @@ impl PyCoreClient {
         let response = py
             .detach(|| {
                 let client = self.client()?;
-                client.recover_unary_call(method_name, call_id, client.call_options().timeout())
+                client.recover_unary_call(method_name, call_id)
             })
             .map_err(core_error_to_py)?;
         Ok(PyBytes::new(py, &response))
     }
 
-    #[pyo3(signature = (call_id, *, timeout=inherit_timeout()))]
+    #[pyo3(signature = (call_id, budget=None))]
     fn query_call<'py>(
         &self,
         py: Python<'py>,
         call_id: &str,
-        timeout: Py<PyAny>,
+        budget: Option<&PyNativeCallBudget>,
     ) -> PyResult<Bound<'py, PyDict>> {
-        let client = self.client().map_err(core_error_to_py)?;
-        let timeout = if timeout.bind(py).is(&py.Ellipsis()) {
-            client.call_options().timeout()
-        } else {
-            call_options(py, &timeout)?.timeout()
-        };
+        let budget = budget.map(PyNativeCallBudget::take).transpose()?;
         let outcome = py
-            .detach(|| client.query_call(call_id, timeout))
+            .detach(|| outcome_client(self.client()?, budget).query_call(call_id))
             .map_err(core_error_to_py)?;
         let status = match outcome.status {
             CallOutcomeStatus::InFlight => "in_flight",
@@ -489,13 +541,17 @@ impl PyCoreClient {
         let explicit = if inherited {
             None
         } else {
-            Some(call_options(py, &timeout)?)
+            Some(call_timeout(timeout.bind(py))?)
         };
         let client = self.client().map_err(core_error_to_py)?;
         let subscription = py
             .detach(move || match explicit {
                 None => client.subscribe(topic, options),
-                Some(call_options) => client.subscribe_with_options(topic, options, call_options),
+                Some(timeout) => client.subscribe_with_options(
+                    topic,
+                    options,
+                    client.call_options().with_timeout_override(timeout),
+                ),
             })
             .map_err(core_error_to_py)?;
         Ok(crate::topic_ffi::PyTopicSubscription::new(subscription))
@@ -864,11 +920,11 @@ impl PyCoreService {
                 let request = Py::new(py, PyCoreRequestBuffer::new_recycled(request))?;
                 let sink = Bound::new(py, PyResponseSink::new(sink))?;
                 let scoped = ResponseSinkScope(sink.get());
-                let result = self
-                    .dispatcher
-                    .call1(py, (self.route_name.as_str(), method_index, request, &sink))?;
+                let args =
+                    (self.route_name.as_str(), method_index, request, &sink).into_pyobject(py)?;
+                let result = dispatch_in_call_context(py, &self.dispatcher, args)?;
                 if scoped.0.state.lock().response.is_none() {
-                    let value = result.bind(py);
+                    let value = &result;
                     let written = scoped.0.write(py, value);
                     if let Ok(view) = value.cast_exact::<pyo3::types::PyMemoryView>() {
                         let released = view.call_method0("release");
@@ -921,10 +977,11 @@ impl EncodedStreamService for PyCoreService {
         Python::attach(|py| {
             let request = Py::new(py, PyCoreRequestBuffer::new_recycled(request))
                 .map_err(|error| python_error_to_c2(py, error))?;
-            let iterator = self
-                .dispatcher
-                .call1(py, (self.route_name.as_str(), method_index, request))
-                .map_err(|error| python_error_to_c2(py, error))?;
+            let iterator = (|| {
+                let args = (self.route_name.as_str(), method_index, request).into_pyobject(py)?;
+                dispatch_in_call_context(py, &self.dispatcher, args).map(Bound::unbind)
+            })()
+            .map_err(|error| python_error_to_c2(py, error))?;
             Ok(Box::new(crate::stream_ffi::PyEncodedStream { iterator })
                 as Box<dyn c2_core::EncodedStream>)
         })

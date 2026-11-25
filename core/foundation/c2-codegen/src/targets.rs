@@ -134,9 +134,8 @@ impl ContractClient {
     pub fn query_call(
         &self,
         call_id: &str,
-        timeout: c_two::CallTimeout,
     ) -> Result<c_two::CallOutcome, c_two::Error> {
-        self.client.query_call(call_id, timeout)
+        self.client.query_call(call_id)
     }
 
     pub fn expected_route(&self) -> &c_two::contract::ExpectedRouteContract {
@@ -455,11 +454,11 @@ fn render_rust_client_method(output: &mut String, method: &TargetMethod<'_>) {
         };
         output.push_str(&format!(
             r#"
-    pub fn {prefix}{symbol}_with_options(
+    pub fn {prefix}{symbol}_with_call_id(
         &self{parameter},
-        options: c_two::UnaryCallOptions,
+        call_id: &str,
     ) -> Result<{return_type}, c_two::Error> {{
-        let {binding} = self.client.begin_unary_with_options({method_name}, options)?;
+        let {binding} = self.client.begin_keyed_call({method_name}, call_id)?;
 {preparation}        let request = {request};
         let response = call.encode_vec(request)?.{dispatch}()?;
         {decode}(response)
@@ -468,9 +467,8 @@ fn render_rust_client_method(output: &mut String, method: &TargetMethod<'_>) {
     pub fn recover_{prefix}{symbol}(
         &self,
         call_id: &str,
-        timeout: c_two::CallTimeout,
     ) -> Result<{return_type}, c_two::Error> {{
-        let response = self.client.{recover}({method_name}, call_id, timeout)?;
+        let response = self.client.{recover}({method_name}, call_id)?;
         {decode}(response)
     }}
 "#,
@@ -1807,14 +1805,26 @@ function normalizeFastDbPayloadError(error: unknown): unknown {
         (true, false) => "C2StreamEncodedClientTransport & C2ClientTransport",
     };
     output.push_str(&format!("    private readonly transport: {transport},\n"));
-    output.push_str("    private readonly routeName: string,\n  ) {}\n");
+    output.push_str(
+        r#"    private readonly routeName: string,
+  ) {}
+
+  private callOptions: C2CallOptions = Object.freeze({});
+
+  withCallOptions(options: C2CallOptions): ContractClient {
+    const view = new ContractClient(this.transport, this.routeName);
+    view.callOptions = mergeCallOptions(this.callOptions, options);
+    return view;
+  }
+"#,
+    );
     if methods
         .iter()
         .any(|method| method.mode == MethodMode::Unary)
     {
         output.push_str(
             "\n  queryCall(callId: string): Promise<C2CallOutcome> {\n\
-             \x20   return this.transport.queryCall(this.routeName, CONTRACT, callId);\n\
+             \x20   return this.transport.queryCall(this.routeName, CONTRACT, callId, this.callOptions);\n\
              \x20 }\n",
         );
     }
@@ -1825,10 +1835,10 @@ function normalizeFastDbPayloadError(error: unknown): unknown {
         let symbol = topic_symbol(topic.index, topic.name);
         output.push_str(&format!(
             "\n  subscribe_{symbol}(options?: TopicSubscribeOptions): Promise<C2TopicSubscription<Payload>> {{\n\
-             \x20   return this.transport.subscribe(this.routeName, CONTRACT, {}, decode_{symbol}_output, options);\n\
+             \x20   return this.transport.subscribe(this.routeName, CONTRACT, {}, decode_{symbol}_output, options, false, this.callOptions);\n\
              \x20 }}\n\n\
              \x20 hold_subscribe_{symbol}(options?: TopicSubscribeOptions): Promise<C2TopicSubscription<C2HeldResult<Payload>>> {{\n\
-             \x20   return this.transport.subscribe(this.routeName, CONTRACT, {}, decode_{symbol}_output, options, true);\n\
+             \x20   return this.transport.subscribe(this.routeName, CONTRACT, {}, decode_{symbol}_output, options, true, this.callOptions);\n\
              \x20 }}\n",
             quoted(topic.name), quoted(topic.name),
         ));
@@ -1930,10 +1940,10 @@ fn render_typescript_client_method(output: &mut String, method: &TargetMethod<'_
     if method.mode == MethodMode::ServerStream {
         output.push_str(&format!(
             "\n  {symbol}({parameter}): C2ResponseStream<Payload> {{\n\
-             \x20   return this.transport.stream(this.routeName, CONTRACT, {}, () => {request}, decode_{symbol}_output);\n\
+             \x20   return this.transport.stream(this.routeName, CONTRACT, {}, () => {request}, decode_{symbol}_output, false, this.callOptions);\n\
              \x20 }}\n\n\
              \x20 hold_{symbol}({parameter}): C2ResponseStream<C2HeldResult<Payload>> {{\n\
-             \x20   return this.transport.stream(this.routeName, CONTRACT, {}, () => {request}, decode_{symbol}_output, true);\n\
+             \x20   return this.transport.stream(this.routeName, CONTRACT, {}, () => {request}, decode_{symbol}_output, true, this.callOptions);\n\
              \x20 }}\n",
             quoted(method.name),
             quoted(method.name),
@@ -1941,14 +1951,14 @@ fn render_typescript_client_method(output: &mut String, method: &TargetMethod<'_
         return;
     }
     let parameter = if parameter.is_empty() {
-        "options?: C2UnaryCallOptions".to_string()
+        "options?: C2CallIdOptions".to_string()
     } else {
-        format!("{parameter}, options?: C2UnaryCallOptions")
+        format!("{parameter}, options?: C2CallIdOptions")
     };
     output.push_str(&format!(
         "\n  async {symbol}({parameter}): Promise<{return_type}> {{\n\
          \x20   const response = requireResponsePayload(\n\
-         \x20     await this.transport.call(this.routeName, CONTRACT, {}, () => {request}, options),\n\
+         \x20     await this.transport.call(this.routeName, CONTRACT, {}, () => {request}, options, this.callOptions),\n\
          \x20     \"encoded transport response\",\n\
          \x20   );\n\
          \x20   return decodeAndReleaseResponse(response, decode_{symbol}_output);\n\
@@ -1957,7 +1967,7 @@ fn render_typescript_client_method(output: &mut String, method: &TargetMethod<'_
     ));
     output.push_str(&format!(
         "\n  async recover_{symbol}(callId: string): Promise<{return_type}> {{\n\
-         \x20   const response = await this.transport.recoverCall(this.routeName, CONTRACT, {}, callId);\n\
+         \x20   const response = await this.transport.recoverCall(this.routeName, CONTRACT, {}, callId, this.callOptions);\n\
          \x20   return decodeAndReleaseResponse(response, decode_{symbol}_output);\n\
          \x20 }}\n",
         quoted(method.name),
@@ -1966,7 +1976,7 @@ fn render_typescript_client_method(output: &mut String, method: &TargetMethod<'_
         output.push_str(&format!(
             "\n  async hold_{symbol}({parameter}): Promise<C2HeldResult<{return_type}>> {{\n\
              \x20   const response = requireResponsePayload(\n\
-             \x20     await this.transport.call(this.routeName, CONTRACT, {}, () => {request}, options),\n\
+             \x20     await this.transport.call(this.routeName, CONTRACT, {}, () => {request}, options, this.callOptions),\n\
              \x20     \"encoded transport response\",\n\
              \x20   );\n\
              \x20   try {{\n\

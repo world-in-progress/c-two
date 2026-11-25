@@ -1569,6 +1569,7 @@ def test_http_call_404_701_contradiction_409_719_reacquire_and_array_float_envel
             self.end_headers()
 
         def do_POST(self):
+            assert self.path == '/_c2/calls/call?route=route&method=echo'
             _ = self.rfile.read(int(self.headers.get('Content-Length', '0')))
             state['posts'] += 1
             if state['posts'] == 1:
@@ -1617,7 +1618,7 @@ def test_http_call_404_701_contradiction_409_719_reacquire_and_array_float_envel
                     'message': 'missing',
                     'details': {'dispatch_phase': 'dispatch_uncertain'},
                 }).encode('utf-8'),
-                ResourceNotFound,
+                ProtocolViolation,
                 'dispatch_uncertain',
                 1,
             ),

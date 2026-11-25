@@ -11,7 +11,7 @@ publish:       false
 
 This source-only package has no crates.io release. It reuses `c2-contract` for release identity and `c2-core` for route, transport, retry, host, and lifetime behavior. It does not expose a second runtime state machine.
 
-This guide describes the current source-only SDK, whose independent version remains 0.1.0. It requires Rust 1.95 or newer and uses IPC 18, SHM 4, C/FFI ABI 10, relay mesh 7 and FastDB 0.3.0. Use matching builds and local endpoint configuration for clients, Hosts and relays. Rust `c2-core` owns shutdown drain transactions and local endpoint maintenance. SDKs derive the OS endpoint from `LocalEndpoint::from_address`. See [lifecycle integration](../../docs/reference/local-endpoint-lifecycle.md).
+This guide describes the current source-only SDK, whose independent version remains 0.1.0. It requires Rust 1.95 or newer and uses IPC 18, SHM 4, C/FFI ABI 10, relay mesh 8 and FastDB 0.3.0. Use matching builds and local endpoint configuration for clients, Hosts and relays. Rust `c2-core` owns shutdown drain transactions and local endpoint maintenance. SDKs derive the OS endpoint from `LocalEndpoint::from_address`. See [lifecycle integration](../../docs/reference/local-endpoint-lifecycle.md).
 
 A Runtime resolves its client and server role domains independently. Use `RuntimeOptions::client_limits` for client capacity and `RuntimeOptions` for the local endpoint and discovery, and `Runtime::update_client_config` / `Runtime::update_server_config` with `ConfigField::{Keep, Inherit, Set}` to adjust overrides before a role freezes. Put the Host's identity, startup timeout, carrying limits and server capacity on `HostOptions`. Each role freezes on first use and accepts subsequent changes with the same effective settings. [Configuration](../../docs/reference/configuration.md#role-domains-and-sdk-configuration)
 
@@ -38,7 +38,7 @@ Connection acquisition accepts an optional total budget through `Runtime::connec
 
 ## Lifecycle and diagnostic APIs
 
-The crate root contains the Runtime, Host, client, registration and call types, their configuration and errors, `ContractRelease`, `Held`, `ResponseStream`, `StreamCloseReceipt`, and the topic types `Publisher`, `Subscription`, `Delivery`, `TopicStart`, `LagPolicy`, `TopicConfig`, `SubscribeOptions`, `TopicCloseCause` and `TopicCloseReceipt`. Supervisor, tooling and diagnostic APIs have one public path in these modules:
+The crate root contains the Runtime, Host, client, registration and call types (including `CallOptions`, `CallMetadata`, `CallMetadataError`, `AdmissionHook`, `AdmissionContext`, `AdmissionDecision`, `AdmissionRejection`, `AdmissionOperation`, `AdmissionTransport`, `CallContext` and `current_call_context`), their configuration and errors, `ContractRelease`, `Held`, `ResponseStream`, `StreamCloseReceipt`, and the topic types `Publisher`, `Subscription`, `Delivery`, `TopicStart`, `LagPolicy`, `TopicConfig`, `SubscribeOptions`, `TopicCloseCause` and `TopicCloseReceipt`. Supervisor, tooling and diagnostic APIs have one public path in these modules:
 
 | Module | Audience and contents |
 | --- | --- |
@@ -83,9 +83,11 @@ High-level `Held` uses `release()` and `Drop` as its release entry points alongs
 
 ## Keyed unary calls
 
-Use `UnaryCallOptions::new().with_timeout(timeout).with_call_id(id)?` once per logical unary operation. Generated clients accept it in `method_{index}_{name}_with_options` and `hold_method_{index}_{name}_with_options`. An uncertain dispatch can carry its key in `Error::call_id()`. Use `query_call(id, timeout)` to observe the current registration without taking a business call slot, or `recover_method_{index}_{name}(id, timeout)` to await or replay its original result without an input payload. For a held result use `recover_hold_method_{index}_{name}`. Each replay has an independent local lifetime.
+Pass a stable call ID to `method_{index}_{name}_with_call_id` or `hold_method_{index}_{name}_with_call_id` once per logical unary operation. Set the timeout and metadata on the client view with `with_call_options`. An uncertain dispatch can carry its key in `Error::call_id()`. Use `query_call(id)` to observe the current registration without taking a business call slot, or `recover_method_{index}_{name}(id)` to await or replay its original result without an input payload. For a held result use `recover_hold_method_{index}_{name}`. Each replay has an independent local lifetime.
 
 `HostOptions::with_outcome_max_entries` and `with_outcome_max_retained_bytes` bound retention across the Host's registrations. Recovery can report `CallResultUnavailable` for a successful call whose payload is missing, or `CallOutcomeUnknown` if the current registration has no record. The caller can reconcile unknown outcomes against its own durable state. See [ADR 0006](../../docs/decisions/0006-post-dispatch-outcome-and-dedup.md).
+
+Set metadata with `CallOptions::with_metadata` or `with_metadata_entry`. Configure a Host's admission hook through `HostOptions::with_admission_hook`. A refusal surfaces as `ErrorCode::AdmissionDenied` before dispatch. Inside an executing unary or stream callback, `current_call_context()` exposes the request metadata and an optional typed extension provided by the hook.
 
 ## Server streams
 

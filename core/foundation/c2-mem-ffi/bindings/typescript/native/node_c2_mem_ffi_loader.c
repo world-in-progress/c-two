@@ -36,9 +36,9 @@ typedef struct Symbols {
     C2MemFfiStatus (*endpoint_deactivate)(const C2MemFfiEndpointContext *);
     C2MemFfiStatus (*endpoint_close)(const C2MemFfiEndpointContext *, C2MemFfiComplete, void *);
     void (*endpoint_free)(C2MemFfiEndpointContext *);
-    C2MemFfiStatus (*call_begin)(const C2MemFfiEndpointContext *, const char *, const char *, uint8_t, const uint64_t *, const uint8_t *, size_t, C2MemFfiCall **, C2MemFfiError **);
-    C2MemFfiStatus (*recover_call)(const C2MemFfiEndpointContext *, const char *, const char *, const uint8_t *, size_t, const uint64_t *, C2MemFfiComplete, void *);
-    C2MemFfiStatus (*query_call)(const C2MemFfiEndpointContext *, const char *, const uint8_t *, size_t, const uint64_t *, C2MemFfiComplete, void *);
+    C2MemFfiStatus (*call_begin)(const C2MemFfiEndpointContext *, const char *, const char *, uint8_t, const uint64_t *, const uint8_t *, size_t, const char *, C2MemFfiCall **, C2MemFfiError **);
+    C2MemFfiStatus (*recover_call)(const C2MemFfiEndpointContext *, const char *, const char *, const uint8_t *, size_t, const uint64_t *, const char *, C2MemFfiComplete, void *);
+    C2MemFfiStatus (*query_call)(const C2MemFfiEndpointContext *, const char *, const uint8_t *, size_t, const uint64_t *, const char *, C2MemFfiComplete, void *);
     C2MemFfiStatus (*call_charge)(const C2MemFfiCall *, uint64_t, C2MemFfiComplete, void *);
     C2MemFfiStatus (*call_dispatch)(const C2MemFfiCall *, const uint8_t *, size_t, C2MemFfiComplete, void *);
     C2MemFfiStatus (*call_next)(const C2MemFfiCall *, C2MemFfiComplete, void *);
@@ -572,7 +572,7 @@ static bool call_id_bytes(napi_env env, napi_value value, uint8_t bytes[129], si
     return true;
 }
 static napi_value endpoint_method(napi_env env, napi_callback_info info) {
-    size_t argc = 5; napi_value argv[5], self; void *data = NULL;
+    size_t argc = 7; napi_value argv[7], self; void *data = NULL;
     if (!args(env, info, &argc, argv, &self, &data)) return NULL;
     Owner *owner = owner_get(env, self, OWNER_ENDPOINT, true);
     if (owner == NULL) return NULL;
@@ -635,27 +635,33 @@ static napi_value endpoint_method(napi_env env, napi_callback_info info) {
     }
     if (data == (void *)7 || data == (void *)8) {
         bool recovery = data == (void *)7;
-        if (argc != (recovery ? 4u : 3u)) return bad(env, "Expected route, optional method for recovery, call_id and timeout.");
+        size_t required = recovery ? 4u : 3u;
+        if (argc < required || argc > required + 1) return bad(env, "Expected route, optional method for recovery, call_id, timeout and optional metadata.");
         uint8_t id[129]; size_t len;
         uint64_t millis; const uint64_t *limit;
-        if (!call_id_bytes(env, argv[argc - 2], id, &len) || !timeout(env, argv[argc - 1], &millis, &limit)) return NULL;
+        if (!call_id_bytes(env, argv[required - 2], id, &len) || !timeout(env, argv[required - 1], &millis, &limit)) return NULL;
         char *route = string(env, argv[0], "Route name must be a string.");
         if (route == NULL) return NULL;
         char *name = recovery ? string(env, argv[1], "Method name must be a string.") : NULL;
         if (recovery && name == NULL) { free(route); return NULL; }
+        char *metadata = NULL;
+        if (argc > required && !nullish(env, argv[required])) {
+            metadata = json_string(env, argv[required], "Metadata must be an object.");
+            if (metadata == NULL) { free(route); free(name); return NULL; }
+        }
         napi_value promise;
         Async *operation = async_new(env, s, recovery ? ASYNC_NEXT : ASYNC_JSON, &promise);
         if (operation != NULL) {
-            st = recovery ? s->recover_call(owner->ptr, route, name, id, len, limit, native_complete, operation)
-                          : s->query_call(owner->ptr, route, id, len, limit, native_complete, operation);
+            st = recovery ? s->recover_call(owner->ptr, route, name, id, len, limit, metadata, native_complete, operation)
+                          : s->query_call(owner->ptr, route, id, len, limit, metadata, native_complete, operation);
         }
-        free(route); free(name);
+        free(route); free(name); free(metadata);
         return operation == NULL ? NULL : async_status(env, operation, st, promise);
     }
-    if (argc < 4 || argc > 5) return bad(env, "beginCall expects route, method, stream flag, timeout and optional call_id.");
+    if (argc < 4 || argc > 6) return bad(env, "beginCall expects route, method, stream flag, timeout, optional call_id and optional metadata.");
     uint8_t id[129]; size_t len = 0;
     napi_valuetype key_type;
-    if (argc == 5 && (!ok(napi_typeof(env, argv[4], &key_type)) ||
+    if (argc >= 5 && (!ok(napi_typeof(env, argv[4], &key_type)) ||
         (key_type != napi_undefined && !call_id_bytes(env, argv[4], id, &len)))) return NULL;
     char *route = string(env, argv[0], "Route name must be a string.");
     if (route == NULL) return NULL;
@@ -665,9 +671,14 @@ static napi_value endpoint_method(napi_env env, napi_callback_info info) {
     if (!ok(napi_get_value_bool(env, argv[2], &stream))) { free(route); free(name); return bad(env, "Stream flag must be a boolean."); }
     uint64_t millis = 0; const uint64_t *limit = NULL;
     if (!timeout(env, argv[3], &millis, &limit)) { free(route); free(name); return NULL; }
+    char *metadata = NULL;
+    if (argc == 6 && !nullish(env, argv[5])) {
+        metadata = json_string(env, argv[5], "Metadata must be an object.");
+        if (metadata == NULL) { free(route); free(name); return NULL; }
+    }
     C2MemFfiCall *call = NULL; C2MemFfiError *error = NULL;
-    st = s->call_begin(owner->ptr, route, name, stream ? 1 : 0, limit, len ? id : NULL, len, &call, &error);
-    free(route); free(name);
+    st = s->call_begin(owner->ptr, route, name, stream ? 1 : 0, limit, len ? id : NULL, len, metadata, &call, &error);
+    free(route); free(name); free(metadata);
     if (st != C2_MEM_FFI_STATUS_OK || call == NULL) return throw_native(env, s, error, st);
     napi_value object = owner_wrap(env, s, OWNER_CALL, call);
     if (object == NULL || !method(env, object, "chargeInput", call_method, (void *)1) ||

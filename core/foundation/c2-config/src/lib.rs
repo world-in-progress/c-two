@@ -6,12 +6,13 @@ mod domain;
 mod identity;
 mod ipc;
 mod local;
+mod metadata;
 mod pool;
 mod relay;
 mod resolver;
 mod timeout;
 
-pub use call::{CallOptions, CallTimeout, UnaryCallOptions};
+pub use call::{CallOptions, CallTimeout};
 pub use connect_options::{
     ConnectDeadline, ConnectDeadlineExceeded, ConnectOptions, ConnectTimeoutError,
 };
@@ -31,6 +32,11 @@ pub use ipc::{
 pub use local::{
     LocalEndpoint, LocalEndpointContext, LocalEndpointNamespace, LocalEndpointOptions,
     UNIX_NAMESPACE_FORMAT_VERSION,
+};
+pub use metadata::{
+    CallMetadata, CallMetadataError, MAX_CALL_METADATA_ENTRIES, MAX_CALL_METADATA_KEY_LEN,
+    MAX_CALL_METADATA_TOTAL_BYTES, MAX_CALL_METADATA_VALUE_LEN, validate_call_metadata_key,
+    validate_call_metadata_value,
 };
 pub use pool::{
     MAX_BUDDY_SEGMENT_BYTES, MAX_DEDICATED_SEGMENTS, MAX_IPC_POOL_SEGMENTS,

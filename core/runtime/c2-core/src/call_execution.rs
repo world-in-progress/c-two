@@ -1546,7 +1546,7 @@ mod tests {
             ),
             (CallOptions::new(), None), // Default direct IPC policy.
         ] {
-            let mut preparing = context.prepare(options, path_default).unwrap();
+            let mut preparing = context.prepare(options.clone(), path_default).unwrap();
             let scope = preparing.scope().clone();
             assert_eq!(scope.deadline(), None);
             // A no-deadline unary call occupies the domain's single slot

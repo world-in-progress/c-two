@@ -14,7 +14,7 @@ use super::{
     HttpCallControl, HttpClientPool, HttpError, HttpInputOwner, HttpResponseStream,
     HttpStreamCancellation, RelayControlClient, RelayResolvedRoutes, RelayRouteInfo,
 };
-use c2_config::LocalEndpointContext;
+use c2_config::{CallMetadata, LocalEndpointContext};
 use c2_contract::ExpectedRouteContract;
 
 /// Whether an HTTP call failure is proven to precede CRM dispatch.
@@ -236,10 +236,15 @@ impl RelayAwareHttpClient {
         &self.expected.route_name
     }
 
-    pub fn call(&self, method_name: &str, data: &[u8]) -> Result<Vec<u8>, HttpError> {
+    pub fn call(
+        &self,
+        method_name: &str,
+        data: &[u8],
+        metadata: &CallMetadata,
+    ) -> Result<Vec<u8>, HttpError> {
         super::http_client::runtime()
             .handle()
-            .block_on(self.call_async(method_name, data))
+            .block_on(self.call_async(method_name, data, metadata))
     }
 
     /// Call with the owner's original scope guards and one shared, read-only
@@ -253,12 +258,14 @@ impl RelayAwareHttpClient {
         method_name: &str,
         data: HttpInputOwner,
         control: &HttpCallControl,
+        metadata: &CallMetadata,
     ) -> Result<BudgetedBuffer, HttpCallError> {
         self.call_inner_async(
             method_name,
             HttpCallInput::Owned(data),
             Some(control),
             HttpUnaryMode::Plain,
+            metadata,
         )
         .await
         .map_err(|source| HttpCallError::new(http_call_error_phase(&source), source))
@@ -271,12 +278,14 @@ impl RelayAwareHttpClient {
         call_id: &str,
         data: HttpInputOwner,
         control: &HttpCallControl,
+        metadata: &CallMetadata,
     ) -> Result<BudgetedBuffer, HttpCallError> {
         self.call_inner_async(
             method,
             HttpCallInput::Owned(data),
             Some(control),
             HttpUnaryMode::Keyed(call_id),
+            metadata,
         )
         .await
         .map_err(|source| HttpCallError::new(http_call_error_phase(&source), source))
@@ -288,12 +297,14 @@ impl RelayAwareHttpClient {
         method: &str,
         call_id: &str,
         control: &HttpCallControl,
+        metadata: &CallMetadata,
     ) -> Result<BudgetedBuffer, HttpCallError> {
         self.call_inner_async(
             method,
             HttpCallInput::Borrowed(&[]),
             Some(control),
             HttpUnaryMode::Recover(call_id),
+            metadata,
         )
         .await
         .map_err(|source| HttpCallError::new(http_call_error_phase(&source), source))
@@ -303,6 +314,7 @@ impl RelayAwareHttpClient {
     pub async fn query_call_async(
         &self,
         call_id: &str,
+        metadata: &CallMetadata,
     ) -> Result<c2_wire::rpc::WireCallOutcome, HttpCallError> {
         let query = async {
             c2_config::validate_call_id(call_id).map_err(HttpError::InvalidInput)?;
@@ -324,7 +336,7 @@ impl RelayAwareHttpClient {
             let client = self.acquire_route_client(&target.relay_url, None)?;
             client
                 .client
-                .query_call_route_async(&self.expected, call_id)
+                .query_call_route_async(&self.expected, call_id, metadata)
                 .await
         };
         query
@@ -343,6 +355,7 @@ impl RelayAwareHttpClient {
         completion_owner: Box<dyn Send>,
         cancellation: HttpStreamCancellation,
         control: &HttpCallControl,
+        metadata: &CallMetadata,
     ) -> Result<HttpResponseStream, HttpCallError> {
         let result = self
             .stream_inner_async(
@@ -352,6 +365,7 @@ impl RelayAwareHttpClient {
                 completion_owner,
                 cancellation,
                 control,
+                metadata,
             )
             .await;
         result.map_err(|source| HttpCallError::new(http_call_error_phase(&source), source))
@@ -370,6 +384,7 @@ impl RelayAwareHttpClient {
         completion_owner: Box<dyn Send>,
         cancellation: super::HttpStreamCancellation,
         control: &HttpCallControl,
+        metadata: &CallMetadata,
     ) -> Result<super::HttpTopicSubscription, HttpCallError> {
         let result = async {
             check_active(Some(control))?;
@@ -391,6 +406,7 @@ impl RelayAwareHttpClient {
                     completion_owner,
                     cancellation,
                     control,
+                    metadata,
                 )
                 .await
         }
@@ -406,6 +422,7 @@ impl RelayAwareHttpClient {
         completion_owner: Box<dyn Send>,
         cancellation: HttpStreamCancellation,
         control: &HttpCallControl,
+        metadata: &CallMetadata,
     ) -> Result<HttpResponseStream, HttpError> {
         check_active(Some(control))?;
         let target = self.selected_http_target()?;
@@ -421,6 +438,7 @@ impl RelayAwareHttpClient {
                 completion_owner,
                 cancellation,
                 control,
+                metadata,
             )
             .await
     }
@@ -572,15 +590,10 @@ impl RelayAwareHttpClient {
                         }
                     };
 
-                // A selected next attempt replaces the previous error. Its
-                // received bytes must not occupy B while the new probe waits.
-                drop(last_error.take());
                 let probe = super::connect_deadline::run(
                     deadline,
                     "relay_probe",
-                    client
-                        .client
-                        .probe_route_async(&self.expected, &self.payload_budget),
+                    client.client.probe_route_async(&self.expected),
                 )
                 .await;
                 match probe {
@@ -618,12 +631,14 @@ impl RelayAwareHttpClient {
         &self,
         method_name: &str,
         data: &[u8],
+        metadata: &CallMetadata,
     ) -> Result<Vec<u8>, HttpError> {
         self.call_inner_async(
             method_name,
             HttpCallInput::Borrowed(data),
             None,
             HttpUnaryMode::Plain,
+            metadata,
         )
         .await
         .map(|buffer| buffer.into_parts().0)
@@ -635,6 +650,7 @@ impl RelayAwareHttpClient {
         data: HttpCallInput<'_>,
         control: Option<&HttpCallControl>,
         mode: HttpUnaryMode<'_>,
+        metadata: &CallMetadata,
     ) -> Result<BudgetedBuffer, HttpError> {
         let budget = control
             .and_then(HttpCallControl::payload_budget)
@@ -644,7 +660,15 @@ impl RelayAwareHttpClient {
         let client = self.acquire_route_client(&target.relay_url, control)?;
         client
             .client
-            .call_route_async(&self.expected, method_name, data, budget, control, mode)
+            .call_route_async(
+                &self.expected,
+                method_name,
+                data,
+                budget,
+                control,
+                mode,
+                metadata,
+            )
             .await
     }
 
@@ -757,66 +781,36 @@ impl RelayAwareHttpClient {
 
 type RelayPoolGuard = super::pool::HttpPoolLease;
 
-fn route_not_found(err: &HttpError) -> bool {
-    let (status, body) = match err {
-        HttpError::ServerError(status, body) => (*status, body.as_bytes()),
-        HttpError::ResponseError(status, body) => (*status, body.as_ref()),
-        _ => return false,
-    };
-    if status != 404 {
-        return false;
+fn response_error_parts(error: &HttpError) -> Option<(u16, &[u8])> {
+    match error {
+        HttpError::ServerError(status, body) => Some((*status, body.as_bytes())),
+        HttpError::ResponseError(status, body) => Some((*status, body.as_slice())),
+        _ => None,
     }
-    c2_error::C2Error::from_json_bytes(body).is_ok_and(|error| {
-        error.code == c2_error::ErrorCode::ResourceNotFound
-            && error
-                .details
-                .get("dispatch_phase")
-                .is_none_or(|phase| phase == "pre_dispatch")
-            && error
-                .details
-                .get("transport_phase")
-                .is_none_or(|phase| phase == "pre_dispatch")
-    })
 }
 
-fn terminal_route_refusal(err: &HttpError) -> bool {
-    let body = match err {
-        HttpError::ServerError(_, body) => body.as_bytes(),
-        HttpError::ResponseError(_, body) => body.as_ref(),
-        _ => return false,
-    };
-    c2_error::C2Error::from_json_bytes(body).is_ok_and(|error| {
-        matches!(
-            error.code,
-            c2_error::ErrorCode::RouteConflict
-                | c2_error::ErrorCode::ContractMismatch
-                | c2_error::ErrorCode::IdentityMismatch
-                | c2_error::ErrorCode::ProtocolViolation
-        )
-    })
+fn proven_control_refusal(error: &HttpError) -> Option<c2_error::C2Error> {
+    let (status, body) = response_error_parts(error)?;
+    crate::decode_control_error(status, body)
 }
 
-fn relay_rejection_is_pre_dispatch(error: &HttpError) -> bool {
-    let body = match error {
-        HttpError::ResponseError(404 | 406 | 409 | 410 | 413 | 429 | 502 | 503, body) => {
-            body.as_ref()
-        }
-        HttpError::ServerError(404 | 406 | 409 | 410 | 413 | 429 | 502 | 503, body) => {
-            body.as_bytes()
-        }
-        _ => return false,
-    };
-    c2_error::C2Error::from_json_bytes(body).is_ok_and(|error| {
-        error.code != c2_error::ErrorCode::Unknown
-            && error
-                .details
-                .get("dispatch_phase")
-                .is_some_and(|phase| phase == "pre_dispatch")
-            && error
-                .details
-                .get("transport_phase")
-                .is_none_or(|phase| phase == "pre_dispatch")
-    })
+fn route_not_found(error: &HttpError) -> bool {
+    proven_control_refusal(error)
+        .is_some_and(|error| error.code == c2_error::ErrorCode::ResourceNotFound)
+}
+
+fn terminal_route_refusal(error: &HttpError) -> bool {
+    use c2_error::ErrorCode::*;
+
+    response_error_parts(error)
+        .and_then(|(status, body)| crate::http_wire::matched_control_error(status, body))
+        .is_some_and(|error| match error.code {
+            RouteConflict | ContractMismatch | IdentityMismatch => true,
+            ProtocolViolation => {
+                error.details.get("stage").map(String::as_str) != Some("call_metadata_validation")
+            }
+            _ => false,
+        })
 }
 
 fn http_call_error_phase(error: &HttpError) -> HttpCallPhase {
@@ -830,9 +824,7 @@ fn http_call_error_phase(error: &HttpError) -> HttpCallPhase {
             HttpCallPhase::DispatchUncertain
         }
         HttpError::InvalidInput(_) | HttpError::LocalCallRejected(_) => HttpCallPhase::PreDispatch,
-        error if route_not_found(error) || relay_rejection_is_pre_dispatch(error) => {
-            HttpCallPhase::PreDispatch
-        }
+        error if proven_control_refusal(error).is_some() => HttpCallPhase::PreDispatch,
         _ => HttpCallPhase::DispatchUncertain,
     }
 }
@@ -1005,7 +997,7 @@ mod tests {
     use axum::{
         Json, Router,
         body::Bytes,
-        extract::{Path, State},
+        extract::{Path, Query, State},
         http::{HeaderMap, StatusCode},
         response::{IntoResponse, Response},
         routing::{get, post},
@@ -1040,7 +1032,7 @@ mod tests {
             Router::new()
                 .route("/_probe/{route}", get(|| async { StatusCode::OK }))
                 .route(
-                    "/{route}/{method}",
+                    crate::CALL_PATH,
                     post(move || {
                         let calls = Arc::clone(&business_calls);
                         async move {
@@ -1123,7 +1115,7 @@ mod tests {
                     }),
                 )
                 .route(
-                    "/{route}/{method}",
+                    crate::CALL_PATH,
                     post(move || {
                         let calls = Arc::clone(&call_count);
                         async move {
@@ -1366,13 +1358,8 @@ mod tests {
             HttpCallPhase::PreDispatch
         );
         let bytes = unsupported.to_string().into_bytes();
-        let budget = crate::payload::memory_only_budget(bytes.capacity() as u64);
-        let reservation = budget.try_reserve_memory(bytes.capacity() as u64).unwrap();
         assert_eq!(
-            http_call_error_phase(&HttpError::ResponseError(
-                406,
-                BudgetedBuffer::new(bytes, reservation)
-            )),
+            http_call_error_phase(&HttpError::ResponseError(406, bytes)),
             HttpCallPhase::PreDispatch
         );
         let mut unavailable =
@@ -1388,6 +1375,10 @@ mod tests {
         capacity_rejected["details"]["dispatch_phase"] = json!("pre_dispatch");
         assert_eq!(
             http_call_error_phase(&HttpError::ServerError(502, capacity_rejected.to_string())),
+            HttpCallPhase::DispatchUncertain
+        );
+        assert_eq!(
+            http_call_error_phase(&HttpError::ServerError(503, capacity_rejected.to_string())),
             HttpCallPhase::PreDispatch
         );
         assert_eq!(
@@ -1455,13 +1446,13 @@ mod tests {
 
     #[test]
     fn contract_identity_and_protocol_probe_refusals_are_terminal() {
-        for (code, name) in [
-            (709, "ContractMismatch"),
-            (710, "IdentityMismatch"),
-            (713, "ProtocolViolation"),
+        for (status, code, name) in [
+            (409, 709, "ContractMismatch"),
+            (409, 710, "IdentityMismatch"),
+            (502, 713, "ProtocolViolation"),
         ] {
             let refusal = HttpError::ServerError(
-                409,
+                status,
                 canonical_error_json(code, name, "route refused", "grid").to_string(),
             );
             assert!(terminal_route_refusal(&refusal));
@@ -1472,7 +1463,35 @@ mod tests {
         )));
     }
 
-    async fn not_found_call(Path((route, _method)): Path<(String, String)>) -> Response {
+    #[test]
+    fn admission_and_metadata_refusals_keep_the_selected_route_usable() {
+        for (status, code, name, stage) in [
+            (403, 724, "AdmissionDenied", None),
+            (
+                400,
+                713,
+                "ProtocolViolation",
+                Some("call_metadata_validation"),
+            ),
+        ] {
+            let mut body = canonical_error_json(code, name, "this call was refused", "grid");
+            body["details"]["dispatch_phase"] = json!("pre_dispatch");
+            if let Some(stage) = stage {
+                body["details"]["stage"] = json!(stage);
+            }
+            let error = HttpError::ResponseError(status, body.to_string().into_bytes());
+            assert_eq!(http_call_error_phase(&error), HttpCallPhase::PreDispatch);
+            assert!(!terminal_route_refusal(&error));
+            assert!(!route_not_found(&error));
+        }
+    }
+
+    #[derive(serde::Deserialize)]
+    struct CallQuery {
+        route: String,
+    }
+
+    async fn not_found_call(Query(CallQuery { route }): Query<CallQuery>) -> Response {
         let mut error = canonical_error_json(701, "ResourceNotFound", "route not found", &route);
         error["details"]["dispatch_phase"] = json!("pre_dispatch");
         (StatusCode::NOT_FOUND, Json(error)).into_response()
@@ -1491,7 +1510,7 @@ mod tests {
     }
 
     async fn dispatch_uncertain_unavailable(
-        Path((route, _method)): Path<(String, String)>,
+        Query(CallQuery { route }): Query<CallQuery>,
     ) -> Response {
         let mut error = canonical_error_json(
             702,
@@ -1526,7 +1545,7 @@ mod tests {
             .into_response()
     }
 
-    async fn stale_not_found(Path((route, _method)): Path<(String, String)>) -> Response {
+    async fn stale_not_found(Query(CallQuery { route }): Query<CallQuery>) -> Response {
         (
             StatusCode::NOT_FOUND,
             Json(canonical_error_json(
@@ -1543,7 +1562,7 @@ mod tests {
         (StatusCode::NOT_FOUND, "missing ResourceNotFound marker").into_response()
     }
 
-    async fn live_call(Path((_route, _method)): Path<(String, String)>, body: Bytes) -> Response {
+    async fn live_call(body: Bytes) -> Response {
         let mut out = b"ok:".to_vec();
         out.extend_from_slice(&body);
         (StatusCode::OK, out).into_response()
@@ -1663,7 +1682,7 @@ mod tests {
 
     async fn call_requires_expected_crm_headers(
         headers: HeaderMap,
-        Path((route, _method)): Path<(String, String)>,
+        Query(CallQuery { route }): Query<CallQuery>,
         body: Bytes,
     ) -> Response {
         if expected_crm_headers_match(&headers) && route_uid_header_absent(&headers) {
@@ -1705,13 +1724,13 @@ mod tests {
         let (missing_url, missing_handle) = spawn_app(
             Router::new()
                 .route("/_probe/{route}", get(|| async { StatusCode::OK }))
-                .route("/{route}/{method}", post(not_found_call)),
+                .route(crate::CALL_PATH, post(not_found_call)),
         )
         .await;
         let (live_url, live_handle) = spawn_app(
             Router::new()
                 .route("/_probe/{route}", get(|| async { StatusCode::OK }))
-                .route("/{route}/{method}", post(live_call)),
+                .route(crate::CALL_PATH, post(live_call)),
         )
         .await;
         let resolve_count = Arc::new(AtomicUsize::new(0));
@@ -1744,7 +1763,10 @@ mod tests {
         .unwrap();
         acquire_http(&client).await;
 
-        let error = client.call_async("step", b"payload").await.unwrap_err();
+        let error = client
+            .call_async("step", b"payload", &CallMetadata::empty())
+            .await
+            .unwrap_err();
         assert!(route_not_found(&error));
         assert_eq!(
             resolve_count.load(Ordering::SeqCst),
@@ -1753,7 +1775,10 @@ mod tests {
         );
         drop(error);
         acquire_http(&client).await;
-        let next = client.call_async("step", b"payload").await.unwrap();
+        let next = client
+            .call_async("step", b"payload", &CallMetadata::empty())
+            .await
+            .unwrap();
         assert_eq!(next, b"ok:payload");
         assert_eq!(
             resolve_count.load(Ordering::SeqCst),
@@ -1772,7 +1797,7 @@ mod tests {
         let (live_url, live_handle) = spawn_app(
             Router::new()
                 .route("/_probe/{route}", get(|| async { StatusCode::OK }))
-                .route("/{route}/{method}", post(live_call)),
+                .route(crate::CALL_PATH, post(live_call)),
         )
         .await;
         let resolve_count = Arc::new(AtomicUsize::new(0));
@@ -1808,7 +1833,10 @@ mod tests {
                 .map(|target| target.relay_url.as_str()),
             Some(live_url.as_str())
         );
-        let bytes = client.call_async("step", b"payload").await.unwrap();
+        let bytes = client
+            .call_async("step", b"payload", &CallMetadata::empty())
+            .await
+            .unwrap();
         assert_eq!(bytes, b"ok:payload");
 
         registry_handle.abort();
@@ -1872,7 +1900,7 @@ mod tests {
                         }
                     }),
                 )
-                .route("/{route}/{method}", post(live_call)),
+                .route(crate::CALL_PATH, post(live_call)),
         )
         .await;
         let expected_namespace = context.namespace_id().to_owned();
@@ -1928,7 +1956,10 @@ mod tests {
                 if !expect_ipc {
                     assert_eq!(target.as_url(), live_url);
                     assert_eq!(
-                        client.call_async("step", b"namespace").await.unwrap(),
+                        client
+                            .call_async("step", b"namespace", &CallMetadata::empty())
+                            .await
+                            .unwrap(),
                         b"ok:namespace"
                     );
                 }
@@ -2293,10 +2324,7 @@ mod tests {
         let (live_url, live_handle) = spawn_app(
             Router::new()
                 .route("/_probe/{route}", get(probe_requires_expected_crm_headers))
-                .route(
-                    "/{route}/{method}",
-                    post(call_requires_expected_crm_headers),
-                ),
+                .route(crate::CALL_PATH, post(call_requires_expected_crm_headers)),
         )
         .await;
         let resolve_count = Arc::new(AtomicUsize::new(0));
@@ -2324,7 +2352,10 @@ mod tests {
         .unwrap();
 
         client.connect_async().await.unwrap();
-        let bytes = client.call_async("step", b"payload").await.unwrap();
+        let bytes = client
+            .call_async("step", b"payload", &CallMetadata::empty())
+            .await
+            .unwrap();
         assert_eq!(bytes, b"ok:payload");
 
         registry_handle.abort();
@@ -2493,13 +2524,13 @@ mod tests {
         let (bad_url, bad_handle) = spawn_app(
             Router::new()
                 .route("/_probe/{route}", get(|| async { StatusCode::OK }))
-                .route("/{route}/{method}", post(generic_bad_gateway)),
+                .route(crate::CALL_PATH, post(generic_bad_gateway)),
         )
         .await;
         let (live_url, live_handle) = spawn_app(
             Router::new()
                 .route("/_probe/{route}", get(|| async { StatusCode::OK }))
-                .route("/{route}/{method}", post(live_call)),
+                .route(crate::CALL_PATH, post(live_call)),
         )
         .await;
         let resolve_count = Arc::new(AtomicUsize::new(0));
@@ -2527,7 +2558,10 @@ mod tests {
         .unwrap();
         acquire_http(&client).await;
 
-        let err = client.call_async("step", b"payload").await.unwrap_err();
+        let err = client
+            .call_async("step", b"payload", &CallMetadata::empty())
+            .await
+            .unwrap_err();
         assert!(matches!(err, HttpError::ResponseError(502, _)));
         assert_eq!(resolve_count.load(Ordering::SeqCst), 1);
 
@@ -2541,13 +2575,13 @@ mod tests {
         let (bad_url, bad_handle) = spawn_app(
             Router::new()
                 .route("/_probe/{route}", get(|| async { StatusCode::OK }))
-                .route("/{route}/{method}", post(misleading_bad_gateway)),
+                .route(crate::CALL_PATH, post(misleading_bad_gateway)),
         )
         .await;
         let (live_url, live_handle) = spawn_app(
             Router::new()
                 .route("/_probe/{route}", get(|| async { StatusCode::OK }))
-                .route("/{route}/{method}", post(live_call)),
+                .route(crate::CALL_PATH, post(live_call)),
         )
         .await;
         let resolve_count = Arc::new(AtomicUsize::new(0));
@@ -2575,7 +2609,10 @@ mod tests {
         .unwrap();
         acquire_http(&client).await;
 
-        let err = client.call_async("step", b"payload").await.unwrap_err();
+        let err = client
+            .call_async("step", b"payload", &CallMetadata::empty())
+            .await
+            .unwrap_err();
         assert!(matches!(err, HttpError::ResponseError(502, _)));
         assert_eq!(resolve_count.load(Ordering::SeqCst), 1);
 
@@ -2589,13 +2626,13 @@ mod tests {
         let (stale_url, stale_handle) = spawn_app(
             Router::new()
                 .route("/_probe/{route}", get(|| async { StatusCode::OK }))
-                .route("/{route}/{method}", post(stale_not_found)),
+                .route(crate::CALL_PATH, post(stale_not_found)),
         )
         .await;
         let (live_url, live_handle) = spawn_app(
             Router::new()
                 .route("/_probe/{route}", get(|| async { StatusCode::OK }))
-                .route("/{route}/{method}", post(live_call)),
+                .route(crate::CALL_PATH, post(live_call)),
         )
         .await;
         let resolve_count = Arc::new(AtomicUsize::new(0));
@@ -2623,7 +2660,10 @@ mod tests {
         .unwrap();
         acquire_http(&client).await;
 
-        let error = client.call_async("step", b"payload").await.unwrap_err();
+        let error = client
+            .call_async("step", b"payload", &CallMetadata::empty())
+            .await
+            .unwrap_err();
         assert!(route_not_found(&error));
         assert_eq!(
             resolve_count.load(Ordering::SeqCst),
@@ -2632,7 +2672,10 @@ mod tests {
         );
         drop(error);
         acquire_http(&client).await;
-        let next = client.call_async("step", b"payload").await.unwrap_err();
+        let next = client
+            .call_async("step", b"payload", &CallMetadata::empty())
+            .await
+            .unwrap_err();
         assert!(route_not_found(&next));
         assert_eq!(
             resolve_count.load(Ordering::SeqCst),
@@ -2646,14 +2689,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn old_relay_outcome_404_is_an_uncertain_protocol_failure() {
-        let (url, server) = spawn_app(
-            Router::new()
-                .route("/_probe/{route}", get(|| async { StatusCode::OK }))
-                .route("/{route}/{method}", post(live_call)),
-        )
-        .await;
-        // Model discovery pointing at an older relay with only two-segment calls.
+    async fn bare_business_404_is_dispatch_uncertain_for_every_call_mode() {
+        let (url, server) =
+            spawn_app(Router::new().route("/_probe/{route}", get(|| async { StatusCode::OK })))
+                .await;
         let state = RegistryState {
             stale_url: url.clone(),
             live_url: url,
@@ -2670,22 +2709,54 @@ mod tests {
                 .unwrap();
         acquire_http(&client).await;
         let control = HttpCallControl::new(|| Ok(()), || Ok(()));
-        let submit = client
-            .call_keyed_controlled_async("step", "key", Arc::new(b"input".to_vec()), &control)
+        let metadata = CallMetadata::empty();
+        let unary = client
+            .call_controlled_async("step", Arc::new(Vec::new()), &control, &metadata)
+            .await
+            .unwrap_err();
+        let keyed = client
+            .call_keyed_controlled_async("step", "key", Arc::new(Vec::new()), &control, &metadata)
             .await
             .unwrap_err();
         let recover = client
-            .recover_call_controlled_async("step", "key", &control)
+            .recover_call_controlled_async("step", "key", &control, &metadata)
             .await
             .unwrap_err();
-        let query = client.query_call_async("key").await.unwrap_err();
-        for error in [submit, recover, query] {
+        let query = client.query_call_async("key", &metadata).await.unwrap_err();
+        let budget = crate::payload::memory_only_budget(64);
+        let stream = client
+            .stream_controlled_async(
+                "step",
+                Arc::new(Vec::new()),
+                budget.try_reserve_memory(16).unwrap(),
+                Box::new(()),
+                HttpStreamCancellation::new(),
+                &control,
+                &metadata,
+            )
+            .await
+            .err()
+            .expect("bare 404 must fail stream open");
+        let subscription = client
+            .subscribe_controlled_async(
+                "state",
+                c2_wire::rpc::WireSubscribeOptions::default(),
+                Box::new(()),
+                HttpStreamCancellation::new(),
+                &control,
+                &metadata,
+            )
+            .await
+            .err()
+            .expect("bare 404 must fail subscription open");
+        for error in [unary, keyed, recover, query, stream, subscription] {
             assert_eq!(error.phase(), HttpCallPhase::DispatchUncertain);
             assert!(!route_not_found(error.source_error()));
             assert!(!terminal_route_refusal(error.source_error()));
-            assert!(
-                matches!(error.into_source(), HttpError::Transport(message) if message.contains("HTTP 404"))
-            );
+            assert!(matches!(
+                error.source_error(),
+                HttpError::ResponseError(404, _)
+            ));
         }
         registry_task.abort();
         server.abort();
@@ -2696,13 +2767,13 @@ mod tests {
         let (bad_url, bad_handle) = spawn_app(
             Router::new()
                 .route("/_probe/{route}", get(|| async { StatusCode::OK }))
-                .route("/{route}/{method}", post(generic_not_found)),
+                .route(crate::CALL_PATH, post(generic_not_found)),
         )
         .await;
         let (live_url, live_handle) = spawn_app(
             Router::new()
                 .route("/_probe/{route}", get(|| async { StatusCode::OK }))
-                .route("/{route}/{method}", post(live_call)),
+                .route(crate::CALL_PATH, post(live_call)),
         )
         .await;
         let resolve_count = Arc::new(AtomicUsize::new(0));
@@ -2730,7 +2801,10 @@ mod tests {
         .unwrap();
         acquire_http(&client).await;
 
-        let err = client.call_async("step", b"payload").await.unwrap_err();
+        let err = client
+            .call_async("step", b"payload", &CallMetadata::empty())
+            .await
+            .unwrap_err();
         assert!(matches!(err, HttpError::ResponseError(404, _)));
         assert_eq!(resolve_count.load(Ordering::SeqCst), 1);
 
@@ -2744,13 +2818,13 @@ mod tests {
         let (bad_url, bad_handle) = spawn_app(
             Router::new()
                 .route("/_probe/{route}", get(|| async { StatusCode::OK }))
-                .route("/{route}/{method}", post(transient_unavailable)),
+                .route(crate::CALL_PATH, post(transient_unavailable)),
         )
         .await;
         let (live_url, live_handle) = spawn_app(
             Router::new()
                 .route("/_probe/{route}", get(|| async { StatusCode::OK }))
-                .route("/{route}/{method}", post(live_call)),
+                .route(crate::CALL_PATH, post(live_call)),
         )
         .await;
         let resolve_count = Arc::new(AtomicUsize::new(0));
@@ -2778,7 +2852,10 @@ mod tests {
         .unwrap();
         acquire_http(&client).await;
 
-        let err = client.call_async("step", b"payload").await.unwrap_err();
+        let err = client
+            .call_async("step", b"payload", &CallMetadata::empty())
+            .await
+            .unwrap_err();
         assert!(matches!(err, HttpError::ResponseError(503, _)));
         assert_eq!(
             resolve_count.load(Ordering::SeqCst),
@@ -2796,13 +2873,13 @@ mod tests {
         let (bad_url, bad_handle) = spawn_app(
             Router::new()
                 .route("/_probe/{route}", get(|| async { StatusCode::OK }))
-                .route("/{route}/{method}", post(dispatch_uncertain_unavailable)),
+                .route(crate::CALL_PATH, post(dispatch_uncertain_unavailable)),
         )
         .await;
         let (live_url, live_handle) = spawn_app(
             Router::new()
                 .route("/_probe/{route}", get(|| async { StatusCode::OK }))
-                .route("/{route}/{method}", post(live_call)),
+                .route(crate::CALL_PATH, post(live_call)),
         )
         .await;
         let resolve_count = Arc::new(AtomicUsize::new(0));
@@ -2835,6 +2912,7 @@ mod tests {
                 "step",
                 Arc::new(b"payload".to_vec()),
                 &HttpCallControl::new(|| Ok(()), || Ok(())),
+                &CallMetadata::empty(),
             )
             .await
             .expect_err("dispatch-uncertain relay failure");
@@ -2949,7 +3027,9 @@ mod tests {
                     request.push(bounded(socket.read_u8()).await.unwrap());
                 }
                 let request = String::from_utf8(request).unwrap().to_ascii_lowercase();
-                assert!(request.starts_with("post /grid/step http/1.1\r\n"));
+                assert!(
+                    request.starts_with("post /_c2/calls/call?route=grid&method=step http/1.1\r\n")
+                );
                 assert!(request.contains("content-length: 0\r\n"));
                 assert!(request.contains(&format!("accept: {}\r\n", stream_wire::MEDIA_TYPE)));
                 let framing = match declared {
@@ -3050,6 +3130,7 @@ mod tests {
                 Box::new(retention.reserve_operation().unwrap()),
                 HttpStreamCancellation::new(),
                 &control,
+                &CallMetadata::empty(),
             ))
             .await
             .unwrap();
@@ -3113,6 +3194,7 @@ mod tests {
                 Box::new(retention.reserve_operation().unwrap()),
                 HttpStreamCancellation::new(),
                 &control,
+                &CallMetadata::empty(),
             ))
             .await
             .unwrap();
@@ -3171,6 +3253,7 @@ mod tests {
                 Box::new(retention.reserve_operation().unwrap()),
                 HttpStreamCancellation::new(),
                 &control,
+                &CallMetadata::empty(),
             ))
             .await
             .unwrap();
@@ -3224,10 +3307,7 @@ mod tests {
     #[test]
     fn http_call_error_phase_rejects_contradictory_404_and_array_envelopes() {
         fn response_error(status: u16, body: &[u8]) -> HttpError {
-            let bytes = body.to_vec();
-            let budget = crate::payload::memory_only_budget(bytes.capacity().max(1) as u64);
-            let reservation = budget.try_reserve_memory(bytes.capacity() as u64).unwrap();
-            HttpError::ResponseError(status, BudgetedBuffer::new(bytes, reservation))
+            HttpError::ResponseError(status, body.to_vec())
         }
 
         let ok_404 = response_error(

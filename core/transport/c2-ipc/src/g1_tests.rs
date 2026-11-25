@@ -1,4 +1,5 @@
 use super::*;
+use crate::tests::EMPTY_METADATA;
 
 #[tokio::test]
 async fn close_preserves_started_chunked_upload_and_reply() {
@@ -49,6 +50,7 @@ async fn close_preserves_started_chunked_upload_and_reply() {
                     3 * CHUNK_SIZE as usize,
                     DEFAULT_MAX_PAYLOAD_SIZE,
                     chunks,
+                    &EMPTY_METADATA,
                 )
                 .await
         }
@@ -58,7 +60,7 @@ async fn close_preserves_started_chunked_upload_and_reply() {
     assert!(!client.close_shared_bounded(Duration::from_millis(20)).await);
     assert!(!caller.is_finished());
     let error = client
-        .call_inline(&identity(), 0, b"new")
+        .call_inline(&identity(), 0, b"new", &EMPTY_METADATA)
         .await
         .unwrap_err();
     assert_eq!(error.phase(), crate::TransportPhase::PreDispatch);
@@ -99,12 +101,16 @@ async fn deactivation_wakes_calls_waiting_for_full_writer_queue() {
     *conn.pause.lock() = Some((entered, resumed));
     let first = tokio::spawn({
         let client = client.clone();
-        async move { client.call_inline(&identity(), 0, b"first").await }
+        async move {
+            client
+                .call_inline(&identity(), 0, b"first", &EMPTY_METADATA)
+                .await
+        }
     });
     paused.await.unwrap();
     let id = identity();
     let mut waiting = (0..66)
-        .map(|_| Box::pin(client.call_inline(&id, 0, b"queued")))
+        .map(|_| Box::pin(client.call_inline(&id, 0, b"queued", &EMPTY_METADATA)))
         .collect::<Vec<_>>();
     for call in &mut waiting {
         assert!(futures_util::poll!(call.as_mut()).is_pending());
@@ -152,7 +158,12 @@ async fn physical_end_releases_peer_mappings_with_retained_client() {
     let binding = client.acquire_route(&contract()).await.unwrap();
     let peer = client.server_pool.lock().clone().unwrap();
     let held = client
-        .call_bound(&binding, "echo", &[9; SHM_THRESHOLD as usize + 1])
+        .call_bound(
+            &binding,
+            "echo",
+            &[9; SHM_THRESHOLD as usize + 1],
+            &EMPTY_METADATA,
+        )
         .await
         .unwrap()
         .into_owned_bytes()

@@ -2,7 +2,7 @@
 
 C3 **0.8.0** accompanies C-Two **0.12.x**, sharing its IPC 17, SHM 4, C/FFI ABI 9, relay mesh 7, Unix namespace format 3 and endpoint maintenance behavior. See the [0.12.0 release notes](../docs/releases/0.12.0.md).
 
-Current source builds use IPC 18 and C/FFI ABI 10. `c3 relay` forwards keyed unary submission, recovery and outcome queries over the fixed HTTP endpoints defined in [ADR 0006](../docs/decisions/0006-post-dispatch-outcome-and-dedup.md).
+Current source builds use IPC 18, C/FFI ABI 10 and relay mesh 8. `c3 relay` forwards keyed unary submission, recovery and outcome queries over the fixed HTTP endpoints defined in [ADR 0007](../docs/decisions/0007-call-metadata-and-admission-hooks.md).
 
 Python does not own CLI behavior; do not add command behavior under `sdk/python/src/c_two`. `cli/` contains the Rust crate for `c3`, the native C-Two command-line interface. It starts relay servers and inspects relay registry state for C-Two deployments.
 
@@ -143,7 +143,7 @@ The relay evicts unreferenced upstream IPC connections after 60 seconds without 
 
 When running normally, `c3 relay` installs a Ctrl+C handler and stops the relay cleanly on interrupt.
 
-`c3 relay` also serves resource-owned topic subscriptions ([ADR 0005](../docs/decisions/0005-publish-subscribe.md)). Each local route's declared topics become available at `POST /{route_name}/_topics/{topic_name}` with the versioned topic media type. The relay opens one shared upstream IPC subscription per registration and topic and fans out a single budgeted copy to all downstream HTTP subscribers, including across two-tier cross-relay hops. Ctrl+C ends forwarded subscriptions with `CallCancelled` naming relay shutdown after the frame each subscriber already selected. See [relay topic forwarding](../docs/reference/contracts-and-routing.md#relay-topic-forwarding).
+`c3 relay` also serves resource-owned topic subscriptions ([ADR 0005](../docs/decisions/0005-publish-subscribe.md)). Each local route's declared topics become available at `POST /_c2/topics/subscribe?route=<pct>&topic=<pct>` with `application/vnd.c-two.topic-stream;version=2`. The relay opens one shared upstream IPC subscription per registration and topic and fans out a single budgeted copy to all downstream HTTP subscribers, including across two-tier cross-relay hops. Ctrl+C ends forwarded subscriptions with `CallCancelled` naming relay shutdown after the frame each subscriber already selected. See [relay topic forwarding](../docs/reference/contracts-and-routing.md#relay-topic-forwarding).
 
 ## Local endpoint maintenance
 

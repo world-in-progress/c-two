@@ -123,6 +123,9 @@ pub const CAP_SHM_REQUEST: u16 = 1 << 3;
 /// lease or lazy-opening a mapping.
 pub const CAP_SHM_RESPONSE: u16 = 1 << 4;
 
+/// The Host has an admission hook. This capability is advertised in server ACKs.
+pub const CAP_ADMISSION_HOOK: u16 = 1 << 5;
+
 // ── Safety limits ────────────────────────────────────────────────────────
 
 pub const MAX_ROUTES: usize = 64;
@@ -273,7 +276,11 @@ pub fn decode_handshake(buf: &[u8], response: bool) -> Result<Handshake, DecodeE
     let capability_flags = read_u16(buf, off);
     off += 2;
 
-    if capability_flags & !(CAP_SHM_REQUEST | CAP_SHM_RESPONSE) != 0 {
+    let mut allowed_caps = CAP_SHM_REQUEST | CAP_SHM_RESPONSE;
+    if response {
+        allowed_caps |= CAP_ADMISSION_HOOK;
+    }
+    if capability_flags & !allowed_caps != 0 {
         return Err(DecodeError::InvalidValue {
             field: "capability flags",
             value: capability_flags.into(),

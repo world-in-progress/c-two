@@ -59,7 +59,12 @@ fn generated_mixed_rust_service_runs_unary_and_server_stream_calls() {
     let output = Command::new(env!("CARGO"))
         .args(["run", "--quiet", "--offline"])
         .current_dir(temp.path())
-        .env("CARGO_TARGET_DIR", repository.join("core/target"))
+        .env(
+            "CARGO_TARGET_DIR",
+            std::env::var_os("CARGO_TARGET_DIR")
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|| repository.join("core/target")),
+        )
         .output()
         .expect("run generated Rust stream consumer");
     assert!(
@@ -180,7 +185,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         c_two::Connect::DirectIpc { address: runtime.server_address().unwrap() },
     )?)?;
 
-    client.method_0_ping()?;
+    let client = client.with_call_options(c_two::CallOptions::new().with_metadata_entry("source", "stream")?);
+    client.method_0_ping_with_call_id("ping-1")?;
+    client.recover_method_0_ping("ping-1")?;
 
     let mut states = client.method_2_states()?;
     assert_eq!(text(&states.next().unwrap()?), "state");

@@ -1,4 +1,5 @@
 use super::*;
+use crate::tests::EMPTY_METADATA;
 
 // Normal closure carries its reason before transport EOF, without an ACK wait.
 #[tokio::test]
@@ -82,7 +83,12 @@ async fn assert_closed_backing_released(explicit_close: bool) {
     let binding = client.acquire_route(&contract()).await.unwrap();
     assert_eq!(
         client
-            .call_bound(&binding, "echo", &[5; SHM_THRESHOLD as usize + 1])
+            .call_bound(
+                &binding,
+                "echo",
+                &[5; SHM_THRESHOLD as usize + 1],
+                &EMPTY_METADATA
+            )
             .await
             .unwrap()
             .into_owned_bytes()
@@ -158,6 +164,7 @@ async fn dropped_receive_task_preserves_first_cause_and_waits_only_for_remote_re
         pending.clone(),
         abort,
         retirement.clone(),
+        false,
         c2_config::WRITE_TIMEOUT,
     );
     let (_loan, pool, budget) = publish_file_loan(&conn, endpoint._root.path());
@@ -327,7 +334,12 @@ async fn bounded_close_is_honest_while_peer_stops_reading_a_started_frame() {
         let client = client.clone();
         async move {
             client
-                .call_inline(&identity(), 0, &vec![0x5b; 16 * 1024 * 1024])
+                .call_inline(
+                    &identity(),
+                    0,
+                    &vec![0x5b; 16 * 1024 * 1024],
+                    &EMPTY_METADATA,
+                )
                 .await
         }
     });
@@ -374,7 +386,7 @@ async fn idle_client_backing_can_retire_and_recreate_a_new_generation() {
         block.write_at(0, &[9; 8193]).unwrap();
         assert_eq!(
             client
-                .call_with_prealloc(&binding.table.call_identity(), 0, &block)
+                .call_with_prealloc(&binding.table.call_identity(), 0, &block, &EMPTY_METADATA)
                 .await
                 .unwrap()
                 .into_owned_bytes()
@@ -455,7 +467,11 @@ async fn published_shm_loan_and_budget_survive_cancellation_close_and_client_dro
             let client = Arc::new(client);
             let caller = tokio::spawn({
                 let client = client.clone();
-                async move { client.call_with_prealloc(&identity(), 0, &block).await }
+                async move {
+                    client
+                        .call_with_prealloc(&identity(), 0, &block, &EMPTY_METADATA)
+                        .await
+                }
             });
             published.await.unwrap();
             caller.abort();
@@ -506,7 +522,7 @@ async fn prepared_request_owners_fill_primary_pool_and_remain_budgeted_after_clo
     let last = blocks.pop().unwrap();
     for (index, block) in blocks.into_iter().enumerate() {
         let bytes = client
-            .call_with_prealloc(&binding.table.call_identity(), 0, &block)
+            .call_with_prealloc(&binding.table.call_identity(), 0, &block, &EMPTY_METADATA)
             .await
             .unwrap()
             .into_owned_bytes()
@@ -514,7 +530,7 @@ async fn prepared_request_owners_fill_primary_pool_and_remain_budgeted_after_clo
         assert_eq!(bytes, vec![index as u8; seg_size]);
     }
     let bytes = client
-        .call_with_prealloc(&binding.table.call_identity(), 0, &last)
+        .call_with_prealloc(&binding.table.call_identity(), 0, &last, &EMPTY_METADATA)
         .await
         .unwrap()
         .into_owned_bytes()
@@ -650,7 +666,7 @@ async fn owned_response_copies_reach_peer_segment_index_16_without_held_transpor
     let mut held_copies = Vec::new();
     for index in 0..17 {
         let response = client
-            .call_inline(&identity(), 0, b"response slot")
+            .call_inline(&identity(), 0, b"response slot", &EMPTY_METADATA)
             .await
             .unwrap();
         assert!(matches!(response, ResponseData::Inline(_)));
@@ -743,6 +759,7 @@ async fn admitted_response_error_never_enters_the_buddy_request_fallback() {
             None,
             DEFAULT_MAX_PAYLOAD_SIZE,
             None,
+            &EMPTY_METADATA,
         )
         .await
         .unwrap_err();
@@ -778,6 +795,7 @@ async fn disabled_buddy_chunked_request_reassembles_into_real_dedicated_shm() {
             None,
             DEFAULT_MAX_PAYLOAD_SIZE,
             None,
+            &EMPTY_METADATA,
         )
         .await
         .unwrap()
@@ -819,7 +837,7 @@ async fn disabled_buddy_response_exhaustion_falls_back_to_dedicated_chunk_reasse
     let binding = client.acquire_route(&contract()).await.unwrap();
     assert_eq!(
         client
-            .call_inline(&binding.table.call_identity(), 0, b"large")
+            .call_inline(&binding.table.call_identity(), 0, b"large", &EMPTY_METADATA)
             .await
             .unwrap()
             .into_owned_bytes()
@@ -848,7 +866,7 @@ async fn real_lazy_startup_sends_one_byte_without_mapping_buddy_backing() {
     assert_eq!(client.request_pool().unwrap().read().segment_count(), 0);
     assert_eq!(
         client
-            .call_bound(&binding, "echo", b"x")
+            .call_bound(&binding, "echo", b"x", &EMPTY_METADATA)
             .await
             .unwrap()
             .into_owned_bytes()
@@ -901,8 +919,8 @@ async fn exhausted_reassembly_budget_returns_correlated_error_and_keeps_controls
     let identity = binding.table.call_identity();
     let (rejected, other) = timeout(WAIT, async {
         tokio::join!(
-            client.call_inline(&identity, 0, b"large"),
-            client.call_bound(&binding, "echo", b"other")
+            client.call_inline(&identity, 0, b"large", &EMPTY_METADATA),
+            client.call_bound(&binding, "echo", b"other", &EMPTY_METADATA)
         )
     })
     .await
@@ -926,7 +944,7 @@ async fn exhausted_reassembly_budget_returns_correlated_error_and_keeps_controls
     client.acquire_route(&contract()).await.unwrap();
     assert_eq!(
         client
-            .call_bound(&binding, "echo", b"x")
+            .call_bound(&binding, "echo", b"x", &EMPTY_METADATA)
             .await
             .unwrap()
             .into_owned_bytes()
@@ -973,6 +991,7 @@ async fn exhausted_request_reassembly_budget_returns_correlated_error_and_keeps_
             None,
             DEFAULT_MAX_PAYLOAD_SIZE,
             None,
+            &EMPTY_METADATA,
         ),
     )
     .await
@@ -988,7 +1007,7 @@ async fn exhausted_request_reassembly_budget_returns_correlated_error_and_keeps_
     client.acquire_route(&contract()).await.unwrap();
     assert_eq!(
         client
-            .call_bound(&binding, "echo", b"x")
+            .call_bound(&binding, "echo", b"x", &EMPTY_METADATA)
             .await
             .unwrap()
             .into_owned_bytes()

@@ -25,7 +25,7 @@ use tracing::{debug, info, warn};
 /// platform segment-name derivation.
 static RESPONSE_POOL_GEN: AtomicU64 = AtomicU64::new(0);
 
-use c2_config::{DomainLimits, MAX_HANDSHAKE_FRAME_BYTES, MAX_RPC_FRAME_BYTES};
+use c2_config::{CallMetadata, DomainLimits, MAX_HANDSHAKE_FRAME_BYTES, MAX_RPC_FRAME_BYTES};
 use c2_error::{C2Error, ErrorCode};
 use c2_mem::{DomainBudget, MemPool, MemoryReservation, OperationPermit};
 use c2_wire::buddy::BuddyPayload;
@@ -35,8 +35,8 @@ use c2_wire::flags::{FLAG_CTRL, FLAG_HANDSHAKE, FLAG_RESPONSE, FLAG_SIGNAL};
 use c2_wire::frame::{self, decode_frame_body, encode_frame};
 pub use c2_wire::handshake::ServerIdentity;
 use c2_wire::handshake::{
-    CAP_SHM_REQUEST, CAP_SHM_RESPONSE, HANDSHAKE_VERSION, MAX_ROUTES, MethodEntry, RouteInfo,
-    VERSION_PREAMBLE_BODY_LEN, VersionPreambleKind, decode_handshake,
+    CAP_ADMISSION_HOOK, CAP_SHM_REQUEST, CAP_SHM_RESPONSE, HANDSHAKE_VERSION, MAX_ROUTES,
+    MethodEntry, RouteInfo, VERSION_PREAMBLE_BODY_LEN, VersionPreambleKind, decode_handshake,
     decode_version_preamble_payload, encode_server_handshake, encode_version_preamble,
     validate_version_preamble_header,
 };
@@ -66,6 +66,7 @@ use crate::dispatcher::{
     BuiltRoute, CrmCallback, CrmError, CrmRoute, CrmStreamCallback, Dispatcher, PeerShmRequest,
     PreparedShmResponse, RequestData, ResponseMeta, RouteBuildSpec,
 };
+use crate::hook::{AdmissionHook, AdmissionOperation, CallContext, enter_call_context};
 use crate::outcome::{
     AdmitOutcome, ExecutionAdmission, OutcomeDelivery, OutcomeDigest, OutcomeResponse, WaiterKind,
     WaiterResolution, conflict_error, revoked_error,
@@ -76,6 +77,9 @@ use crate::scheduler::{
     SchedulerPendingPermit, SchedulerSnapshot, StreamCancelCause,
 };
 use crate::writer::ConnectionWriter;
+
+#[path = "ipc_admission.rs"]
+pub(crate) mod ipc_admission;
 
 const FRAME_FIXED_BODY_LEN: u32 = 12;
 const SHUTDOWN_INITIATE_FRAME_BODY_LEN: u32 =
@@ -317,6 +321,9 @@ pub struct Server {
     /// Per-connection control-reply slot budget `Q_ctrl = clamp(N, 1, 64)`.
     control_reply_capacity: usize,
     query_replies: Arc<Semaphore>,
+    admission_hook: Option<Arc<dyn AdmissionHook>>,
+    admission_permits: Arc<Semaphore>,
+    active_admissions: ipc_admission::ActiveAdmissions,
     active_connections: parking_lot::Mutex<HashMap<u64, Arc<Connection>>>,
     active_connections_notify: Notify,
     shutdown_route_outcomes: parking_lot::Mutex<Vec<ServerRouteCloseOutcome>>,
@@ -602,6 +609,9 @@ impl Server {
             copy_scheduler: Arc::new(CopyScheduler::new()),
             control_reply_capacity,
             query_replies: Arc::new(Semaphore::new(control_reply_capacity)),
+            admission_hook: None,
+            admission_permits: Arc::new(Semaphore::new(derivation.admission_permits)),
+            active_admissions: ipc_admission::ActiveAdmissions::default(),
             active_connections: parking_lot::Mutex::new(HashMap::new()),
             active_connections_notify: Notify::new(),
             shutdown_route_outcomes: parking_lot::Mutex::new(Vec::new()),
@@ -610,6 +620,24 @@ impl Server {
             execution_scheduler,
             outcome_store,
         })
+    }
+
+    /// Configure admission before sharing or running the server.
+    pub fn with_admission_hook(mut self, hook: Arc<dyn AdmissionHook>) -> Self {
+        assert!(
+            !self.run_entered.load(Ordering::Acquire),
+            "server already ran"
+        );
+        self.admission_hook = Some(hook);
+        self
+    }
+
+    pub fn has_admission_hook(&self) -> bool {
+        self.admission_hook.is_some()
+    }
+
+    pub fn admission_hook(&self) -> Option<Arc<dyn AdmissionHook>> {
+        self.admission_hook.clone()
     }
 
     /// Install a source prepared/subscribed by Core before server construction.
@@ -664,6 +692,7 @@ impl Server {
             }
             routes
         };
+        self.active_admissions.wait_idle().await;
         let outcomes = Self::wait_routes_drained(routes.clone(), closed_reason).await;
         for route in &routes {
             route.scheduler.close();
@@ -698,10 +727,11 @@ impl Server {
         loop {
             let notified = self.active_connections_notify.notified();
             if self.active_connections.lock().is_empty() {
-                return;
+                break;
             }
             notified.await;
         }
+        self.active_admissions.wait_idle().await;
     }
 
     /// Read-only count of native connections still owned by this server.
@@ -776,7 +806,7 @@ impl Server {
 
     pub fn build_stream_route(
         &self,
-        mut spec: RouteBuildSpec,
+        spec: RouteBuildSpec,
         callback: Arc<dyn CrmStreamCallback>,
         descriptor: &c2_contract::ValidatedContractDescriptor,
     ) -> Result<BuiltRoute, ServerError> {
@@ -825,10 +855,11 @@ impl Server {
                 "route access map differs from validated stream descriptor".into(),
             ));
         }
-        spec.access_map = access_map;
+        // The scheduler uses the validated descriptor. Keep the supplied
+        // declarations in the route for admission, including Write defaults.
         let scheduler = Scheduler::with_admission(
             spec.concurrency_mode,
-            spec.access_map.clone(),
+            access_map,
             spec.limits,
             Arc::clone(&self.admission),
         );
@@ -1131,7 +1162,7 @@ impl Server {
         name: &str,
         expected_topics: Option<&Arc<crate::topic::RouteTopics>>,
     ) -> bool {
-        let route = {
+        let (route, cancellations) = {
             let _guard = self.route_registration.lock().await;
             let dispatcher = self.dispatcher.write();
             let route = dispatcher.resolve(name).filter(|route| {
@@ -1142,23 +1173,31 @@ impl Server {
                         .is_some_and(|topics| Arc::ptr_eq(topics, expected))
                 })
             });
-            if let Some(route) = &route {
+            let cancellations = if let Some(route) = &route {
                 route
                     .scheduler
                     .close_and_cancel_local_streams(StreamCancelCause::Unregister);
                 if let Some(topics) = &route.topics {
                     topics.close(crate::topic::TopicCloseCause::RouteUnregistered);
                 }
-                self.cancel_route_streams(Some(&route.route_uid), StreamCancelCause::Unregister);
-            }
+                self.mark_route_streams_cancelled(
+                    Some(&route.route_uid),
+                    StreamCancelCause::Unregister,
+                )
+            } else {
+                Vec::new()
+            };
             if route.is_none()
                 && let Some(topics) = expected_topics
             {
                 // A stale registration can only seal its own topics.
                 topics.close(crate::topic::TopicCloseCause::RouteUnregistered);
             }
-            route
+            (route, cancellations)
         };
+        for cancellation in cancellations {
+            cancellation.finish();
+        }
         if let Some(route) = route {
             self.refuse_partial_keyed_calls(&route.route_uid).await;
             route.scheduler.wait_drained_async().await;
@@ -1196,16 +1235,20 @@ impl Server {
         names: &[String],
         closed_reason: &str,
     ) -> Vec<ServerRouteCloseOutcome> {
-        let routes = {
+        let (routes, cancellations) = {
             let _guard = self.route_registration.lock().await;
             let dispatcher = self.dispatcher.write();
             let mut seen = HashSet::new();
-            names
+            let mut cancellations = Vec::new();
+            let routes = names
                 .iter()
                 .filter(|name| seen.insert(name.as_str()))
                 .filter_map(|name| dispatcher.resolve(name))
                 .inspect(|route| {
-                    self.cancel_route_streams(Some(&route.route_uid), StreamCancelCause::Shutdown);
+                    cancellations.extend(self.mark_route_streams_cancelled(
+                        Some(&route.route_uid),
+                        StreamCancelCause::Shutdown,
+                    ));
                     route
                         .scheduler
                         .close_and_cancel_local_streams(StreamCancelCause::Shutdown);
@@ -1213,8 +1256,12 @@ impl Server {
                         topics.close(crate::topic::TopicCloseCause::HostShutdown);
                     }
                 })
-                .collect::<Vec<_>>()
+                .collect::<Vec<_>>();
+            (routes, cancellations)
         };
+        for cancellation in cancellations {
+            cancellation.finish();
+        }
         for route in &routes {
             self.refuse_partial_keyed_calls(&route.route_uid).await;
         }
@@ -1670,6 +1717,9 @@ impl Server {
                             }).collect::<Vec<_>>();
                             let writer = conn.rpc_writer.lock().as_ref().and_then(std::sync::Weak::upgrade);
                             if let Some(writer) = writer {
+                                if gc_server.has_admission_hook() {
+                                    expire_pending_admissions(&conn, &writer, tokio::time::Instant::now());
+                                }
                                 for id in expired {
                                     queue_rejection(&writer, id, &error_wire(ErrorCode::ResourceUnavailable, "input assembly timed out; request was not executed")).await;
                                 }
@@ -1896,8 +1946,11 @@ impl Server {
         self.admission.notify.notify_waiters();
         drop(registration);
         // IPC stream publication holds the read side of this same boundary.
-        self.cancel_route_streams(None, StreamCancelCause::Shutdown);
+        let cancellations = self.mark_route_streams_cancelled(None, StreamCancelCause::Shutdown);
         drop(publication);
+        for cancellation in cancellations {
+            cancellation.finish();
+        }
         match self.lifecycle_state() {
             ServerLifecycleState::Starting | ServerLifecycleState::Ready => {
                 self.set_lifecycle_state(ServerLifecycleState::Stopping);
@@ -1953,7 +2006,12 @@ impl Server {
         }
     }
 
-    fn cancel_route_streams(&self, route_uid: Option<&str>, cause: StreamCancelCause) {
+    fn mark_route_streams_cancelled(
+        &self,
+        route_uid: Option<&str>,
+        cause: StreamCancelCause,
+    ) -> Vec<StreamCancellation> {
+        let mut cancellations = Vec::new();
         let connections = self
             .active_connections
             .lock()
@@ -1969,11 +2027,14 @@ impl Server {
                     .lock()
                     .as_ref()
                     .is_some_and(|stream| route_uid.is_none_or(|uid| stream.route_uid == uid));
-                if matches {
-                    submit_stream_cancel(&conn, id, &call, cause);
+                if matches
+                    && let Some(cancellation) = mark_stream_cancelled(&conn, id, &call, cause)
+                {
+                    cancellations.push(cancellation);
                 }
             }
         }
+        cancellations
     }
 }
 
@@ -2747,6 +2808,9 @@ async fn handle_handshake(
     if negotiated_shm_response {
         cap |= CAP_SHM_RESPONSE;
     }
+    if server.has_admission_hook() {
+        cap |= CAP_ADMISSION_HOOK;
+    }
     let hs_bytes = encode_server_handshake(cap, &routes, &server_prefix, server.identity())
         .map_err(|error| ServerError::Protocol(error.to_string()))?;
     let frame = encode_frame(request_id, FLAG_HANDSHAKE | FLAG_RESPONSE, &hs_bytes);
@@ -3021,6 +3085,7 @@ struct RouteExecutionAdmission {
 #[derive(Default)]
 pub(crate) struct ServerCall {
     input: CallMutex<Option<ServerInput>>,
+    pending_admission: CallMutex<Option<ipc_admission::PendingAdmission>>,
     admission: CallMutex<Option<ChunkRouteAdmission>>,
     cancel_waiter: CallMutex<Option<tokio::sync::oneshot::Sender<()>>>,
     start_gate: CallMutex<()>,
@@ -3035,44 +3100,39 @@ struct StreamCallControl {
     route_uid: String,
     cancellation: Option<StreamCancelCause>,
     topic_channel: Option<Arc<crate::topic::TopicChannel>>,
+    topic_route: Option<Arc<CrmRoute>>,
     sync_reply_failed: bool,
 }
 
-fn submit_stream_cancel(
-    conn: &Connection,
+struct StreamCancellation {
+    conn: Arc<Connection>,
     id: u64,
-    call: &c2_wire::connection::calls::CallRecord<ServerCall>,
     cause: StreamCancelCause,
-) {
-    let _start = call.data.start_gate.lock();
-    {
-        let mut stream = call.data.stream.lock();
-        let Some(stream) = stream.as_mut() else {
-            return;
-        };
-        stream.cancellation.get_or_insert(cause);
-    }
-    // Only a consumer's CANCEL discards its pending item. Host lifecycle
-    // cancellation keeps CREDIT live until the current item has been sent.
-    if cause == StreamCancelCause::Consumer {
-        if let Err(error) = conn.core.stream_cancel(id) {
-            warn!(request_id=id, %error, "invalid stream cancel");
-            conn.end(ConnectionEndReason::ProtocolError, "stream_cancel");
-            return;
-        }
-    }
-    let writer = conn
-        .rpc_writer
-        .lock()
-        .as_ref()
-        .and_then(std::sync::Weak::upgrade);
-    if let Some(writer) = writer {
-        if let Some(claim) = claim_terminal(&writer, id, CallStatus::NotExecuted) {
+    call: Arc<c2_wire::connection::calls::CallRecord<ServerCall>>,
+}
+
+impl StreamCancellation {
+    // Dropping staged or admitted context can run user destructors. The
+    // publication fence and the resource-entry lock are already released.
+    fn finish(self) {
+        let Self {
+            conn,
+            id,
+            cause,
+            call,
+        } = self;
+        let _claim = finish_terminal_claim(&conn, id, CallStatus::NotExecuted, call);
+        let writer = conn
+            .rpc_writer
+            .lock()
+            .as_ref()
+            .and_then(std::sync::Weak::upgrade);
+        if let Some(writer) = writer {
             let error = error_wire(ErrorCode::CallCancelled, cause.message());
             let frame = rpc::encode_call_end_frame(
                 id,
                 CallMode::ServerStream,
-                claim.status,
+                CallStatus::NotExecuted,
                 0,
                 ValuePart::whole(ValueStorage::Inline(&error)),
             )
@@ -3082,8 +3142,56 @@ fn submit_stream_cancel(
             }
         }
     }
-    conn.writer_wake.notify_waiters();
 }
+
+fn submit_stream_cancel(
+    conn: &Arc<Connection>,
+    id: u64,
+    call: &c2_wire::connection::calls::CallRecord<ServerCall>,
+    cause: StreamCancelCause,
+) {
+    if let Some(cancellation) = mark_stream_cancelled(conn, id, call, cause) {
+        cancellation.finish();
+    }
+}
+
+fn mark_stream_cancelled(
+    conn: &Arc<Connection>,
+    id: u64,
+    call: &c2_wire::connection::calls::CallRecord<ServerCall>,
+    cause: StreamCancelCause,
+) -> Option<StreamCancellation> {
+    let _start = call.data.start_gate.lock();
+    let mut calls = conn.calls.lock();
+    if calls.get(id).is_none() {
+        return None;
+    }
+    {
+        let mut stream = call.data.stream.lock();
+        let stream = stream.as_mut()?;
+        stream.cancellation.get_or_insert(cause);
+    }
+    // Only a consumer's CANCEL discards its pending item. Host lifecycle
+    // cancellation keeps CREDIT live until the current item has been sent.
+    if cause == StreamCancelCause::Consumer
+        && let Err(error) = conn.core.stream_cancel(id)
+    {
+        warn!(request_id=id, %error, "invalid stream cancel");
+        drop(calls);
+        conn.end(ConnectionEndReason::ProtocolError, "stream_cancel");
+        return None;
+    }
+    conn.writer_wake.notify_waiters();
+    call.reject_before_execution()?;
+    let call = calls.retire(id)?;
+    Some(StreamCancellation {
+        conn: conn.clone(),
+        id,
+        cause,
+        call,
+    })
+}
+
 struct ServerInput {
     receive: ValueReceive,
     queue_key: (u64, u64),
@@ -3327,6 +3435,7 @@ impl Drop for KeyedCall {
 pub(crate) struct ChunkRouteAdmission {
     route: Arc<CrmRoute>,
     method_idx: u16,
+    context: Option<CallContext>,
     // Revoke the pending outcome before releasing the route drain credential.
     keyed: Option<KeyedCall>,
     pending_permit: Option<SchedulerPendingPermit>,
@@ -3344,8 +3453,11 @@ pub(crate) fn retire_connection_calls(conn: &Connection) {
         }
         std::mem::take(&mut *calls)
     };
+    conn.admission_queue.lock().clear();
     for (id, call) in calls.active() {
         conn.core.stream_retire(id);
+        let pending = call.data.pending_admission.lock().take();
+        drop(pending);
         let input = call.data.input.lock().take();
         let admission = call.data.admission.lock().take();
         drop(input);
@@ -3372,14 +3484,27 @@ fn release_request_storage(conn: &Arc<Connection>, value: ValueStorage<'_>) {
 /// but whose active record is not inserted. No call record exists to claim,
 /// and late continuations of this ID are dropped by the high-water mark.
 async fn queue_open_refusal(writer: &Arc<ConnectionWriter>, request_id: u64, error: &C2Error) {
-    write_error_record(
-        writer,
-        request_id,
-        CallStatus::NotExecuted,
-        &rpc::bounded_call_end_error_bytes(error),
-        true,
-    )
-    .await;
+    let bytes = rpc::bounded_call_end_error_bytes(error);
+    if error.code == ErrorCode::ProtocolViolation
+        && error
+            .details
+            .get("stage")
+            .is_some_and(|stage| stage == "call_metadata_validation")
+    {
+        let frame = rpc::encode_call_end_frame(
+            request_id,
+            CallMode::Unary,
+            CallStatus::NotExecuted,
+            0,
+            ValuePart::whole(ValueStorage::Inline(&bytes)),
+        )
+        .expect("bounded canonical refusal");
+        if let Err(error) = writer.queue_recoverable_refusal(frame).await {
+            warn!(request_id, %error, "failed to queue metadata refusal");
+        }
+    } else {
+        write_error_record(writer, request_id, CallStatus::NotExecuted, &bytes, true).await;
+    }
 }
 
 /// Enqueue one frame into a request's pending-copy queue and re-ready the
@@ -3422,7 +3547,8 @@ async fn handle_rpc_record(
     // Identity history is advanced before any route, capacity or storage
     // refusal; the active record is inserted only after admission completes.
     let new_query = payload.first() == Some(&(RpcRecordKind::QueryCall as u8));
-    let (mark_advanced, duplicate) = if new_open || new_query {
+    let new_admit_topic = payload.first() == Some(&(RpcRecordKind::AdmitTopic as u8));
+    let (mark_advanced, duplicate) = if new_open || new_query || new_admit_topic {
         match conn.calls.lock().advance_open(id) {
             Ok(()) => (new_open, false),
             Err(_) => (false, true),
@@ -3467,6 +3593,32 @@ async fn handle_rpc_record(
         Err(failure) => {
             if let Some(descriptor) = failure.carrier {
                 drop(request_storage(conn, ValueStorage::Shm(descriptor)));
+            }
+            if !duplicate
+                && failure.error.is_call_metadata_validation()
+                && (header.flags & c2_wire::flags::FLAG_BUDDY == 0 || failure.carrier.is_some())
+                && (new_open || new_query || new_admit_topic)
+            {
+                let error = C2Error::new(ErrorCode::ProtocolViolation, failure.error.to_string())
+                    .with_details([("stage".into(), "call_metadata_validation".into())].into());
+                if new_open {
+                    queue_open_refusal(writer, id, &error).await;
+                } else {
+                    let frame = if new_query {
+                        rpc::encode_query_call_result_frame(
+                            id,
+                            &rpc::WireQueryCallResult::Error(error),
+                        )
+                    } else {
+                        rpc::encode_admit_topic_result_frame(
+                            id,
+                            &rpc::WireAdmitTopicResult::Error(error),
+                        )
+                    };
+                    let permit = server.query_replies.clone().try_acquire_owned().ok();
+                    ipc_admission::reply(writer, id, frame, permit).await;
+                }
+                return;
             }
             if failure.error == frame::DecodeError::ZeroLoanId
                 || matches!(
@@ -3582,46 +3734,133 @@ async fn handle_rpc_record(
             mode,
             call_id,
             value,
-        } => match call_id {
-            None => {
-                handle_open_record(server, conn, writer, id, identity, method_idx, mode, value)
-                    .await;
-            }
-            Some(call_id) if mode == CallMode::KeyedUnary => {
+            metadata,
+        } => {
+            if server.has_admission_hook() {
+                let operation = ipc_admission::OpenOperation::Call {
+                    method: method_idx,
+                    mode,
+                    call_id,
+                };
+                ipc_admission::open(
+                    server,
+                    conn,
+                    writer,
+                    id,
+                    identity,
+                    operation,
+                    metadata,
+                    Some(value),
+                )
+                .await;
+            } else if let Some(call_id) = call_id {
                 handle_keyed_open_record(
-                    server, conn, writer, id, identity, method_idx, call_id, value,
+                    server, conn, writer, id, identity, method_idx, call_id, value, metadata,
+                )
+                .await;
+            } else {
+                handle_open_record(
+                    server, conn, writer, id, identity, method_idx, mode, value, metadata,
                 )
                 .await;
             }
-            Some(_) => {
-                release_request_storage(conn, value.storage);
-                conn.end(
-                    ConnectionEndReason::ProtocolError,
-                    "call_id_on_unkeyed_mode",
-                );
-            }
-        },
+        }
         RpcRecord::OpenRecover {
             identity,
             method_idx,
             call_id,
+            metadata,
         } => {
-            handle_open_recover_record(server, conn, writer, id, identity, method_idx, call_id)
+            if server.has_admission_hook() {
+                let operation = ipc_admission::OpenOperation::Recover {
+                    method: method_idx,
+                    call_id,
+                };
+                ipc_admission::open(
+                    server, conn, writer, id, identity, operation, metadata, None,
+                )
                 .await;
+            } else {
+                handle_open_recover_record(server, conn, writer, id, identity, method_idx, call_id)
+                    .await;
+            }
         }
-        RpcRecord::QueryCall { identity, call_id } => {
-            handle_query_call(server, writer, id, identity, call_id).await;
+        RpcRecord::QueryCall {
+            identity,
+            call_id,
+            metadata,
+        } => {
+            let operation = ipc_admission::ControlOperation::Query { identity, call_id };
+            ipc_admission::control(server, conn, writer, id, operation, metadata).await;
+        }
+        RpcRecord::AdmitTopic {
+            subscription_stream_id,
+            metadata,
+        } => {
+            let operation = ipc_admission::ControlOperation::AdmitTopic {
+                subscription_id: subscription_stream_id,
+            };
+            ipc_admission::control(server, conn, writer, id, operation, metadata).await;
         }
         RpcRecord::OpenSubscribe {
             identity,
             topic_name,
             options,
+            metadata,
         } => {
-            handle_open_subscribe_record(server, conn, writer, id, identity, topic_name, options)
+            if server.has_admission_hook() {
+                let operation = ipc_admission::OpenOperation::Subscribe {
+                    topic: topic_name,
+                    options,
+                };
+                ipc_admission::open(
+                    server, conn, writer, id, identity, operation, metadata, None,
+                )
                 .await;
+            } else {
+                handle_open_subscribe_record(
+                    server, conn, writer, id, identity, topic_name, options,
+                )
+                .await;
+            }
         }
         RpcRecord::OpenContinuation { value } => {
-            let lookup = conn.calls.lock().continuation(id);
+            let lookup = {
+                let mut calls = conn.calls.lock();
+                let lookup = calls.continuation(id);
+                let staged = match &lookup {
+                    CallLookup::Active(call) if server.has_admission_hook() => {
+                        let mut pending = call.data.pending_admission.lock();
+                        pending.as_mut().map(|pending| {
+                            ipc_admission::stage_continuation(pending, server, conn, value.storage)
+                        })
+                    }
+                    _ => None,
+                };
+                match staged {
+                    Some(Ok(())) => return,
+                    Some(Err(error)) => {
+                        let CallLookup::Active(call) = lookup else {
+                            unreachable!("staged continuation")
+                        };
+                        let claim = call
+                            .reject_before_execution()
+                            .and_then(|status| calls.retire(id).map(|call| (status, call)));
+                        Err((error, claim))
+                    }
+                    None => Ok(lookup),
+                }
+            };
+            let lookup = match lookup {
+                Ok(lookup) => lookup,
+                Err((error, claim)) => {
+                    if let Some((status, call)) = claim {
+                        let claim = finish_terminal_claim(conn, id, status, call);
+                        ipc_admission::write_refusal(writer, id, claim, &error);
+                    }
+                    return;
+                }
+            };
             let call = match lookup {
                 CallLookup::Retired => {
                     release_request_storage(conn, value.storage);
@@ -3655,7 +3894,9 @@ async fn handle_rpc_record(
                 Ok(next) => next,
                 Err(error) => {
                     release_request_storage(conn, value.storage);
-                    if !queue_input_error(writer, id, error.into()).await {
+                    if !queue_input_error(writer, id, error.into()).await
+                        && conn.calls.lock().get(id).is_some()
+                    {
                         conn.end(
                             ConnectionEndReason::ProtocolError,
                             "unexpected_input_continuation",
@@ -3830,6 +4071,7 @@ async fn handle_open_subscribe_record(
                                                     route_uid: route.route_uid.clone(),
                                                     cancellation: None,
                                                     sync_reply_failed: false,
+                                                    topic_route: Some(route.clone()),
                                                     topic_channel: Some(Arc::clone(
                                                         &attach.channel,
                                                     )),
@@ -3892,6 +4134,7 @@ async fn handle_open_record(
     method_idx: u16,
     mode: CallMode,
     value: rpc::ValuePart<'_>,
+    metadata: CallMetadata,
 ) {
     let flight = crate::connection::FlightGuard::new(conn);
     if conn.is_deactivated() || conn.shutdown_requested() {
@@ -3967,8 +4210,10 @@ async fn handle_open_record(
             return;
         }
     };
+    let context = rpc_call_context(&route.route, method_idx, None, metadata, None);
     let admission = ChunkRouteAdmission {
         route: route.route,
+        context: Some(context),
         method_idx,
         pending_permit: Some(route.pending_permit),
         keyed: None,
@@ -4283,6 +4528,7 @@ async fn handle_keyed_open_record(
     method_idx: u16,
     call_id: String,
     value: rpc::ValuePart<'_>,
+    metadata: CallMetadata,
 ) {
     let flight = crate::connection::FlightGuard::new(conn);
     if conn.is_deactivated() || conn.shutdown_requested() {
@@ -4323,8 +4569,18 @@ async fn handle_keyed_open_record(
             AdmitOutcome::Hit { generation } => (generation, KeyedRole::Duplicate),
             AdmitOutcome::Miss { generation } => (generation, KeyedRole::Original),
         };
+        let context = (role == KeyedRole::Original).then(|| {
+            rpc_call_context(
+                &route,
+                method_idx,
+                Some(call_id.to_string()),
+                metadata,
+                None,
+            )
+        });
         let admission = ChunkRouteAdmission {
             route,
+            context,
             method_idx,
             keyed: Some(KeyedCall {
                 store: Arc::clone(&server.outcome_store),
@@ -4524,52 +4780,6 @@ async fn deliver_keyed_outcome(
 /// route pending permits, bounded only by this connection's control-reply
 /// budget. Budget exhaustion answers a bounded `717` without deactivating
 /// the physical connection.
-async fn handle_query_call(
-    server: &Arc<Server>,
-    writer: &Arc<ConnectionWriter>,
-    id: u64,
-    identity: RouteCallIdentity,
-    call_id: String,
-) {
-    let permit = Arc::clone(&server.query_replies).try_acquire_owned();
-    let result = if permit.is_ok() {
-        let dispatcher = server.dispatcher.read();
-        match resolve_route_contract(&dispatcher, &identity).and_then(|route| {
-            validate_live_route(&route)?;
-            Ok(route)
-        }) {
-            Ok(route) => {
-                let route_uid: Arc<str> = Arc::from(route.route_uid.as_str());
-                rpc::WireQueryCallResult::Outcome(server.outcome_store.query(
-                    &route_uid,
-                    &call_id,
-                    |method_idx| route.method_names.get(method_idx as usize).cloned(),
-                ))
-            }
-            Err(error) => rpc::WireQueryCallResult::Error(route_admission_error(error)),
-        }
-    } else {
-        rpc::WireQueryCallResult::Error(C2Error::new(
-            ErrorCode::CallCapacityExceeded,
-            "query control reply budget exhausted; retry the query later",
-        ))
-    };
-    let frame = match rpc::encode_query_call_result_frame(id, &result) {
-        Ok(frame) => frame,
-        Err(error) => {
-            warn!(request_id = id, %error, "failed to encode query result");
-            return;
-        }
-    };
-    let queued = match permit {
-        Ok(permit) => writer.queue_query_reply(frame, permit),
-        Err(_) => writer.queue_query_overflow(frame).await,
-    };
-    if let Err(error) = queued {
-        warn!(request_id = id, %error, "query reply admission failed");
-    }
-}
-
 /// Insert the active call record once admission completed, carrying the
 /// operation permit and, for stream calls, the publication control.
 fn insert_admitted_call(
@@ -4588,6 +4798,7 @@ fn insert_admitted_call(
             route_uid: admission.route.route_uid.clone(),
             cancellation: None,
             topic_channel: None,
+            topic_route: None,
             sync_reply_failed: false,
         });
     }
@@ -4960,6 +5171,7 @@ async fn dispatch_complete_call(
     let name = admission.route.name.clone();
     let method_idx = admission.method_idx;
     let response_pool = server.response_pool.clone();
+    let context = admission.context.take().expect("unary call context");
     let result = execute_route_request(
         server.execution_scheduler.clone(),
         admission
@@ -4970,7 +5182,10 @@ async fn dispatch_complete_call(
         request_id,
         input,
         &server.domain_budget,
-        move |request| callback.invoke_recycled(&name, method_idx, request, response_pool),
+        move |request| {
+            let _context = enter_call_context(context);
+            callback.invoke_recycled(&name, method_idx, request, response_pool)
+        },
     )
     .await;
     send_route_execution_result(server, conn, writer, request_id, result).await;
@@ -4998,6 +5213,10 @@ async fn dispatch_keyed_original(
         .take()
         .expect("original keyed call holds its route permit");
     let _flight = admission._flight.take();
+    let context = admission
+        .context
+        .take()
+        .expect("original keyed call context");
     drop(admission);
     match execute_keyed_request(
         server,
@@ -5006,7 +5225,10 @@ async fn dispatch_keyed_original(
         request_id,
         input,
         keyed,
-        move |request| callback.invoke_recycled(&name, method_idx, request, callback_pool),
+        move |request| {
+            let _context = enter_call_context(context);
+            callback.invoke_recycled(&name, method_idx, request, callback_pool)
+        },
     )
     .await
     {
@@ -5283,6 +5505,27 @@ fn seal_keyed_response(
     }
 }
 
+fn rpc_call_context(
+    route: &CrmRoute,
+    method_idx: u16,
+    call_id: Option<String>,
+    metadata: CallMetadata,
+    extension: Option<Arc<dyn std::any::Any + Send + Sync>>,
+) -> CallContext {
+    let operation = match route.method_modes[method_idx as usize] {
+        CallMode::ServerStream => AdmissionOperation::ServerStream,
+        _ => AdmissionOperation::Unary,
+    };
+    CallContext::new(
+        route.name.clone(),
+        route.method_names[method_idx as usize].clone(),
+        operation,
+        call_id,
+        metadata,
+        extension,
+    )
+}
+
 fn callback_error(error: CrmError) -> C2Error {
     let error = match error {
         CrmError::UserError(bytes) => C2Error::from_wire_bytes(&bytes)
@@ -5298,15 +5541,19 @@ fn callback_error(error: CrmError) -> C2Error {
             C2Error::new(ErrorCode::ResourceFunctionExecuting, message)
         }
     };
-    if error.code.is_outcome_control() {
+    if error.code.is_host_control() {
         return C2Error::new(
             ErrorCode::ResourceFunctionExecuting,
             "resource returned an outcome control error",
         )
-        .with_details(std::collections::BTreeMap::from([(
-            "cause".into(),
-            format!("{}: {}", u16::from(error.code), error.message),
-        )]));
+        .with_details(std::collections::BTreeMap::from([
+            (
+                "cause".into(),
+                format!("{}: {}", u16::from(error.code), error.message),
+            ),
+            ("cause_code".into(), u16::from(error.code).to_string()),
+            ("cause_message".into(), error.message),
+        ]));
     }
     error
 }
@@ -5744,6 +5991,7 @@ fn response_write_error(context: &str, error: std::io::Error) -> ResponseSendErr
 
 struct TerminalClaim {
     status: CallStatus,
+    _flight: Option<crate::connection::FlightGuard>,
     _call: Arc<c2_wire::connection::calls::CallRecord<ServerCall>>,
 }
 
@@ -5774,19 +6022,38 @@ fn claim_outcome_terminal(
         };
         (status, calls.retire(id)?)
     };
+    Some(finish_terminal_claim(&writer.conn, id, status, retired))
+}
+
+fn finish_terminal_claim(
+    conn: &Connection,
+    id: u64,
+    status: CallStatus,
+    retired: Arc<c2_wire::connection::calls::CallRecord<ServerCall>>,
+) -> TerminalClaim {
     let call = &retired;
+    let pending = call.data.pending_admission.lock().take();
+    let mut flight = pending.map(|pending| {
+        conn.admission_queue.lock().remove(id);
+        pending.flight
+    });
     // Retire storage outside the table lock. Copy tokens retain actual owners.
     let input = call.data.input.lock().take();
-    let admission = call.data.admission.lock().take();
+    let mut admission = call.data.admission.lock().take();
+    if let Some(admission) = &mut admission {
+        debug_assert!(flight.is_none());
+        flight = admission._flight.take();
+    }
     drop(input);
     drop(admission);
     let cancel = call.data.cancel_waiter.lock().take();
     drop(cancel);
-    writer.conn.core.stream_retire(id);
-    Some(TerminalClaim {
+    conn.core.stream_retire(id);
+    TerminalClaim {
         status,
+        _flight: flight,
         _call: retired,
-    })
+    }
 }
 
 /// Transport one replayed keyed response to one connection: SHM-capable
@@ -6168,3 +6435,38 @@ mod stream;
 
 #[path = "subscribe.rs"]
 mod subscribe;
+
+fn expire_pending_admissions(
+    conn: &Connection,
+    writer: &Arc<ConnectionWriter>,
+    now: tokio::time::Instant,
+) {
+    let retired = {
+        let mut calls = conn.calls.lock();
+        let expired: Vec<_> = calls
+            .active()
+            .filter_map(|(id, call)| {
+                (ipc_admission::expired(&call, now) && call.reject_before_execution().is_some())
+                    .then_some(id)
+            })
+            .collect();
+        expired
+            .into_iter()
+            .filter_map(|id| calls.retire(id).map(|call| (id, call)))
+            .collect::<Vec<_>>()
+    };
+    if !retired.is_empty() {
+        let error = C2Error::new(
+            ErrorCode::ResourceUnavailable,
+            "input assembly timed out; request was not executed",
+        );
+        for (id, call) in retired {
+            let claim = finish_terminal_claim(conn, id, CallStatus::NotExecuted, call);
+            ipc_admission::write_refusal(writer, id, claim, &error);
+        }
+    }
+}
+
+#[cfg(test)]
+#[path = "ipc_admission_tests.rs"]
+mod ipc_admission_tests;

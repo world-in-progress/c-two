@@ -1,11 +1,11 @@
-//! Real IPC 16 server-stream regressions. Each test owns its endpoint namespace.
+//! Real IPC 18 server-stream regressions. Each test owns its endpoint namespace.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::Duration;
 
-use c2_config::LocalEndpointContext;
+use c2_config::{CallMetadata, LocalEndpointContext};
 use c2_contract::{ExpectedRouteContract, ValidatedContractDescriptor};
 use c2_error::ErrorCode;
 use c2_ipc::{IpcClient, IpcResponseStream, RouteBinding, StreamTerminal};
@@ -14,6 +14,8 @@ use c2_server::{
     ResponseMeta, ResponsePool, RouteBuildSpec, SchedulerLimits, Server, ServerIpcConfig,
 };
 use c2_wire::rpc::CallStatus;
+
+static EMPTY_METADATA: CallMetadata = CallMetadata::empty();
 
 const WAIT: Duration = Duration::from_secs(5);
 #[path = "server_streams/forward.rs"]
@@ -156,6 +158,7 @@ struct Harness {
     client: Arc<IpcClient>,
     binding: RouteBinding,
     observed: Arc<Observed>,
+    publisher: c2_server::topic::TopicPublisher,
 }
 
 impl Harness {
@@ -175,6 +178,14 @@ impl Harness {
         config: ServerIpcConfig,
         executor: Option<&tokio::runtime::Handle>,
     ) -> Self {
+        Self::start_with_admission(config, executor, None).await
+    }
+
+    async fn start_with_admission(
+        config: ServerIpcConfig,
+        executor: Option<&tokio::runtime::Handle>,
+        hook: Option<Arc<dyn c2_server::AdmissionHook>>,
+    ) -> Self {
         let descriptor = ValidatedContractDescriptor::from_json(DESCRIPTOR).unwrap();
         static NEXT_ADDRESS: AtomicUsize = AtomicUsize::new(0);
         let address = format!(
@@ -192,7 +203,11 @@ impl Harness {
         #[cfg(windows)]
         let context = LocalEndpointContext::default_for_platform().unwrap();
         let endpoint = context.endpoint(&address).unwrap();
-        let server = Arc::new(Server::new_with_endpoint(endpoint.clone(), config).unwrap());
+        let server = Server::new_with_endpoint(endpoint.clone(), config).unwrap();
+        let server = Arc::new(match hook {
+            Some(hook) => server.with_admission_hook(hook),
+            None => server,
+        });
         let observed = Arc::new(Observed::default());
         let built = server
             .build_stream_route(
@@ -212,7 +227,15 @@ impl Harness {
                 &descriptor,
             )
             .unwrap();
-        let reservation = server.reserve_route(built).await.unwrap();
+        let topics = server.create_route_topics(
+            expected_contract(),
+            &[("latest".into(), c2_server::topic::TopicConfig::default())].into(),
+        );
+        let publisher = topics.publisher("latest").unwrap();
+        let reservation = server
+            .reserve_route(built.with_topics(topics))
+            .await
+            .unwrap();
         server.commit_reserved_route(reservation).await.unwrap();
         server.begin_start_attempt().unwrap();
         let serving = {
@@ -244,6 +267,7 @@ impl Harness {
             client,
             binding,
             observed,
+            publisher,
         }
     }
 
@@ -256,7 +280,7 @@ impl Harness {
     async fn unary(&self) {
         let reply = self
             .client
-            .call_bound(&self.binding, "ping", b"")
+            .call_bound(&self.binding, "ping", b"", &EMPTY_METADATA)
             .await
             .unwrap();
         assert_eq!(reply.into_owned_bytes().unwrap(), b"pong");
@@ -280,7 +304,13 @@ fn server_executor_teardown_reports_peer_end_as_dispatch_uncertain() {
                 .await;
         let mut stream = fixture
             .client
-            .stream_bound(&fixture.binding, "echo", &[6], memory_budget(1024))
+            .stream_bound(
+                &fixture.binding,
+                "echo",
+                &[6],
+                memory_budget(1024),
+                &EMPTY_METADATA,
+            )
             .await
             .unwrap();
         wait_for_steps(&fixture.observed, 2).await;
@@ -350,7 +380,13 @@ async fn zero_one_and_multiple_items_have_exact_terminal_counts() {
     for count in [0_u8, 1, 4] {
         let mut stream = fixture
             .client
-            .stream_bound(&fixture.binding, "echo", &[count], memory_budget(1024))
+            .stream_bound(
+                &fixture.binding,
+                "echo",
+                &[count],
+                memory_budget(1024),
+                &EMPTY_METADATA,
+            )
             .await
             .unwrap();
         for expected in 0..count {
@@ -375,7 +411,13 @@ async fn zero_length_items_need_no_storage_credit_but_keep_demand_and_counts() {
     let budget = memory_budget(0);
     let mut stream = fixture
         .client
-        .stream_bound(&fixture.binding, "echo", &[3, 0, 0], budget.clone())
+        .stream_bound(
+            &fixture.binding,
+            "echo",
+            &[3, 0, 0],
+            budget.clone(),
+            &EMPTY_METADATA,
+        )
         .await
         .unwrap();
     for _ in 0..3 {
@@ -405,7 +447,13 @@ async fn resource_and_cleanup_errors_follow_only_complete_items() {
     for failure in [1_u8, 2] {
         let mut stream = fixture
             .client
-            .stream_bound(&fixture.binding, "echo", &[2, failure], memory_budget(1024))
+            .stream_bound(
+                &fixture.binding,
+                "echo",
+                &[2, failure],
+                memory_budget(1024),
+                &EMPTY_METADATA,
+            )
             .await
             .unwrap();
         for expected in 0..2_u8 {
@@ -439,7 +487,13 @@ async fn waiting_resource_step_does_not_hold_an_execution_worker() {
         streams.push(
             fixture
                 .client
-                .stream_bound(&fixture.binding, "echo", &[10], memory_budget(1024))
+                .stream_bound(
+                    &fixture.binding,
+                    "echo",
+                    &[10],
+                    memory_budget(1024),
+                    &EMPTY_METADATA,
+                )
                 .await
                 .unwrap(),
         );
@@ -485,7 +539,13 @@ async fn cancel_during_running_step_waits_for_step_and_cleanup_once() {
     *fixture.observed.release_step.lock().unwrap() = Some(release_rx);
     let stream = fixture
         .client
-        .stream_bound(&fixture.binding, "echo", &[10], memory_budget(1024))
+        .stream_bound(
+            &fixture.binding,
+            "echo",
+            &[10],
+            memory_budget(1024),
+            &EMPTY_METADATA,
+        )
         .await
         .unwrap();
     wait_for_signal(entered_rx).await;
@@ -512,7 +572,13 @@ async fn local_delivery_grants_one_step_ahead_without_waiting_for_recv() {
     let fixture = Harness::start(1).await;
     let mut stream = fixture
         .client
-        .stream_bound(&fixture.binding, "echo", &[6], memory_budget(1024))
+        .stream_bound(
+            &fixture.binding,
+            "echo",
+            &[6],
+            memory_budget(1024),
+            &EMPTY_METADATA,
+        )
         .await
         .unwrap();
     wait_for_steps(&fixture.observed, 2).await;
@@ -554,7 +620,13 @@ async fn budget_wait_preserves_other_calls_and_resumes_after_a_local_copy_drops(
     let budget = memory_budget(16);
     let mut stream = fixture
         .client
-        .stream_bound(&fixture.binding, "echo", &[4], budget.clone())
+        .stream_bound(
+            &fixture.binding,
+            "echo",
+            &[4],
+            budget.clone(),
+            &EMPTY_METADATA,
+        )
         .await
         .unwrap();
     let first = stream.recv().await.unwrap().unwrap();
@@ -596,7 +668,13 @@ async fn cancel_while_second_item_waits_for_budget_does_not_wait_for_the_held_co
     let budget = memory_budget(8);
     let mut stream = fixture
         .client
-        .stream_bound(&fixture.binding, "echo", &[4], budget.clone())
+        .stream_bound(
+            &fixture.binding,
+            "echo",
+            &[4],
+            budget.clone(),
+            &EMPTY_METADATA,
+        )
         .await
         .unwrap();
     let first = stream.recv().await.unwrap().unwrap();
@@ -626,9 +704,13 @@ async fn item_larger_than_entire_budget_fails_locally_and_keeps_call_until_clean
     *fixture.observed.release_finish.lock().unwrap() = Some(release_rx);
     let mut stream = tokio::time::timeout(
         WAIT,
-        fixture
-            .client
-            .stream_bound(&fixture.binding, "echo", &[3, 0, 9], memory_budget(8)),
+        fixture.client.stream_bound(
+            &fixture.binding,
+            "echo",
+            &[3, 0, 9],
+            memory_budget(8),
+            &EMPTY_METADATA,
+        ),
     )
     .await
     .expect("stream OPEN did not submit")
@@ -667,11 +749,21 @@ async fn cancel_before_first_resource_step_is_not_executed() {
     *fixture.observed.release_unary.lock().unwrap() = Some(release_rx);
     let client = fixture.client.clone();
     let binding = fixture.binding.clone();
-    let unary = tokio::spawn(async move { client.call_bound(&binding, "ping", b"").await });
+    let unary = tokio::spawn(async move {
+        client
+            .call_bound(&binding, "ping", b"", &EMPTY_METADATA)
+            .await
+    });
     wait_for_signal(entered_rx).await;
     let stream = fixture
         .client
-        .stream_bound(&fixture.binding, "echo", &[3], memory_budget(1024))
+        .stream_bound(
+            &fixture.binding,
+            "echo",
+            &[3],
+            memory_budget(1024),
+            &EMPTY_METADATA,
+        )
         .await
         .unwrap();
     stream.cancel().unwrap();
@@ -695,7 +787,13 @@ async fn late_cancel_does_not_rewrite_successful_terminal() {
     let fixture = Harness::start(1).await;
     let stream = fixture
         .client
-        .stream_bound(&fixture.binding, "echo", &[0], memory_budget(1024))
+        .stream_bound(
+            &fixture.binding,
+            "echo",
+            &[0],
+            memory_budget(1024),
+            &EMPTY_METADATA,
+        )
         .await
         .unwrap();
     let terminal = observed_terminal(&stream).await;
@@ -717,7 +815,13 @@ async fn removed_route_returns_decodable_not_executed_to_old_stream_binding() {
     assert!(fixture.server.unregister_route("portable").await);
     let result = fixture
         .client
-        .stream_bound(&fixture.binding, "echo", &[1], memory_budget(1024))
+        .stream_bound(
+            &fixture.binding,
+            "echo",
+            &[1],
+            memory_budget(1024),
+            &EMPTY_METADATA,
+        )
         .await;
     match result {
         Ok(stream) => {
@@ -770,7 +874,13 @@ async fn changed_contract_returns_decodable_not_executed_to_old_stream_binding()
 
     let result = fixture
         .client
-        .stream_bound(&fixture.binding, "echo", &[1], memory_budget(1024))
+        .stream_bound(
+            &fixture.binding,
+            "echo",
+            &[1],
+            memory_budget(1024),
+            &EMPTY_METADATA,
+        )
         .await;
     match result {
         Ok(stream) => {
@@ -810,6 +920,7 @@ async fn deactivation_preserves_admitted_stream_and_local_copy_after_shm_receive
             "echo",
             &[3, 0, size_lo, size_hi],
             budget.clone(),
+            &EMPTY_METADATA,
         )
         .await
         .unwrap();
@@ -851,7 +962,13 @@ async fn fragmented_inline_and_shm_items_reuse_the_same_local_buffer() {
         .unwrap();
     let mut stream = fixture
         .client
-        .stream_bound(&fixture.binding, "echo", &request, budget.clone())
+        .stream_bound(
+            &fixture.binding,
+            "echo",
+            &request,
+            budget.clone(),
+            &EMPTY_METADATA,
+        )
         .await
         .unwrap();
     let item = tokio::time::timeout(WAIT, stream.recv())
@@ -870,7 +987,13 @@ async fn fragmented_inline_and_shm_items_reuse_the_same_local_buffer() {
 
     let mut stream = fixture
         .client
-        .stream_bound(&fixture.binding, "echo", &request, budget.clone())
+        .stream_bound(
+            &fixture.binding,
+            "echo",
+            &request,
+            budget.clone(),
+            &EMPTY_METADATA,
+        )
         .await
         .unwrap();
     let item = tokio::time::timeout(WAIT, stream.recv())

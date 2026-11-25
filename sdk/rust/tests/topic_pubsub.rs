@@ -278,7 +278,7 @@ fn remote_decode_deadline_preserves_the_original_topic_subscription() {
     let subscribe = || {
         Subscription::from_core(
             client
-                .subscribe_with_options("state", SubscribeOptions::default(), options)
+                .subscribe_with_options("state", SubscribeOptions::default(), options.clone())
                 .unwrap(),
             slow_decode,
             slow_decode_held,
@@ -472,8 +472,8 @@ const CONSUMER: &str = r##"
 
 use c_two::generated::ErrorCode;
 use c_two::{
-    CallOutcomeStatus, CallTimeout, Connect, Error, Held, HostOptions, LagPolicy, Runtime,
-    RuntimeOptions, SubscribeOptions, TopicStart, UnaryCallOptions,
+    CallOutcomeStatus, Connect, Error, Held, HostOptions, LagPolicy, Runtime,
+    RuntimeOptions, SubscribeOptions, TopicStart,
 };
 
 #[path = "../generated-mixed/rust/c_two_contract.rs"]
@@ -565,11 +565,10 @@ fn main() {
 
         // Unary methods still work next to topic subscriptions.
         assert_eq!(text(&client.method_1_echo(&payload("ctrl")).unwrap()), "ctrl");
-        let options = UnaryCallOptions::new().with_call_id("mixed-echo").unwrap();
-        let mut original = client.hold_method_1_echo_with_options(&payload("keyed"), options).unwrap();
-        let outcome = client.query_call("mixed-echo", CallTimeout::Inherit).unwrap();
+        let mut original = client.hold_method_1_echo_with_call_id(&payload("keyed"), "mixed-echo").unwrap();
+        let outcome = client.query_call("mixed-echo").unwrap();
         assert_eq!(outcome.status, CallOutcomeStatus::Succeeded);
-        let replay = client.recover_hold_method_1_echo("mixed-echo", CallTimeout::Inherit).unwrap();
+        let replay = client.recover_hold_method_1_echo("mixed-echo").unwrap();
         original.release().unwrap();
         assert_eq!(text(replay.value().unwrap()), "keyed");
 

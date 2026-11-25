@@ -123,7 +123,7 @@ async fn post(state: Arc<RelayState>, path: &str, body: &str) -> (StatusCode, St
 }
 
 fn force_message(sender: &str, target: &str) -> String {
-    serde_json::json!({"protocol_version":7,"sender_relay_id":sender,
+    serde_json::json!({"protocol_version":8,"sender_relay_id":sender,
         "message":{"type":"RelayForceLeave","relay_id":target}})
     .to_string()
 }
@@ -252,7 +252,7 @@ async fn force_leave_admin_status_body_and_no_broadcast_on_rejection() {
 #[test]
 fn force_leave_wire_validation_distinguishes_deployer_from_graceful_leave() {
     let message: PeerEnvelope = serde_json::from_str(&force_message("relay-a", "relay-c")).unwrap();
-    assert_eq!(PROTOCOL_VERSION, 7);
+    assert_eq!(PROTOCOL_VERSION, 8);
     assert!(validate_route_state_envelope(message.clone(), Some("relay-a")).is_ok());
     let wire = serde_json::to_string(&message).unwrap();
     assert_eq!(
@@ -267,7 +267,7 @@ fn force_leave_wire_validation_distinguishes_deployer_from_graceful_leave() {
         let envelope = serde_json::from_str(&force_message(sender, target)).unwrap();
         assert!(validate_route_state_envelope(envelope, None).is_err());
     }
-    for version in [6, 8] {
+    for version in [7, 9] {
         let mut envelope = message.clone();
         envelope.protocol_version = version;
         assert!(validate_route_state_envelope(envelope, None).is_err());
@@ -387,13 +387,13 @@ async fn force_leave_digest_cannot_restore_state_from_another_owner() {
     post(a.clone(), "/_peer/digest", &body).await;
     // Even a peer that sends a third party's valid fields cannot restore it.
     let entry = route("grid", "relay-c", Locality::Peer);
-    let foreign = serde_json::json!({"protocol_version":7,"sender_relay_id":"relay-b","message":{
+    let foreign = serde_json::json!({"protocol_version":8,"sender_relay_id":"relay-b","message":{
         "type":"DigestDiff","entries":[{"state":"Active","name":entry.name,"relay_id":entry.relay_id,
         "relay_url":entry.relay_url,"crm_ns":entry.crm_ns,"crm_name":entry.crm_name,"crm_ver":entry.crm_ver,
         "abi_hash":entry.abi_hash,"signature_hash":entry.signature_hash,"max_payload_size":1024,
         "route_uid":entry.route_uid,"registered_at":1000.0}]}});
     post(a.clone(), "/_peer/digest", &foreign.to_string()).await;
-    let deleted = serde_json::json!({"protocol_version":7,"sender_relay_id":"relay-b","message":{
+    let deleted = serde_json::json!({"protocol_version":8,"sender_relay_id":"relay-b","message":{
         "type":"DigestDiff","entries":[{"state":"Deleted","name":"gone","relay_id":"relay-c","removed_at":1001.0}]}});
     post(a.clone(), "/_peer/digest", &deleted.to_string()).await;
     post(

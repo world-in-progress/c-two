@@ -143,3 +143,118 @@ fn typed_item_decoder_does_not_escape_the_original_iteration_deadline() {
     assert_eq!(receipt.complete_items, Some(1));
     registration.close().unwrap();
 }
+
+#[test]
+fn call_context_carries_metadata_and_extension_through_stream_callbacks() {
+    use c_two::{AdmissionContext, AdmissionDecision, AdmissionOperation, current_call_context};
+
+    struct StreamResource(mpsc::Sender<&'static str>);
+
+    impl StreamResource {
+        fn observe(&self, callback: &'static str) {
+            let context = current_call_context().expect("stream callback context");
+            assert_eq!(context.route_name(), "stream-context");
+            assert_eq!(context.target(), "echo");
+            assert_eq!(context.operation(), AdmissionOperation::ServerStream);
+            assert_eq!(context.metadata().get("trace"), Some("stream"));
+            assert_eq!(*context.extension::<u16>().unwrap(), 42);
+            self.0.send(callback).unwrap();
+        }
+    }
+
+    impl EncodedService for StreamResource {
+        fn invoke(&self, _: u16, _: Vec<u8>) -> Result<Vec<u8>, C2Error> {
+            unreachable!()
+        }
+    }
+
+    impl EncodedStreamService for StreamResource {
+        fn open_stream(&self, _: u16, _: Vec<u8>) -> Result<Box<dyn EncodedStream>, C2Error> {
+            self.observe("open");
+            Ok(Box::new(Self(self.0.clone())))
+        }
+    }
+
+    impl EncodedStream for StreamResource {
+        fn step(&mut self) -> Result<Option<Box<dyn EncodedStreamItem>>, C2Error> {
+            self.observe("step");
+            Ok(None)
+        }
+
+        fn finish(self: Box<Self>) -> Result<(), C2Error> {
+            self.observe("finish");
+            Ok(())
+        }
+    }
+
+    let runtime = Runtime::new(RuntimeOptions {
+        use_process_relay_anchor: false,
+        ..Default::default()
+    })
+    .unwrap();
+    let host = runtime
+        .host(
+            HostOptions::default()
+                .without_relay()
+                .with_server_id(format!("rust-stream-context-{}", std::process::id()))
+                .with_admission_hook(Arc::new(|context: &AdmissionContext<'_>| {
+                    assert_eq!(context.operation(), AdmissionOperation::ServerStream);
+                    assert_eq!(context.metadata().get("trace"), Some("stream"));
+                    AdmissionDecision::allow_with_extension(Arc::new(42u16))
+                })),
+        )
+        .unwrap();
+    let release = ContractRelease::from_descriptor_json(DESCRIPTOR).unwrap();
+    let methods = release
+        .descriptor()
+        .methods()
+        .iter()
+        .enumerate()
+        .map(|(index, method)| MethodDefinition {
+            index: index as u16,
+            name: method.name().into(),
+            access: method.access(),
+        });
+    let (send, callbacks) = mpsc::channel();
+    let _registration = host
+        .register(
+            ServiceDefinition::new_stream(
+                &release,
+                release.reference(),
+                "stream-context",
+                methods,
+                Arc::new(StreamResource(send)),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    let client = runtime
+        .connect(
+            release.expected_route("stream-context").unwrap(),
+            Connect::DirectIpc {
+                address: host.local_endpoint().address().into(),
+            },
+        )
+        .unwrap()
+        .with_call_options(
+            CallOptions::with_timeout(CallTimeout::After(Duration::from_secs(5)))
+                .with_metadata_entry("trace", "stream")
+                .unwrap(),
+        );
+    let stream = client
+        .begin_stream("echo")
+        .unwrap()
+        .encode_vec(Vec::new())
+        .unwrap()
+        .stream()
+        .unwrap();
+    assert!(stream.next_item().unwrap().is_none());
+    assert!(stream.close().terminal.unwrap().is_ok());
+    for callback in ["open", "step", "finish"] {
+        assert_eq!(
+            callbacks.recv_timeout(Duration::from_secs(5)).unwrap(),
+            callback
+        );
+    }
+    assert!(current_call_context().is_none());
+}

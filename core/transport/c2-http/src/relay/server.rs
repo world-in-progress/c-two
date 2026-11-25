@@ -1995,7 +1995,12 @@ mod tests {
                 .unwrap_or_else(|_| panic!("live manager route acquisition failed"));
             let manager_client = manager_lease.client();
             manager_client
-                .call_bound(&manager_binding, "ping", &[])
+                .call_bound(
+                    &manager_binding,
+                    "ping",
+                    &[],
+                    &c2_config::CallMetadata::empty(),
+                )
                 .await
                 .unwrap();
             let builder_route = server
@@ -2056,7 +2061,12 @@ mod tests {
             assert!(Arc::ptr_eq(&manager_client, &builder_lease.client()));
             builder_lease
                 .client()
-                .call_bound(&builder_binding, "ping", &[])
+                .call_bound(
+                    &builder_binding,
+                    "ping",
+                    &[],
+                    &c2_config::CallMetadata::empty(),
+                )
                 .await
                 .unwrap();
             assert_eq!(callback_count.load(Ordering::SeqCst), 2);
@@ -2137,10 +2147,13 @@ mod tests {
                             .map_err(|_| "concurrent route acquisition failed")?;
                     let client = lease.client();
                     let client_id = Arc::as_ptr(&client) as usize;
-                    tokio::time::timeout(CLEANUP, client.call_bound(&binding, "ping", &[]))
-                        .await
-                        .map_err(|_| "concurrent upstream call timed out")?
-                        .map_err(|error| error.to_string())?;
+                    tokio::time::timeout(
+                        CLEANUP,
+                        client.call_bound(&binding, "ping", &[], &c2_config::CallMetadata::empty()),
+                    )
+                    .await
+                    .map_err(|_| "concurrent upstream call timed out")?
+                    .map_err(|error| error.to_string())?;
                     Ok::<_, String>(client_id)
                 });
             }

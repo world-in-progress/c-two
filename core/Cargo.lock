@@ -272,6 +272,7 @@ dependencies = [
  "c2-ipc",
  "futures-util",
  "parking_lot",
+ "serde",
  "serde_json",
  "tempfile",
  "tokio",

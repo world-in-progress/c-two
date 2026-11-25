@@ -2,7 +2,7 @@
 
 use std::time::Duration;
 
-use crate::{TimeoutError, timeout_from_seconds, validate_call_id};
+use crate::{CallMetadata, CallMetadataError, TimeoutError, timeout_from_seconds};
 
 /// Total-wait deadline policy for one logical call.
 ///
@@ -63,23 +63,25 @@ impl CallTimeout {
 /// One value describes the options projected onto a call view (for example
 /// `Client::with_call_options`); it never mutates global configuration or a
 /// shared client, and every call made through the view derives its own
-/// deadline from `timeout`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+/// deadline from `timeout` and carries the same metadata.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
 pub struct CallOptions {
     timeout: CallTimeout,
+    metadata: CallMetadata,
 }
 
 impl CallOptions {
     /// Options that inherit the path's default policy.
     pub const fn new() -> Self {
-        Self {
-            timeout: CallTimeout::Inherit,
-        }
+        Self::with_timeout(CallTimeout::Inherit)
     }
 
     /// Options carrying one explicit timeout policy.
     pub const fn with_timeout(timeout: CallTimeout) -> Self {
-        Self { timeout }
+        Self {
+            timeout,
+            metadata: CallMetadata::empty(),
+        }
     }
 
     /// The per-call timeout policy.
@@ -92,63 +94,42 @@ impl CallOptions {
     pub fn effective_timeout(&self, inherited: Option<Duration>) -> Option<Duration> {
         self.timeout.resolve(inherited)
     }
-}
-
-/// Per-call options for a single unary invocation.
-///
-/// Unlike reusable [`CallOptions`] (which stays [`Copy`] and carries only
-/// timeout policy), `UnaryCallOptions` can carry an explicit `call_id` bound
-/// to one logical unary operation.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
-pub struct UnaryCallOptions {
-    timeout: CallTimeout,
-    call_id: Option<String>,
-}
-
-impl UnaryCallOptions {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    pub fn from_call_options(options: CallOptions) -> Self {
-        Self {
-            timeout: options.timeout(),
-            call_id: None,
-        }
-    }
-
-    pub fn with_timeout(mut self, timeout: CallTimeout) -> Self {
+    /// Replaces the timeout while retaining call metadata.
+    pub fn with_timeout_override(mut self, timeout: CallTimeout) -> Self {
         self.timeout = timeout;
         self
     }
 
-    pub fn with_call_id(mut self, call_id: impl Into<String>) -> Result<Self, String> {
-        let call_id = call_id.into();
-        validate_call_id(&call_id)?;
-        self.call_id = Some(call_id);
+    pub fn with_metadata(mut self, metadata: CallMetadata) -> Self {
+        self.metadata = metadata;
+        self
+    }
+
+    pub fn with_metadata_entry(
+        mut self,
+        key: impl Into<String>,
+        value: impl Into<String>,
+    ) -> Result<Self, CallMetadataError> {
+        self.metadata = self.metadata.with_entry(key, value)?;
         Ok(self)
     }
 
-    pub const fn timeout(&self) -> CallTimeout {
-        self.timeout
+    pub fn extend_metadata<I, K, V>(mut self, entries: I) -> Result<Self, CallMetadataError>
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: Into<String>,
+        V: Into<String>,
+    {
+        self.metadata = self.metadata.extend(entries)?;
+        Ok(self)
     }
 
-    pub fn call_id(&self) -> Option<&str> {
-        self.call_id.as_deref()
+    pub fn clear_metadata(self) -> Self {
+        self.with_metadata(CallMetadata::empty())
     }
 
-    pub const fn call_options(&self) -> CallOptions {
-        CallOptions::with_timeout(self.timeout)
-    }
-
-    pub fn effective_timeout(&self, inherited: Option<Duration>) -> Option<Duration> {
-        self.timeout.resolve(inherited)
-    }
-}
-
-impl From<CallOptions> for UnaryCallOptions {
-    fn from(options: CallOptions) -> Self {
-        Self::from_call_options(options)
+    pub fn metadata(&self) -> &CallMetadata {
+        &self.metadata
     }
 }
 
@@ -294,17 +275,28 @@ mod tests {
             None
         );
 
-        // Immutable per-call views compare by value and stay Copy.
         assert_eq!(bounded, CallOptions::with_timeout(bounded.timeout()));
-        let copied = bounded;
-        assert_eq!(copied, bounded);
+        assert!(options.metadata().is_empty());
+    }
 
-        let unary = UnaryCallOptions::from(bounded)
-            .with_call_id("step-42_ok")
+    #[test]
+    fn call_options_metadata_and_timeout_are_independent() {
+        let original = CallOptions::with_timeout(CallTimeout::After(Duration::ZERO))
+            .with_metadata_entry("trace", "first")
             .unwrap();
-        assert_eq!(unary.timeout(), bounded.timeout());
-        assert_eq!(unary.call_id(), Some("step-42_ok"));
-        assert_eq!(unary.call_options(), bounded);
-        assert!(UnaryCallOptions::new().with_call_id("bad/id").is_err());
+        let changed = original
+            .clone()
+            .with_timeout_override(CallTimeout::Inherit)
+            .extend_metadata([("trace", "second"), ("token", "fresh")])
+            .unwrap();
+
+        assert_eq!(original.metadata().get("trace"), Some("first"));
+        assert_eq!(changed.metadata().get("trace"), Some("second"));
+        assert_eq!(changed.metadata().get("token"), Some("fresh"));
+        assert_eq!(changed.timeout(), CallTimeout::Inherit);
+
+        let cleared = original.clear_metadata();
+        assert_eq!(cleared.timeout(), CallTimeout::After(Duration::ZERO));
+        assert!(cleared.metadata().is_empty());
     }
 }

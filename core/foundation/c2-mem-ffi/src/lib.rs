@@ -1,4 +1,5 @@
 //! C ABI for native client domains, IPC endpoints, calls and local buffers.
+//! ABI 10 call and subscription entries validate and own call metadata before returning.
 
 use c2_config::{
     ConfigResolver, ConfigSources, EnvCatalog, LocalEndpointContext, LocalEndpointOptions,

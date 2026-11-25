@@ -15,7 +15,7 @@ use c2_wire::{
     flags::FLAG_SIGNAL,
     frame::encode_frame,
     msg_type::DISCONNECT_BYTES,
-    rpc::WireCallOutcome,
+    rpc::{WireAdmitTopicResult, WireQueryCallResult},
 };
 use parking_lot::{Mutex, RwLock};
 use std::collections::HashMap;
@@ -27,7 +27,12 @@ use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tokio::sync::{Notify, mpsc, oneshot, watch};
 
 type Receipt = oneshot::Sender<Result<(), IpcError>>;
-type QueryReply = oneshot::Sender<Result<WireCallOutcome, IpcError>>;
+pub(crate) enum ControlResponse {
+    QueryCall(WireQueryCallResult),
+    AdmitTopic(WireAdmitTopicResult),
+}
+
+type ControlReply = oneshot::Sender<Result<ControlResponse, IpcError>>;
 
 /// Publication and cancellation linearize at the writer's first I/O attempt.
 /// After that point cancellation removes only the caller's response waiter.
@@ -63,7 +68,7 @@ struct Submission {
     state: Arc<Mutex<SendState>>,
     policy: Option<IpcCallControl>,
     reply: Option<Receipt>,
-    query_reply: Option<QueryReply>,
+    control_reply: Option<ControlReply>,
 }
 
 #[derive(Clone, Copy)]
@@ -201,11 +206,10 @@ pub(crate) struct ClientConnection {
     pub publisher: ConnectionPublisher,
     end: Arc<EndState>,
     pending: Arc<Mutex<PendingMap>>,
-    /// Independent query-call pending table keyed by request ID. Replies are
-    /// matched here, never through the business pending map, so a locally
-    /// timed-out query's late reply and a reconnect's fresh table stay
-    /// isolated per physical connection.
-    queries: Mutex<HashMap<u64, QueryReply>>,
+    /// Independent control request table, keyed by the request ID on this
+    /// physical connection. Late replies after local timeout are discarded.
+    control_requests: Mutex<HashMap<u64, ControlReply>>,
+    pub(crate) server_has_admission_hook: bool,
     pub(crate) sequence: std::sync::atomic::AtomicU64,
     stream_control_cursor: std::sync::atomic::AtomicU64,
     queue: mpsc::Sender<Submission>,
@@ -298,7 +302,7 @@ impl ClientConnection {
                     state,
                     policy: None,
                     reply: None,
-                    query_reply: None,
+                    control_reply: None,
                 });
             }
         }
@@ -309,6 +313,7 @@ impl ClientConnection {
         pending: Arc<Mutex<PendingMap>>,
         abort: AbortHandle,
         retirement: Arc<PhysicalRetirement>,
+        server_has_admission_hook: bool,
         write_timeout: Duration,
     ) -> Arc<Self> {
         let wake = Arc::new(Notify::new());
@@ -326,7 +331,8 @@ impl ClientConnection {
             publisher: retirement.end.publisher.clone(),
             end: retirement.end.clone(),
             pending,
-            queries: Mutex::new(HashMap::new()),
+            control_requests: Mutex::new(HashMap::new()),
+            server_has_admission_hook,
             sequence: std::sync::atomic::AtomicU64::new(0),
             stream_control_cursor: std::sync::atomic::AtomicU64::new(0),
             queue,
@@ -352,8 +358,12 @@ impl ClientConnection {
         tokio::spawn(run(driver, conn.clone(), receiver));
         conn
     }
-    pub(crate) fn complete_query(&self, rid: u64, result: Result<WireCallOutcome, IpcError>) {
-        let sender = self.queries.lock().remove(&rid);
+    pub(crate) fn complete_control_request(
+        &self,
+        rid: u64,
+        result: Result<ControlResponse, IpcError>,
+    ) {
+        let sender = self.control_requests.lock().remove(&rid);
         if let Some(sender) = sender {
             let _ = sender.send(result);
             self.wake.notify_one();
@@ -361,13 +371,13 @@ impl ClientConnection {
     }
 
     #[cfg(test)]
-    pub(crate) fn pending_queries_for_test(&self) -> usize {
-        self.queries.lock().len()
+    pub(crate) fn pending_control_requests_for_test(&self) -> usize {
+        self.control_requests.lock().len()
     }
 
-    fn fail_queries(&self) {
-        let queries = std::mem::take(&mut *self.queries.lock());
-        for (_, sender) in queries {
+    fn fail_control_requests(&self) {
+        let control_requests = std::mem::take(&mut *self.control_requests.lock());
+        for (_, sender) in control_requests {
             let _ = sender.send(Err(IpcError::Closed));
         }
     }
@@ -408,7 +418,7 @@ impl ClientConnection {
     fn take_disconnect(&self) -> Option<ControlFrame> {
         // DISCONNECT stops the peer's admission too. Send it only after every
         // dispatched request (including its continuation frames) has replied.
-        if !self.pending.lock().is_empty() || !self.queries.lock().is_empty() {
+        if !self.pending.lock().is_empty() || !self.control_requests.lock().is_empty() {
             return None;
         }
         let mut disconnect = self.disconnect.lock();
@@ -482,7 +492,7 @@ impl ClientConnection {
         for entry in pending.active.into_values().chain(pending.queued) {
             entry.complete(Err(IpcError::Closed));
         }
-        self.fail_queries();
+        self.fail_control_requests();
     }
     pub fn read_stopped(&self, peer_end: bool) {
         if peer_end {
@@ -499,7 +509,7 @@ impl ClientConnection {
     fn close_ready(&self) -> bool {
         // ConnectionCore accounts for loans and real remote reads; the client
         // also has sent calls whose replies still have trustworthy framing.
-        if !self.pending.lock().is_empty() || !self.queries.lock().is_empty() {
+        if !self.pending.lock().is_empty() || !self.control_requests.lock().is_empty() {
             return false;
         }
         if !self.core.try_close() {
@@ -586,15 +596,16 @@ impl ClientConnection {
             .await
     }
 
-    pub(crate) async fn query(
+    pub(crate) async fn control_request(
         self: &Arc<Self>,
         frame: Vec<u8>,
         deadline: Option<std::time::Instant>,
-    ) -> Result<WireCallOutcome, IpcError> {
+        operation: &'static str,
+    ) -> Result<ControlResponse, IpcError> {
         let deadline_error = || {
             IpcError::Io(io::Error::new(
                 io::ErrorKind::TimedOut,
-                "query_call timed out",
+                format!("{operation} timed out"),
             ))
         };
         if deadline.is_some_and(|deadline| deadline <= std::time::Instant::now()) {
@@ -603,11 +614,11 @@ impl ClientConnection {
         let control = self.core.prepare_control_frame().map_err(core_error)?;
         let (sender, mut receiver) = oneshot::channel();
         let state = Arc::new(Mutex::new(SendState::default()));
-        let _waiter = QueryWaiter {
+        let _waiter = ControlWaiter {
             conn: self,
             state: &state,
         };
-        let query = async {
+        let request = async {
             let write = self.submit_frame(
                 frame,
                 WriteRequest::Control(control),
@@ -627,10 +638,10 @@ impl ClientConnection {
             }
         };
         match deadline {
-            Some(deadline) => tokio::time::timeout_at(deadline.into(), query)
+            Some(deadline) => tokio::time::timeout_at(deadline.into(), request)
                 .await
                 .map_err(|_| deadline_error())?,
-            None => query.await,
+            None => request.await,
         }
     }
 
@@ -641,7 +652,7 @@ impl ClientConnection {
         state: Arc<Mutex<SendState>>,
         policy: Option<IpcCallControl>,
         payload_owner: Option<Arc<MemoryReservation>>,
-        query_reply: Option<QueryReply>,
+        control_reply: Option<ControlReply>,
     ) -> Result<(), IpcError> {
         // Subscribe before waiting for queue capacity. Deactivation must wake
         // unpublished calls even while the writer and all 64 queue slots stall.
@@ -671,7 +682,7 @@ impl ClientConnection {
             state: state.clone(),
             policy,
             reply: Some(reply),
-            query_reply,
+            control_reply,
         });
         let is_stopped = *stopped.borrow();
         let result = if is_stopped && !state.lock().started() {
@@ -695,12 +706,12 @@ impl ClientConnection {
     }
 }
 
-struct QueryWaiter<'a> {
+struct ControlWaiter<'a> {
     conn: &'a ClientConnection,
     state: &'a Mutex<SendState>,
 }
 
-impl Drop for QueryWaiter<'_> {
+impl Drop for ControlWaiter<'_> {
     fn drop(&mut self) {
         let rid = {
             let mut state = self.state.lock();
@@ -708,7 +719,7 @@ impl Drop for QueryWaiter<'_> {
             state.request_id()
         };
         if let Some(rid) = rid {
-            self.conn.queries.lock().remove(&rid);
+            self.conn.control_requests.lock().remove(&rid);
             self.conn.wake.notify_one();
         }
     }
@@ -840,12 +851,12 @@ async fn process(stream: &mut LocalWriteHalf, conn: &ClientConnection, mut submi
                                 }
                             };
                             let rid = previous + 1;
-                            if let Some(sender) = submission.query_reply.take() {
-                                let mut queries = conn.queries.lock();
+                            if let Some(sender) = submission.control_reply.take() {
+                                let mut control_requests = conn.control_requests.lock();
                                 if conn.core.is_deactivated() {
                                     return Err(IpcError::Closed);
                                 }
-                                queries.insert(rid, sender);
+                                control_requests.insert(rid, sender);
                                 state.request_id = Some(rid);
                             } else {
                                 conn.pending.lock().publish(&submission.state, rid)?;

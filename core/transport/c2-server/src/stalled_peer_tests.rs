@@ -112,6 +112,7 @@ async fn stopped_local_reads_bound_calls_and_preserve_half_frame_close_truth() {
                 &harness.identity,
                 0,
                 CallMode::Unary,
+                &c2_config::CallMetadata::empty(),
                 ValuePart::whole(ValueStorage::Inline(&[])),
             )
             .unwrap(),
@@ -303,6 +304,7 @@ mod posix {
                     &identity,
                     1,
                     CallMode::ServerStream,
+                    &c2_config::CallMetadata::empty(),
                     ValuePart::whole(ValueStorage::Inline(&[1])),
                 )
                 .unwrap(),
@@ -322,6 +324,7 @@ mod posix {
                     &identity,
                     0,
                     CallMode::Unary,
+                    &c2_config::CallMetadata::empty(),
                     ValuePart::whole(ValueStorage::Inline(&[])),
                 )
                 .unwrap(),

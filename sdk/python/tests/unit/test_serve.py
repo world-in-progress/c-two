@@ -87,6 +87,31 @@ class TestServeBasic:
         done.wait(timeout=5.0)
         assert done.is_set()
 
+    def test_serve_signal_handler_does_not_acquire_stop_event_lock(self, monkeypatch):
+        """Signal delivery while the main thread holds ``_serve_stop._cond`` must not deadlock."""
+        import signal as signal_mod
+
+        installed: dict[int, object] = {}
+
+        def _capture_signal(sig, handler):
+            installed[sig] = handler
+
+        monkeypatch.setattr(signal_mod, 'signal', _capture_signal)
+        self.registry.register(IServeCRM, ServeCRM(), name='svc')
+        self.registry._serve(blocking=False)
+
+        handler = installed[signal_mod.SIGINT]
+        stop_event = self.registry._serve_stop
+        assert stop_event is not None
+
+        def _forbid_set():
+            raise AssertionError('signal handler must not call Event.set()')
+
+        monkeypatch.setattr(stop_event, 'set', _forbid_set)
+        with stop_event._cond:
+            handler(signal_mod.SIGINT, None)
+        assert not stop_event.is_set()
+
     def test_serve_prints_banner(self, capsys):
         """serve() prints a banner with CRM route info."""
         self.registry.register(IServeCRM, ServeCRM(), name='my_service')

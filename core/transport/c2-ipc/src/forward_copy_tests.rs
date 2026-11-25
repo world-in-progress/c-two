@@ -1,4 +1,5 @@
 use super::*;
+use crate::tests::EMPTY_METADATA;
 use crate::tests::download_slice;
 use crate::tests::memory_budget;
 use c2_config::LocalEndpointContext;
@@ -156,6 +157,7 @@ impl Harness {
                 0,
                 futures_util::stream::empty::<Result<Vec<u8>, std::io::Error>>(),
                 budget.try_reserve_memory(1).unwrap(),
+                &EMPTY_METADATA,
             )
             .await
             .unwrap();
@@ -181,6 +183,7 @@ async fn forwarded_topic_uses_small_windows_and_reports_real_terminal() {
             &harness.binding,
             "state",
             rpc::WireSubscribeOptions::default(),
+            &EMPTY_METADATA,
         ),
     )
     .await
@@ -288,6 +291,7 @@ async fn forwarded_unknown_topic_preserves_pre_dispatch_refusal() {
             &harness.binding,
             "unknown",
             rpc::WireSubscribeOptions::default(),
+            &EMPTY_METADATA,
         )
         .await
     {
@@ -324,6 +328,7 @@ async fn sync_waiters_observe_source_head_and_real_terminal() {
             &harness.binding,
             "state",
             rpc::WireSubscribeOptions::default(),
+            &EMPTY_METADATA,
         )
         .await
         .unwrap();
@@ -522,7 +527,9 @@ async fn terminal_during_owned_copy(consumer_first: bool) {
     assert!(call.conn.core.stream_state(id).is_some());
     let unary = tokio::time::timeout(
         WAIT,
-        harness.client.call_bound(&harness.binding, "ping", b""),
+        harness
+            .client
+            .call_bound(&harness.binding, "ping", b"", &EMPTY_METADATA),
     )
     .await
     .unwrap()

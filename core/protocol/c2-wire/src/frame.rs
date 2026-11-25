@@ -111,10 +111,23 @@ pub enum DecodeError {
     },
     /// An invalid value was encountered (e.g. unknown status byte).
     InvalidValue { field: &'static str, value: u64 },
-    /// A UTF-8 text field was structurally valid but semantically invalid.
+    /// A text field was structurally valid but its contents were invalid.
     InvalidText { field: &'static str, reason: String },
     /// UTF-8 decoding failed.
     Utf8Error,
+}
+
+impl DecodeError {
+    /// True when the metadata segment is complete but violates its content rules.
+    pub fn is_call_metadata_validation(&self) -> bool {
+        matches!(
+            self,
+            Self::InvalidText {
+                field: "call_metadata",
+                ..
+            }
+        )
+    }
 }
 
 impl std::fmt::Display for DecodeError {

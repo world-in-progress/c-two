@@ -291,7 +291,8 @@ class TestCcConnectHttp:
         relay = start_c3_relay()
         with httpx.Client(trust_env=False, timeout=5.0) as http:
             resp = http.post(
-                f"{relay.url}/grid/get",
+                f"{relay.url}/_c2/calls/call",
+                params={"route": "grid", "method": "get"},
                 content=b"",
                 headers={
                     "x-c2-expected-crm-ns": "test/grid",
@@ -319,9 +320,8 @@ class TestCcConnectHttp:
         """CRM names containing '/' (toodle-style resource paths) work over HTTP relay.
 
         Regression: axum's single-segment ``Path<String>`` extractor would
-        404 on a raw ``/_resolve/a/b`` and split ``/{name}/{method}``
-        wrong. Both the Python registry and the Rust HTTP client now
-        percent-encode ``/`` as ``%2F``.
+        404 on a raw ``/_resolve/a/b``. Resolve and call requests encode
+        route names containing ``/``.
         """
         slashed_name = 'toodle/grid/0'
         cc.register(Hello, HelloImpl(), name=slashed_name)
@@ -674,11 +674,13 @@ class TestRelayControlPlane:
 
             # Data-plane call should return 404.
             resp = http.post(
-                f'{relay_url}/hello/greeting',
+                f'{relay_url}/_c2/calls/call',
+                params={'route': 'hello', 'method': 'greeting'},
                 content=b'test',
                 headers=_expected_contract_headers(),
             )
             assert resp.status_code == 404
+            assert resp.json()['code'] == 701
 
     def test_unregister_missing_404(self, start_c3_relay):
         """POST /_unregister for unknown name returns 404."""
@@ -730,13 +732,14 @@ class TestRelayControlPlane:
             assert set(health['routes']) == {'hello', 'counter'}
 
     def test_call_unknown_route_404(self, start_c3_relay):
-        """POST /{route}/{method} for unregistered route returns 404."""
+        """The call endpoint returns canonical 701 for an unregistered route."""
         relay = start_c3_relay()
         relay_url = relay.url
 
         with httpx.Client(trust_env=False, timeout=5.0) as http:
             resp = http.post(
-                f'{relay_url}/nonexistent/method',
+                f'{relay_url}/_c2/calls/call',
+                params={'route': 'nonexistent', 'method': 'method'},
                 content=b'data',
                 headers=_expected_contract_headers(),
             )

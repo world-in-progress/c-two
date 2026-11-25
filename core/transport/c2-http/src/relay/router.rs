@@ -14,7 +14,8 @@ use axum::{
     Json, Router,
     body::{Body, Bytes, HttpBody},
     extract::{
-        ConnectInfo, DefaultBodyLimit, Extension, FromRequestParts, Path, Query, Request, State,
+        ConnectInfo, DefaultBodyLimit, Extension, FromRequest, FromRequestParts, Path, Query,
+        Request, State,
     },
     http::request::Parts,
     http::{HeaderMap, StatusCode, header},
@@ -24,7 +25,8 @@ use axum::{
 use futures::StreamExt;
 
 use crate::client::{LOCAL_ENDPOINT_NAMESPACE_HEADER, validate_local_endpoint_namespace};
-use crate::outcome_wire::{CALL_ID_HEADER, KEYED_PATH, OUTCOME_PATH, OutcomeJson, RECOVER_PATH};
+use crate::http_wire::{MAX_CONTROL_ERROR_BYTES, metadata_from_headers};
+use crate::outcome_wire::{CALL_ID_HEADER, OutcomeJson};
 use crate::payload::SegmentedPayload;
 use crate::relay::authority::{
     ClaimedRouteContract, ControlError, LocalRegistration, LocalRouteOwner, RegisterPreparation,
@@ -39,11 +41,17 @@ use crate::relay::server::connect_register_attestation_client;
 use crate::relay::state::{RegisterCommitResult, RelayState, UpstreamAcquireError};
 use crate::relay::types::{PeerStatus, RouteEntry, RouteResolutionError, UpstreamEndpointKey};
 use crate::send_budget::{SendBufferPlan, SendBuffers, reserve_send_buffers};
+use crate::{
+    CALL_PATH, KEYED_PATH, OUTCOME_PATH, RECOVER_PATH, TOPIC_CONFIRM_PATH, TOPIC_SUBSCRIBE_PATH,
+};
+use c2_config::CallMetadata;
 use c2_ipc::IpcClient;
-use c2_mem::{BudgetedBuffer, DomainBudget, MemoryReservation, PayloadBufferError};
+#[cfg(test)]
+use c2_mem::BudgetedBuffer;
+use c2_mem::{DomainBudget, MemoryReservation, PayloadBufferError};
 use tokio_util::sync::CancellationToken;
 
-const OUTCOME_QUERY_TIMEOUT: Duration = Duration::from_secs(5);
+pub(super) const OUTCOME_QUERY_TIMEOUT: Duration = Duration::from_secs(5);
 const CONTROL_BODY_LIMIT_BYTES: usize = 64 * 1024;
 const EXPECTED_CRM_NS_HEADER: &str = "x-c2-expected-crm-ns";
 const EXPECTED_CRM_NAME_HEADER: &str = "x-c2-expected-crm-name";
@@ -156,15 +164,13 @@ fn duplicate_route_response(
     if let Some(address) = existing_address {
         details.insert("existing_address".into(), address.into());
     }
-    json_error_response(
+    control_error_response(
         StatusCode::CONFLICT,
         c2_error::C2Error::new(
             c2_error::ErrorCode::ResourceAlreadyRegistered,
             format!("route already registered: {name}"),
         )
-        .with_details(details)
-        .envelope(),
-        None,
+        .with_details(details),
     )
 }
 
@@ -235,19 +241,6 @@ fn resource_not_found_response(route_name: &str) -> Response {
     )
 }
 
-fn resource_not_found_response_budgeted(route_name: &str, budget: &DomainBudget) -> Response {
-    c2_error_response_with_budget(
-        StatusCode::NOT_FOUND,
-        c2_error::ErrorCode::ResourceNotFound,
-        format!("route not found: {route_name}"),
-        [
-            ("route", route_name.to_string()),
-            ("dispatch_phase", "pre_dispatch".to_string()),
-        ],
-        budget,
-    )
-}
-
 fn resource_unavailable_response(route_name: &str, message: impl Into<String>) -> Response {
     c2_error_response(
         StatusCode::BAD_GATEWAY,
@@ -257,13 +250,12 @@ fn resource_unavailable_response(route_name: &str, message: impl Into<String>) -
     )
 }
 
-fn resource_unavailable_response_budgeted(
+fn phased_resource_unavailable_response(
     route_name: &str,
     message: impl Into<String>,
     dispatch_phase: &str,
-    budget: &DomainBudget,
 ) -> Response {
-    c2_error_response_with_budget(
+    c2_error_response(
         StatusCode::BAD_GATEWAY,
         c2_error::ErrorCode::ResourceUnavailable,
         message,
@@ -271,7 +263,6 @@ fn resource_unavailable_response_budgeted(
             ("route", route_name.to_string()),
             ("dispatch_phase", dispatch_phase.to_string()),
         ],
-        budget,
     )
 }
 
@@ -284,12 +275,11 @@ fn route_watch_unavailable_response(route_name: &str, reason: impl Into<String>)
     )
 }
 
-fn route_watch_unavailable_response_budgeted(
+fn phased_route_watch_unavailable_response(
     route_name: &str,
     reason: impl Into<String>,
-    budget: &DomainBudget,
 ) -> Response {
-    c2_error_response_with_budget(
+    c2_error_response(
         StatusCode::SERVICE_UNAVAILABLE,
         c2_error::ErrorCode::RouteWatchUnavailable,
         format!("route watch unavailable for {route_name}"),
@@ -298,7 +288,6 @@ fn route_watch_unavailable_response_budgeted(
             ("reason", reason.into()),
             ("dispatch_phase", "pre_dispatch".to_string()),
         ],
-        budget,
     )
 }
 
@@ -316,118 +305,76 @@ where
     let details = details
         .into_iter()
         .map(|(key, value)| (key.into(), value.into()))
-        .collect::<BTreeMap<_, _>>();
-    (
+        .collect();
+    control_error_response(
         status,
-        Json(
-            c2_error::C2Error::new(code, message)
-                .with_details(details)
-                .envelope(),
-        ),
+        c2_error::C2Error::new(code, message).with_details(details),
     )
-        .into_response()
 }
 
-struct JsonSize(u64);
-
-impl Write for JsonSize {
-    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-        self.0 = self
-            .0
-            .checked_add(bytes.len() as u64)
-            .ok_or_else(|| std::io::Error::other("JSON response length overflow"))?;
-        Ok(bytes.len())
+pub(super) fn control_error_response(status: StatusCode, error: c2_error::C2Error) -> Response {
+    #[derive(serde::Serialize)]
+    struct Envelope<'a> {
+        version: u16,
+        code: u16,
+        name: &'static str,
+        message: &'a str,
+        details: &'a BTreeMap<String, String>,
     }
 
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
+    struct ControlBody(Vec<u8>);
+    impl Write for ControlBody {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            if bytes.len() > MAX_CONTROL_ERROR_BYTES - self.0.len() {
+                return Err(std::io::Error::other(
+                    "control error exceeds its size limit",
+                ));
+            }
+            self.0.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
 
-/// Reserve the exact serialized body before creating its owned Vec. The Body
-/// carries the reservation through `Bytes` slices and clones until their last
-/// real reference is released. Admission for an error reply never waits for
-/// memory capacity: `try_reserve_memory` either succeeds immediately or the
-/// relay answers with the bounded static control response, so a full budget
-/// cannot pile up suspended error streams.
-fn budgeted_json_response<T>(
-    status: StatusCode,
-    payload: T,
-    budget: &DomainBudget,
-    dispatch_uncertain: bool,
-) -> Response
-where
-    T: serde::Serialize + Send + 'static,
-{
-    let mut size = JsonSize(0);
-    let admitted = (serde_json::to_writer(&mut size, &payload).is_ok()
-        && usize::try_from(size.0).is_ok())
-    .then(|| budget.try_reserve_memory(size.0).ok())
-    .flatten();
-    let Some(reservation) = admitted else {
-        return if dispatch_uncertain {
-            uncertain_error_control_response()
-        } else {
-            forwarding_capacity_response("", "error response exceeds payload budget")
-        };
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let mut body = ControlBody(Vec::new());
+    let mut envelope = Envelope {
+        version: c2_error::ERROR_WIRE_VERSION,
+        code: error.code.into(),
+        name: error.code.name(),
+        message: &error.message,
+        details: &error.details,
     };
-    let mut data = Vec::with_capacity(size.0 as usize);
-    if serde_json::to_writer(&mut data, &payload).is_err() {
-        return if dispatch_uncertain {
-            uncertain_error_control_response()
-        } else {
-            forwarding_capacity_response("", "error response exceeds payload budget")
-        };
+    if serde_json::to_writer(&mut body, &envelope).is_err() {
+        // Keep the fields that establish call disposition. The small fallback
+        // fits even when JSON escapes every byte of its message and details.
+        let mut details = BTreeMap::from([("truncated".into(), "true".into())]);
+        for key in [
+            "dispatch_phase",
+            "transport_phase",
+            "stage",
+            "cause",
+            "reason",
+        ] {
+            if let Some(value) = error.details.get(key)
+                && value.len() <= 64
+            {
+                details.insert(key.into(), value.clone());
+            }
+        }
+        envelope.details = &details;
+        envelope.message = &error.message[..error.message.floor_char_boundary(256)];
+        body.0.clear();
+        serde_json::to_writer(&mut body, &envelope).expect("truncated control error fits");
     }
-    let body = Bytes::from_owner(BudgetedBuffer::new(data, reservation));
-    (
-        status,
-        [
-            (header::CONTENT_TYPE, "application/json".to_string()),
-            (header::CONTENT_LENGTH, size.0.to_string()),
-        ],
-        body,
-    )
-        .into_response()
+    (status, [(header::CONTENT_TYPE, "application/json")], body.0).into_response()
 }
 
-fn json_error_response<T>(status: StatusCode, payload: T, budget: Option<&DomainBudget>) -> Response
-where
-    T: serde::Serialize + Send + 'static,
-{
-    match budget {
-        Some(budget) => budgeted_json_response(status, payload, budget, false),
-        None => (status, Json(payload)).into_response(),
-    }
-}
-
-fn c2_error_response_with_budget<I, K, V>(
-    status: StatusCode,
-    code: c2_error::ErrorCode,
-    message: impl Into<String>,
-    details: I,
-    budget: &DomainBudget,
-) -> Response
-where
-    I: IntoIterator<Item = (K, V)>,
-    K: Into<String>,
-    V: Into<String>,
-{
-    let details = details
-        .into_iter()
-        .map(|(key, value)| (key.into(), value.into()))
-        .collect::<BTreeMap<_, _>>();
-    let dispatch_uncertain = details
-        .get("dispatch_phase")
-        .is_some_and(|phase| phase == "dispatch_uncertain");
-    budgeted_json_response(
-        status,
-        c2_error::C2Error::new(code, message)
-            .with_details(details)
-            .envelope(),
-        budget,
-        dispatch_uncertain,
-    )
+fn call_metadata(headers: &HeaderMap) -> ResponseResult<CallMetadata> {
+    metadata_from_headers(headers)
+        .map_err(|error| control_error_response(StatusCode::BAD_REQUEST, error).into())
 }
 
 #[derive(Clone, Copy)]
@@ -454,9 +401,8 @@ fn payload_too_large_response(
     route_name: &str,
     content_length: u64,
     max_payload_size: u64,
-    budget: &DomainBudget,
 ) -> Response {
-    c2_error_response_with_budget(
+    c2_error_response(
         StatusCode::PAYLOAD_TOO_LARGE,
         c2_error::ErrorCode::CallCapacityExceeded,
         format!(
@@ -469,24 +415,19 @@ fn payload_too_large_response(
             ("max_payload_size", max_payload_size.to_string()),
             ("dispatch_phase", "pre_dispatch".to_string()),
         ],
-        budget,
     )
 }
 
-fn unknown_length_too_large_response(
-    route_name: &str,
-    limit: u64,
-    budget: &DomainBudget,
-) -> Response {
-    json_error_response(
+fn unknown_length_too_large_response(route_name: &str, limit: u64) -> Response {
+    (
         StatusCode::LENGTH_REQUIRED,
-        serde_json::json!({
+        Json(serde_json::json!({
             "error": "ContentLengthRequired",
             "route": route_name,
             "message": format!("streaming relay calls larger than {limit} bytes require Content-Length"),
-        }),
-        Some(budget),
+        })),
     )
+        .into_response()
 }
 
 #[derive(Debug, Default, serde::Deserialize)]
@@ -544,7 +485,6 @@ fn run_data_plane_after_precheck_hook(state: &Arc<RelayState>, route_name: &str)
 fn expected_crm_from_headers(
     route_name: &str,
     headers: &HeaderMap,
-    budget: Option<&DomainBudget>,
 ) -> ResponseResult<c2_contract::ExpectedRouteContract> {
     let crm_ns = headers
         .get(EXPECTED_CRM_NS_HEADER)
@@ -563,15 +503,15 @@ fn expected_crm_from_headers(
         .map(|value| value.to_str().map(str::to_string));
 
     match (crm_ns, crm_name, crm_ver, abi_hash, signature_hash) {
-        (None, None, None, None, None) => Err(json_error_response(
+        (None, None, None, None, None) => Err((
             StatusCode::BAD_REQUEST,
-            serde_json::json!({
+            Json(serde_json::json!({
                 "error": "InvalidCrmTag",
                 "message": "expected CRM headers and hash headers are required",
-            }),
-            budget,
+            })),
         )
-        .into()),
+            .into_response()
+            .into()),
         (
             Some(Ok(crm_ns)),
             Some(Ok(crm_name)),
@@ -588,15 +528,15 @@ fn expected_crm_from_headers(
                 signature_hash,
             };
             if let Err(err) = c2_contract::validate_expected_route_contract(&expected) {
-                return Err(json_error_response(
+                return Err((
                     StatusCode::BAD_REQUEST,
-                    serde_json::json!({
+                    Json(serde_json::json!({
                         "error": "InvalidCrmTag",
                         "message": err.to_string(),
-                    }),
-                    budget,
+                    })),
                 )
-                .into());
+                    .into_response()
+                    .into());
             }
             Ok(expected)
         }
@@ -604,24 +544,24 @@ fn expected_crm_from_headers(
         | (_, Some(Err(_)), _, _, _)
         | (_, _, Some(Err(_)), _, _)
         | (_, _, _, Some(Err(_)), _)
-        | (_, _, _, _, Some(Err(_))) => Err(json_error_response(
+        | (_, _, _, _, Some(Err(_))) => Err((
             StatusCode::BAD_REQUEST,
-            serde_json::json!({
+            Json(serde_json::json!({
                 "error": "InvalidCrmTag",
                 "message": "expected CRM headers must be valid UTF-8",
-            }),
-            budget,
+            })),
         )
-        .into()),
-        _ => Err(json_error_response(
+            .into_response()
+            .into()),
+        _ => Err((
             StatusCode::BAD_REQUEST,
-            serde_json::json!({
+            Json(serde_json::json!({
                 "error": "InvalidCrmTag",
                 "message": "expected CRM headers and hash headers must be supplied together",
-            }),
-            budget,
+            })),
         )
-        .into()),
+            .into_response()
+            .into()),
     }
 }
 
@@ -634,8 +574,8 @@ fn crm_contract_mismatch_response(route_name: &str) -> Response {
     )
 }
 
-fn crm_contract_mismatch_response_budgeted(route_name: &str, budget: &DomainBudget) -> Response {
-    c2_error_response_with_budget(
+fn phased_crm_contract_mismatch_response(route_name: &str) -> Response {
+    c2_error_response(
         StatusCode::CONFLICT,
         c2_error::ErrorCode::ContractMismatch,
         format!("CRM contract mismatch for route {route_name}"),
@@ -643,7 +583,6 @@ fn crm_contract_mismatch_response_budgeted(route_name: &str, budget: &DomainBudg
             ("route", route_name.to_string()),
             ("dispatch_phase", "pre_dispatch".to_string()),
         ],
-        budget,
     )
 }
 
@@ -798,21 +737,23 @@ fn validate_expected_crm_for_route(
     state: &RelayState,
     route_name: &str,
     expected: &c2_contract::ExpectedRouteContract,
-    budget: Option<&DomainBudget>,
+    business: bool,
 ) -> ResponseResult<RouteEntry> {
     let Some(route) = state.local_route(route_name) else {
-        return Err(match budget {
-            Some(budget) => resource_not_found_response_budgeted(route_name, budget),
-            None => probe_resource_not_found_response(route_name),
+        return Err(if business {
+            resource_not_found_response(route_name)
+        } else {
+            probe_resource_not_found_response(route_name)
         }
         .into());
     };
     if route_matches_expected_crm(&route, expected) {
         Ok(route)
     } else {
-        Err(match budget {
-            Some(budget) => crm_contract_mismatch_response_budgeted(route_name, budget),
-            None => crm_contract_mismatch_response(route_name),
+        Err(if business {
+            phased_crm_contract_mismatch_response(route_name)
+        } else {
+            crm_contract_mismatch_response(route_name)
         }
         .into())
     }
@@ -852,12 +793,9 @@ pub fn build_router(state: Arc<RelayState>) -> Router {
     let data_router = Router::new()
         .route(KEYED_PATH, post(keyed_call_handler))
         .route(RECOVER_PATH, post(recover_call_handler))
-        .route("/{route_name}/{method_name}", post(call_handler))
-        .route("/{route_name}/_topics/{topic_name}", post(topic_handler))
-        .route(
-            "/{route_name}/_topics/{topic_name}/_confirm",
-            post(topic_confirm_handler),
-        )
+        .route(CALL_PATH, post(call_handler))
+        .route(TOPIC_SUBSCRIBE_PATH, post(topic_handler))
+        .route(TOPIC_CONFIRM_PATH, post(topic_confirm_handler))
         .layer(DefaultBodyLimit::disable());
 
     Router::new()
@@ -867,14 +805,22 @@ pub fn build_router(state: Arc<RelayState>) -> Router {
         .layer(axum::middleware::from_fn(finish_unread_body_rejection))
 }
 
+#[derive(serde::Deserialize)]
+struct TopicQuery {
+    route: String,
+    topic: String,
+}
+
 async fn topic_handler(
     State(state): State<Arc<RelayState>>,
-    Path((route_name, topic_name)): Path<(String, String)>,
+    Query(TopicQuery {
+        route: route_name,
+        topic: topic_name,
+    }): Query<TopicQuery>,
     OptionalTopicConnection(connection): OptionalTopicConnection,
     headers: HeaderMap,
 ) -> Response {
-    let budget = state.forwarding.budget().clone();
-    let expected = match expected_crm_from_headers(&route_name, &headers, Some(&budget)) {
+    let expected = match expected_crm_from_headers(&route_name, &headers) {
         Ok(expected) => expected,
         Err(response) => return response.into_response(),
     };
@@ -896,6 +842,10 @@ async fn topic_handler(
     let origin_only = match origin_only_from_headers(&headers) {
         Ok(value) => value,
         Err(response) => return response,
+    };
+    let metadata = match crate::http_wire::metadata_from_headers(&headers) {
+        Ok(metadata) => metadata,
+        Err(error) => return topic_error_response(error),
     };
     let start = match headers
         .get("x-c2-topic-start")
@@ -940,18 +890,17 @@ async fn topic_handler(
                 .iter()
                 .any(|route| route.name == route_name)
             {
-                return crm_contract_mismatch_response_budgeted(&route_name, &budget);
+                return phased_crm_contract_mismatch_response(&route_name);
             }
-            return resource_not_found_response_budgeted(&route_name, &budget);
+            return resource_not_found_response(&route_name);
         }
         // Loop prevention: a relay-to-relay upstream must land on the relay
         // that hosts the registration. Never forward it onward.
         if origin_only {
-            return resource_unavailable_response_budgeted(
+            return phased_resource_unavailable_response(
                 &route_name,
                 "origin-only topic request must target a local route",
                 "pre_dispatch",
-                &budget,
             );
         }
         let Some(entry) = resolved else {
@@ -962,23 +911,15 @@ async fn topic_handler(
             Err(error) => return forwarding_capacity_response(&route_name, error.to_string()),
         };
         return match require_send(super::topic_hub::subscribe_remote(
-            state,
-            entry,
-            expected,
-            topic_name,
-            options,
-            permit,
-            tracked,
-            connection,
+            state, entry, expected, topic_name, options, metadata, permit, tracked, connection,
         ))
         .await
         {
             Ok(response) => response,
-            Err(error) => topic_error_response(error, &budget),
+            Err(error) => topic_error_response(error),
         };
     }
-    let route = match validate_expected_crm_for_route(&state, &route_name, &expected, Some(&budget))
-    {
+    let route = match validate_expected_crm_for_route(&state, &route_name, &expected, true) {
         Ok(route) => route,
         Err(response) => return response.into_response(),
     };
@@ -997,20 +938,19 @@ async fn topic_handler(
                 (lease, binding, route)
             }
             RequestClient::WatchUnavailable { route, reason } => {
-                return route_watch_unavailable_response_budgeted(&route.name, reason, &budget);
+                return phased_route_watch_unavailable_response(&route.name, reason);
             }
             RequestClient::NotFound => {
-                return resource_not_found_response_budgeted(&route_name, &budget);
+                return resource_not_found_response(&route_name);
             }
             RequestClient::RouteError(error) => {
-                return ipc_route_error_response(&route_name, &error, Some(&budget));
+                return ipc_route_error_response(&route_name, &error, true);
             }
             RequestClient::Unreachable => {
-                return resource_unavailable_response_budgeted(
+                return phased_resource_unavailable_response(
                     &route_name,
                     "relay upstream unavailable",
                     "pre_dispatch",
-                    &budget,
                 );
             }
         };
@@ -1022,6 +962,7 @@ async fn topic_handler(
         current,
         topic_name,
         options,
+        metadata,
         lease,
         binding,
         permit,
@@ -1032,23 +973,28 @@ async fn topic_handler(
     .await
     {
         Ok(response) => response,
-        Err(error) => topic_error_response(error, &budget),
+        Err(error) => topic_error_response(error),
     }
 }
 
-fn topic_error_response(mut error: c2_error::C2Error, budget: &DomainBudget) -> Response {
+fn topic_error_response(mut error: c2_error::C2Error) -> Response {
     error
         .details
-        .insert("dispatch_phase".into(), "pre_dispatch".into());
+        .entry("dispatch_phase".into())
+        .or_insert_with(|| "pre_dispatch".into());
     let status = match error.code {
+        c2_error::ErrorCode::AdmissionDenied => StatusCode::FORBIDDEN,
+        c2_error::ErrorCode::ProtocolViolation => StatusCode::BAD_REQUEST,
         c2_error::ErrorCode::ResourceNotFound => StatusCode::NOT_FOUND,
         c2_error::ErrorCode::ContractMismatch | c2_error::ErrorCode::RouteConflict => {
             StatusCode::CONFLICT
         }
-        c2_error::ErrorCode::CallCapacityExceeded => StatusCode::SERVICE_UNAVAILABLE,
+        c2_error::ErrorCode::ResourceClosed
+        | c2_error::ErrorCode::CallCancelled
+        | c2_error::ErrorCode::CallCapacityExceeded => StatusCode::SERVICE_UNAVAILABLE,
         _ => StatusCode::BAD_GATEWAY,
     };
-    json_error_response(status, error.envelope(), Some(budget))
+    control_error_response(status, error)
 }
 
 fn require_send<F: std::future::Future + Send>(future: F) -> F {
@@ -1056,10 +1002,11 @@ fn require_send<F: std::future::Future + Send>(future: F) -> F {
 }
 
 fn origin_only_from_headers(headers: &HeaderMap) -> Result<bool, Response> {
-    match headers.get(super::topic_remote::ORIGIN_ONLY_HEADER) {
-        None => Ok(false),
-        Some(value) if value.as_bytes() == b"1" => Ok(true),
-        Some(_) => Err(c2_error_response(
+    use super::topic_remote::ORIGIN_ONLY_HEADER;
+    match crate::http_wire::single_header(headers, ORIGIN_ONLY_HEADER) {
+        None if !headers.contains_key(ORIGIN_ONLY_HEADER) => Ok(false),
+        Some("1") => Ok(true),
+        _ => Err(c2_error_response(
             StatusCode::BAD_REQUEST,
             c2_error::ErrorCode::ProtocolViolation,
             "invalid relay origin header",
@@ -1068,15 +1015,84 @@ fn origin_only_from_headers(headers: &HeaderMap) -> Result<bool, Response> {
     }
 }
 
-/// `POST /{route_name}/_topics/{topic_name}/_confirm` — the lightweight
-/// cross-relay source confirmation. Carries no payload bytes; the source
-/// relay verifies the route still serves the caller's registration and
-/// returns the topic head sequence from the active hub's subscription.
+/// Confirm a late joiner's topic head through an origin-only subscription.
 async fn topic_confirm_handler(
     State(state): State<Arc<RelayState>>,
-    Path((route_name, topic_name)): Path<(String, String)>,
+    Query(TopicQuery {
+        route: route_name,
+        topic: topic_name,
+    }): Query<TopicQuery>,
     headers: HeaderMap,
 ) -> Response {
+    use super::topic_hub::closed_confirmation;
+    use super::topic_remote::{
+        EXPECTED_REGISTRATION_HEADER, UPSTREAM_TOKEN_HEADER, registration_fingerprint,
+        valid_fingerprint, valid_token,
+    };
+    use crate::http_wire::{metadata_from_headers, single_header};
+    use c2_error::{C2Error, ErrorCode};
+
+    let Ok(_permit) = state.outcome_queries.try_acquire() else {
+        return topic_error_response(C2Error::new(
+            ErrorCode::CallCapacityExceeded,
+            "all relay control slots are in use",
+        ));
+    };
+    if !matches!(origin_only_from_headers(&headers), Ok(true))
+        || (headers.contains_key(header::CONTENT_LENGTH)
+            && single_header(&headers, "content-length") != Some("0"))
+        || headers.contains_key(header::TRANSFER_ENCODING)
+    {
+        return topic_error_response(C2Error::new(
+            ErrorCode::ProtocolViolation,
+            "invalid topic confirmation headers",
+        ));
+    }
+    let metadata = match metadata_from_headers(&headers) {
+        Ok(metadata) => metadata,
+        Err(error) => return topic_error_response(error),
+    };
+    let expected = match expected_crm_from_headers(&route_name, &headers) {
+        Ok(expected) => expected,
+        Err(response) => return response.into_response(),
+    };
+    let Some(registration) = single_header(&headers, EXPECTED_REGISTRATION_HEADER)
+        .filter(|value| valid_fingerprint(value))
+    else {
+        return topic_error_response(C2Error::new(
+            ErrorCode::ProtocolViolation,
+            "invalid topic confirmation registration fingerprint",
+        ));
+    };
+    let Some(token) =
+        single_header(&headers, UPSTREAM_TOKEN_HEADER).filter(|value| valid_token(value))
+    else {
+        return topic_error_response(C2Error::new(
+            ErrorCode::ProtocolViolation,
+            "invalid topic confirmation upstream token",
+        ));
+    };
+    let Some(route) = state.local_route(&route_name) else {
+        return topic_error_response(closed_confirmation());
+    };
+    let (Some(instance), Some(route_uid)) = (&route.server_instance_id, &route.route_uid) else {
+        return topic_error_response(closed_confirmation());
+    };
+    if registration_fingerprint(instance, route_uid) != registration {
+        return topic_error_response(closed_confirmation());
+    }
+    let Some(confirmation) = state
+        .topics
+        .confirmation(instance, route_uid, &topic_name, token)
+    else {
+        return topic_error_response(closed_confirmation());
+    };
+    if !confirmation.is_live() {
+        return topic_error_response(closed_confirmation());
+    }
+    if !route_matches_expected_crm(&route, &expected) {
+        return phased_crm_contract_mismatch_response(&route_name);
+    }
     #[cfg(feature = "test-support")]
     {
         state
@@ -1088,106 +1104,21 @@ async fn topic_confirm_handler(
             let _ = release.await;
         }
     }
-    let budget = state.forwarding.budget().clone();
-    let expected = match expected_crm_from_headers(&route_name, &headers, Some(&budget)) {
-        Ok(expected) => expected,
-        Err(response) => return response.into_response(),
-    };
-    if headers
-        .get(header::CONTENT_LENGTH)
-        .and_then(|v| v.to_str().ok())
-        .is_some_and(|v| v != "0")
-        || headers.contains_key(header::TRANSFER_ENCODING)
+    let result = confirmation.confirm(&metadata).await;
+    if !confirmation.is_live()
+        || !state
+            .local_route(&route_name)
+            .is_some_and(|current| super::types::local_route_matches(&current, &route))
     {
-        return c2_error_response(
-            StatusCode::BAD_REQUEST,
-            c2_error::ErrorCode::ProtocolViolation,
-            "invalid topic confirmation headers",
-            [("dispatch_phase", "pre_dispatch")],
-        );
+        return topic_error_response(closed_confirmation());
     }
-    if !matches!(origin_only_from_headers(&headers), Ok(true)) {
-        return c2_error_response(
-            StatusCode::BAD_REQUEST,
-            c2_error::ErrorCode::ProtocolViolation,
-            "topic confirmation requires the relay origin header",
-            [("dispatch_phase", "pre_dispatch")],
-        );
-    }
-    let registration = match headers
-        .get(super::topic_remote::EXPECTED_REGISTRATION_HEADER)
-        .and_then(|value| value.to_str().ok())
-    {
-        Some(value) if !value.is_empty() => value.to_string(),
-        _ => {
-            return c2_error_response(
-                StatusCode::BAD_REQUEST,
-                c2_error::ErrorCode::ProtocolViolation,
-                "topic confirmation requires the source registration identity",
-                [("dispatch_phase", "pre_dispatch")],
-            );
-        }
-    };
-    let resolved = match state.resolve_matching(&expected) {
-        Ok(resolved) => resolved,
-        Err(error) => return route_resolution_error_response(&route_name, error),
-    };
-    // Loop prevention, identical to the subscription endpoint: the
-    // confirmation answers for a registration this relay hosts. A name that
-    // left the mesh entirely is an unregistered registration, not a refusal
-    // to forward: it isolates the requester's hub.
-    let Some(route) = state.local_route(&route_name) else {
-        if resolved.is_none() {
-            return resource_not_found_response_budgeted(&route_name, &budget);
-        }
-        return resource_unavailable_response_budgeted(
-            &route_name,
-            "origin-only topic confirmation must target a local route",
-            "pre_dispatch",
-            &budget,
-        );
-    };
-    if !route_matches_expected_crm(&route, &expected) {
-        return crm_contract_mismatch_response_budgeted(&route_name, &budget);
-    }
-    let (Some(instance), Some(route_uid)) = (&route.server_instance_id, &route.route_uid) else {
-        return resource_unavailable_response_budgeted(
-            &route_name,
-            "local route has no registration identity",
-            "pre_dispatch",
-            &budget,
-        );
-    };
-    // The fingerprint covers the server instance and the registration's route
-    // UID, so a same-process re-registration can never confirm an old hub.
-    if super::topic_remote::registration_fingerprint(instance, route_uid) != registration {
-        return c2_error_response_with_budget(
-            StatusCode::SERVICE_UNAVAILABLE,
-            c2_error::ErrorCode::CallCancelled,
-            "subscription cancelled: route_unregistered",
-            [
-                ("route".to_string(), route_name.clone()),
-                ("cause".to_string(), "route_unregistered".to_string()),
-                ("dispatch_phase".to_string(), "pre_dispatch".to_string()),
-            ],
-            &budget,
-        );
-    }
-    let Some(source) = state.topics.active_local(instance, route_uid, &topic_name) else {
-        return resource_unavailable_response_budgeted(
-            &route_name,
-            "source topic subscription is not active",
-            "pre_dispatch",
-            &budget,
-        );
-    };
-    match source.head_seq().await {
+    match result {
         Ok(head_seq) => (
             StatusCode::OK,
             Json(serde_json::json!({ "head_seq": head_seq })),
         )
             .into_response(),
-        Err(error) => topic_error_response(error, &budget),
+        Err(error) => topic_error_response(error),
     }
 }
 
@@ -2140,11 +2071,10 @@ async fn read_unknown_length_body(
             Ok(chunk) => chunk,
             Err(err) => {
                 drop((payload, buffers));
-                return Err(json_error_response(
+                return Err((
                     StatusCode::BAD_REQUEST,
-                    serde_json::json!({"error":"RequestBodyReadError", "route":route_name, "message":err.to_string()}),
-                    Some(budget),
-                )
+                    Json(serde_json::json!({"error":"RequestBodyReadError", "route":route_name, "message":err.to_string()})),
+                ).into_response()
                 .into());
             }
         };
@@ -2154,13 +2084,11 @@ async fn read_unknown_length_body(
         let next_len = (payload.len() as u64).saturating_add(chunk.len() as u64);
         if next_len > max_payload_size {
             drop((payload, buffers));
-            return Err(
-                payload_too_large_response(route_name, next_len, max_payload_size, budget).into(),
-            );
+            return Err(payload_too_large_response(route_name, next_len, max_payload_size).into());
         }
         if next_len > limit {
             drop((payload, buffers));
-            return Err(unknown_length_too_large_response(route_name, limit, budget).into());
+            return Err(unknown_length_too_large_response(route_name, limit).into());
         }
         if buffers.is_none() {
             let plan = SendBufferPlan::new(
@@ -2346,7 +2274,7 @@ async fn handle_probe_in_context(
     state: Arc<RelayState>,
     headers: HeaderMap,
 ) -> Response {
-    let expected_crm = match expected_crm_from_headers(&route_name, &headers, None) {
+    let expected_crm = match expected_crm_from_headers(&route_name, &headers) {
         Ok(expected) => expected,
         Err(response) => return response.into_response(),
     };
@@ -2354,7 +2282,7 @@ async fn handle_probe_in_context(
         return probe_route_conflict_response(&route_name, error);
     }
     let advertised_route =
-        match validate_expected_crm_for_route(&state, &route_name, &expected_crm, None) {
+        match validate_expected_crm_for_route(&state, &route_name, &expected_crm, false) {
             Ok(route) => route,
             Err(response) => return response.into_response(),
         };
@@ -2370,7 +2298,7 @@ async fn handle_probe_in_context(
             route_watch_unavailable_response(&route.name, reason)
         }
         RequestClient::NotFound => probe_resource_not_found_response(&route_name),
-        RequestClient::RouteError(error) => ipc_route_error_response(&route_name, &error, None),
+        RequestClient::RouteError(error) => ipc_route_error_response(&route_name, &error, false),
         RequestClient::Unreachable => resource_unavailable_response(
             &route_name,
             format!("relay upstream unavailable: {route_name}"),
@@ -2415,6 +2343,7 @@ async fn keyed_call_handler(
     headers: HeaderMap,
     body: Body,
 ) -> ResponseResult<Response> {
+    let metadata = call_metadata(&headers)?;
     let call_id = call_id_from_headers(&headers)?.to_owned();
     Ok(admit_call(
         state,
@@ -2424,6 +2353,7 @@ async fn keyed_call_handler(
         headers,
         body,
         ForwardMode::Unary(Some(call_id)),
+        metadata,
     )
     .await)
 }
@@ -2435,6 +2365,7 @@ async fn recover_call_handler(
     headers: HeaderMap,
     body: Body,
 ) -> ResponseResult<Response> {
+    let metadata = call_metadata(&headers)?;
     let call_id = call_id_from_headers(&headers)?.to_owned();
     if !matches!(length.0, Ok(None | Some(0))) || axum::body::to_bytes(body, 0).await.is_err() {
         return Err((StatusCode::BAD_REQUEST, "recovery requires an empty body")
@@ -2449,6 +2380,7 @@ async fn recover_call_handler(
         headers,
         Body::empty(),
         ForwardMode::Recover(call_id),
+        metadata,
     )
     .await)
 }
@@ -2457,25 +2389,32 @@ async fn query_call_handler(
     State(state): State<Arc<RelayState>>,
     Query(query): Query<RouteQuery>,
     headers: HeaderMap,
-    _body: Bytes,
+    request: Request,
 ) -> ResponseResult<Response> {
+    let metadata = call_metadata(&headers)?;
+    let _body = Bytes::from_request(request, &state)
+        .await
+        .map_err(IntoResponse::into_response)?;
     let call_id = call_id_from_headers(&headers)?;
-    let expected = expected_crm_from_headers(&query.route, &headers, None)?;
-    let route = validate_expected_crm_for_route(&state, &query.route, &expected, None)?;
+    let expected = expected_crm_from_headers(&query.route, &headers)?;
+    let route = validate_expected_crm_for_route(&state, &query.route, &expected, true)?;
     // The upstream IPC client separately limits its own control records.
     let Ok(_permit) = state.outcome_queries.try_acquire() else {
         return Ok(c2_error_response(
             StatusCode::SERVICE_UNAVAILABLE,
             c2_error::ErrorCode::CallCapacityExceeded,
             "all relay query slots are in use",
-            [("route", query.route)],
+            [
+                ("route", query.route),
+                ("dispatch_phase", "pre_dispatch".into()),
+            ],
         ));
     };
     let response = match acquire_request_client_for_route(state.clone(), &route).await {
         RequestClient::Ready(ready) => match ready
             .lease
             .client()
-            .query_call(&ready.binding, call_id, OUTCOME_QUERY_TIMEOUT)
+            .query_call(&ready.binding, call_id, OUTCOME_QUERY_TIMEOUT, &metadata)
             .await
         {
             Ok(outcome) => (
@@ -2483,31 +2422,34 @@ async fn query_call_handler(
                 Json(OutcomeJson::from(outcome)),
             )
                 .into_response(),
-            Err(error) => ipc_route_error_response(&query.route, &error, None),
+            Err(error) => ipc_route_error_response(&query.route, &error, true),
         },
         RequestClient::WatchUnavailable { route, reason } => {
-            route_watch_unavailable_response(&route.name, reason)
+            phased_route_watch_unavailable_response(&route.name, reason)
         }
-        RequestClient::NotFound => probe_resource_not_found_response(&query.route),
-        RequestClient::RouteError(error) => ipc_route_error_response(&query.route, &error, None),
-        RequestClient::Unreachable => {
-            resource_unavailable_response(&query.route, "relay upstream unavailable")
-        }
+        RequestClient::NotFound => resource_not_found_response(&query.route),
+        RequestClient::RouteError(error) => ipc_route_error_response(&query.route, &error, true),
+        RequestClient::Unreachable => phased_resource_unavailable_response(
+            &query.route,
+            "relay upstream unavailable",
+            "pre_dispatch",
+        ),
     };
     Ok(response)
 }
 
-/// `POST /{route_name}/{method_name}` — relay CRM call to upstream.
+/// Forward a route-bound CRM call to the upstream Host.
 ///
 /// If the upstream was evicted by the idle sweeper, attempts a lazy
 /// reconnect before returning 502.
 async fn call_handler(
     State(state): State<Arc<RelayState>>,
-    Path((route_name, method_name)): Path<(String, String)>,
+    Query(UnaryQuery { route, method }): Query<UnaryQuery>,
     Extension(declared_length): Extension<DeclaredBodyLength>,
     headers: HeaderMap,
     body: Body,
-) -> Response {
+) -> ResponseResult<Response> {
+    let metadata = call_metadata(&headers)?;
     let mode = if headers
         .get(header::ACCEPT)
         .is_some_and(|value| value.as_bytes() == crate::stream_wire::MEDIA_TYPE.as_bytes())
@@ -2516,16 +2458,17 @@ async fn call_handler(
     } else {
         ForwardMode::Unary(None)
     };
-    admit_call(
+    Ok(admit_call(
         state,
-        route_name,
-        method_name,
+        route,
+        method,
         declared_length,
         headers,
         body,
         mode,
+        metadata,
     )
-    .await
+    .await)
 }
 
 async fn admit_call(
@@ -2536,25 +2479,25 @@ async fn admit_call(
     headers: HeaderMap,
     body: Body,
     mode: ForwardMode,
+    metadata: CallMetadata,
 ) -> Response {
-    let budget = state.forwarding.budget().clone();
-    let expected_crm = match expected_crm_from_headers(&route_name, &headers, Some(&budget)) {
+    let expected_crm = match expected_crm_from_headers(&route_name, &headers) {
         Ok(expected) => expected,
         Err(response) => return response.into_response(),
     };
     let advertised_route =
-        match validate_expected_crm_for_route(&state, &route_name, &expected_crm, Some(&budget)) {
+        match validate_expected_crm_for_route(&state, &route_name, &expected_crm, true) {
             Ok(route) => route,
             Err(response) => return response.into_response(),
         };
     let content_length = match declared_length.0 {
         Ok(value) => value,
         Err(message) => {
-            return json_error_response(
+            return (
                 StatusCode::BAD_REQUEST,
-                serde_json::json!({"error": "InvalidContentLength", "message": message}),
-                Some(&budget),
-            );
+                Json(serde_json::json!({"error": "InvalidContentLength", "message": message})),
+            )
+                .into_response();
         }
     };
     if let Some(content_length) = content_length
@@ -2564,7 +2507,6 @@ async fn admit_call(
             &route_name,
             content_length,
             advertised_route.max_payload_size,
-            &budget,
         );
     }
     #[cfg(test)]
@@ -2588,6 +2530,7 @@ async fn admit_call(
             permit,
             cancelled,
             mode,
+            metadata,
         )
         .await
     };
@@ -2603,11 +2546,10 @@ async fn admit_call(
         .expect("admitted forwarding task retains its input receiver");
     match waiter.await {
         Ok(response) => response,
-        Err(_) => resource_unavailable_response_budgeted(
+        Err(_) => phased_resource_unavailable_response(
             &route_name,
             "relay forwarding transaction failed",
             "dispatch_uncertain",
-            &budget,
         ),
     }
 }
@@ -2668,16 +2610,6 @@ fn forwarding_capacity_response(_route_name: &str, _message: impl Into<String>) 
         .into_response()
 }
 
-fn uncertain_error_control_response() -> Response {
-    const BODY: &[u8] = br#"{"version":1,"code":702,"name":"ResourceUnavailable","message":"relay error response exceeds payload budget","details":{"dispatch_phase":"dispatch_uncertain"}}"#;
-    (
-        StatusCode::BAD_GATEWAY,
-        [(header::CONTENT_TYPE, "application/json")],
-        Body::from(Bytes::from_static(BODY)),
-    )
-        .into_response()
-}
-
 // This future belongs to the bounded native domain, never to the HTTP handler.
 async fn forward_call(
     state: Arc<RelayState>,
@@ -2689,6 +2621,7 @@ async fn forward_call(
     permit: c2_mem::OperationPermit,
     cancelled: CancellationToken,
     mode: ForwardMode,
+    metadata: CallMetadata,
 ) -> Response {
     let server_stream = matches!(mode, ForwardMode::Stream);
     let keyed = matches!(mode, ForwardMode::Recover(_) | ForwardMode::Unary(Some(_)));
@@ -2716,7 +2649,7 @@ async fn forward_call(
             let buffers = tokio::select! {
                 biased;
                 _ = cancelled.cancelled() => return StatusCode::NO_CONTENT.into_response(),
-                _ = shutdown.cancelled(), if server_stream => return relay_shutdown_refusal(&route_name, &budget),
+                _ = shutdown.cancelled(), if server_stream => return relay_shutdown_refusal(&route_name),
                 buffers = reserve_send_buffers(&budget, plan, None) => buffers,
             };
             let SendBuffers {
@@ -2735,7 +2668,7 @@ async fn forward_call(
         None => {
             let prepared = tokio::select! {
                 biased;
-                _ = shutdown.cancelled(), if server_stream => return relay_shutdown_refusal(&route_name, &budget),
+                _ = shutdown.cancelled(), if server_stream => return relay_shutdown_refusal(&route_name),
                 prepared = read_unknown_length_body(&route_name, body, advertised_route.max_payload_size, &budget, &cancelled, copy_cap) => prepared,
             };
             let prepared = match prepared {
@@ -2765,7 +2698,7 @@ async fn forward_call(
         return StatusCode::NO_CONTENT.into_response();
     }
     if server_stream && shutdown.is_cancelled() {
-        return relay_shutdown_refusal(&route_name, &budget);
+        return relay_shutdown_refusal(&route_name);
     }
     let (lease, binding, current_route) =
         match acquire_request_client_for_route(state.clone(), &advertised_route).await {
@@ -2779,34 +2712,28 @@ async fn forward_call(
             }
             RequestClient::WatchUnavailable { route, reason } => {
                 drop((chunks, upload, download));
-                return route_watch_unavailable_response_budgeted(&route.name, reason, &budget);
+                return phased_route_watch_unavailable_response(&route.name, reason);
             }
             RequestClient::NotFound => {
                 drop((chunks, upload, download));
-                return resource_not_found_response_budgeted(&route_name, &budget);
+                return resource_not_found_response(&route_name);
             }
             RequestClient::RouteError(error) => {
                 drop((chunks, upload, download));
-                return ipc_route_error_response(&route_name, &error, Some(&budget));
+                return ipc_route_error_response(&route_name, &error, true);
             }
             RequestClient::Unreachable => {
                 drop((chunks, upload, download));
-                return resource_unavailable_response_budgeted(
+                return phased_resource_unavailable_response(
                     &route_name,
                     format!("relay upstream unavailable: {route_name}"),
                     "pre_dispatch",
-                    &budget,
                 );
             }
         };
     if input_len > current_route.max_payload_size {
         drop((chunks, upload, download));
-        return payload_too_large_response(
-            &route_name,
-            input_len,
-            current_route.max_payload_size,
-            &budget,
-        );
+        return payload_too_large_response(&route_name, input_len, current_route.max_payload_size);
     }
     let client = lease.client();
     if cancelled.is_cancelled() {
@@ -2814,7 +2741,7 @@ async fn forward_call(
     }
     if server_stream && shutdown.is_cancelled() {
         drop((chunks, upload, download));
-        return relay_shutdown_refusal(&route_name, &budget);
+        return relay_shutdown_refusal(&route_name);
     }
 
     enum ForwardedResponse {
@@ -2825,7 +2752,14 @@ async fn forward_call(
     let phase_and_source = |error: c2_ipc::IpcCallError| (error.phase(), error.into_source());
     let call_result = match mode {
         ForwardMode::Stream => match client
-            .forward_stream_bound_sized_phased(&binding, &method_name, input_len, chunks, upload)
+            .forward_stream_bound_sized_phased(
+                &binding,
+                &method_name,
+                input_len,
+                chunks,
+                upload,
+                &metadata,
+            )
             .await
         {
             Ok(stream) => finish_stream_upload(stream, &cancelled, &shutdown)
@@ -2842,6 +2776,7 @@ async fn forward_call(
                 input_len,
                 chunks,
                 upload,
+                &metadata,
             )
             .await
             .map(ForwardedResponse::Unary)
@@ -2849,7 +2784,7 @@ async fn forward_call(
         ForwardMode::Recover(call_id) => {
             drop((chunks, upload));
             client
-                .forward_recover_bound_phased(&binding, &method_name, &call_id)
+                .forward_recover_bound_phased(&binding, &method_name, &call_id, &metadata)
                 .await
                 .map(ForwardedResponse::Unary)
                 .map_err(phase_and_source)
@@ -2878,11 +2813,10 @@ async fn forward_call(
             width,
         ) {
             Ok(response) => response,
-            Err(error) => resource_unavailable_response_budgeted(
+            Err(error) => phased_resource_unavailable_response(
                 &route_name,
                 format!("cannot create call cancellation token: {error}"),
                 "dispatch_uncertain",
-                &budget,
             ),
         },
         Err((phase, error)) => {
@@ -2899,12 +2833,11 @@ async fn forward_call(
                 }
             }
             match error {
-                c2_ipc::IpcError::MethodNotFound { .. } if keyed => c2_error_response_with_budget(
+                c2_ipc::IpcError::MethodNotFound { .. } if keyed => c2_error_response(
                     StatusCode::NOT_ACCEPTABLE,
                     c2_error::ErrorCode::UnsupportedCallMode,
                     "outcome operations require a declared unary method",
                     [("dispatch_phase", "pre_dispatch")],
-                    &budget,
                 ),
                 c2_ipc::IpcError::CallRejected(error) => {
                     drop(download);
@@ -2918,7 +2851,7 @@ async fn forward_call(
                             reason,
                         );
                     }
-                    ipc_route_error_response(&route_name, &error, Some(&budget))
+                    ipc_route_error_response(&route_name, &error, true)
                 }
                 c2_ipc::IpcError::LocalCallRejected(error)
                     if matches!(phase, c2_ipc::TransportPhase::PreDispatch)
@@ -2946,7 +2879,7 @@ async fn forward_call(
                             reason,
                         );
                     }
-                    ipc_route_error_response(&route_name, &error, Some(&budget))
+                    ipc_route_error_response(&route_name, &error, true)
                 }
                 error
                     if matches!(
@@ -2959,11 +2892,10 @@ async fn forward_call(
                     // Reply admission rejects only this RID; the receiver
                     // keeps serving other calls on the healthy connection.
                     // Dispatch already happened, so replay is still unsafe.
-                    resource_unavailable_response_budgeted(
+                    phased_resource_unavailable_response(
                         &route_name,
                         format!("relay error after possible dispatch: {error}"),
                         "dispatch_uncertain",
-                        &budget,
                     )
                 }
                 error => {
@@ -2976,11 +2908,10 @@ async fn forward_call(
                         // observes confirmed cleanup beyond transaction completion.
                         state.clients.close(&old_client);
                     }
-                    resource_unavailable_response_budgeted(
+                    phased_resource_unavailable_response(
                         &route_name,
                         format!("relay error after possible dispatch: {error}"),
                         "dispatch_uncertain",
-                        &budget,
                     )
                 }
             }
@@ -3024,14 +2955,14 @@ async fn finish_stream_upload(
     }
 }
 
-fn relay_shutdown_refusal(route: &str, budget: &DomainBudget) -> Response {
+fn relay_shutdown_refusal(route: &str) -> Response {
     ipc_route_error_response(
         route,
         &c2_ipc::IpcError::CallRejected(c2_error::C2Error::new(
             c2_error::ErrorCode::CallCancelled,
             "server stream cancelled by relay shutdown",
         )),
-        Some(budget),
+        true,
     )
 }
 
@@ -3083,7 +3014,7 @@ async fn acquire_request_client_for_route(
 fn ipc_route_error_response(
     route_name: &str,
     error: &c2_ipc::IpcError,
-    budget: Option<&DomainBudget>,
+    business: bool,
 ) -> Response {
     use c2_error::{C2Error, ErrorCode};
     let semantic_error_response = |status, mut error: C2Error| {
@@ -3092,7 +3023,7 @@ fn ipc_route_error_response(
             error.details.remove("transport_phase");
             return (status, Body::from(error.to_wire_bytes())).into_response();
         }
-        if budget.is_some() || error.code.is_outcome_control() {
+        if business || error.code.is_host_control() {
             error
                 .details
                 .insert("dispatch_phase".into(), "pre_dispatch".into());
@@ -3105,12 +3036,22 @@ fn ipc_route_error_response(
             error.details.remove("dispatch_phase");
             error.details.remove("transport_phase");
         }
-        json_error_response(status, error.envelope(), budget)
+        control_error_response(status, error)
     };
 
     match error {
         c2_ipc::IpcError::CallRejected(error) => {
             let status = match error.code {
+                ErrorCode::AdmissionDenied => StatusCode::FORBIDDEN,
+                ErrorCode::CallCancelled => StatusCode::SERVICE_UNAVAILABLE,
+                ErrorCode::ProtocolViolation
+                    if error
+                        .details
+                        .get("stage")
+                        .is_some_and(|stage| stage == "call_metadata_validation") =>
+                {
+                    StatusCode::BAD_REQUEST
+                }
                 ErrorCode::ResourceNotFound => StatusCode::NOT_FOUND,
                 ErrorCode::UnsupportedCallMode => StatusCode::NOT_ACCEPTABLE,
                 ErrorCode::ResourceRemoved => StatusCode::GONE,
@@ -3225,18 +3166,15 @@ fn ipc_route_error_response(
                 ("transport".to_string(), "ipc".to_string()),
             ])),
         ),
-        error => match budget {
-            Some(budget) => resource_unavailable_response_budgeted(
-                route_name,
-                format!("relay upstream unavailable before dispatch: {error}"),
-                "pre_dispatch",
-                budget,
-            ),
-            None => resource_unavailable_response(
-                route_name,
-                format!("relay upstream unavailable before dispatch: {error}"),
-            ),
-        },
+        error if business => phased_resource_unavailable_response(
+            route_name,
+            format!("relay upstream unavailable before dispatch: {error}"),
+            "pre_dispatch",
+        ),
+        error => resource_unavailable_response(
+            route_name,
+            format!("relay upstream unavailable before dispatch: {error}"),
+        ),
     }
 }
 
@@ -3601,9 +3539,7 @@ mod tests {
 
         for (error, expected_status, expected_code) in cases {
             for business in [false, true] {
-                let budget = crate::payload::memory_only_budget(64 * 1024);
-                let response =
-                    ipc_route_error_response("grid", &error, business.then_some(&budget));
+                let response = ipc_route_error_response("grid", &error, business);
                 assert_eq!(response.status(), expected_status, "error={error}");
                 let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
                 let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
@@ -3631,19 +3567,15 @@ mod tests {
         }
 
         let response =
-            ipc_route_error_response("grid", &c2_ipc::IpcError::Config("offline".into()), None);
+            ipc_route_error_response("grid", &c2_ipc::IpcError::Config("offline".into()), false);
         assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(body["name"], "ResourceUnavailable");
         assert!(body["details"].get("dispatch_phase").is_none());
 
-        let budget = crate::payload::memory_only_budget(64 * 1024);
-        let business_response = ipc_route_error_response(
-            "grid",
-            &c2_ipc::IpcError::Config("offline".into()),
-            Some(&budget),
-        );
+        let business_response =
+            ipc_route_error_response("grid", &c2_ipc::IpcError::Config("offline".into()), true);
         assert_eq!(business_response.status(), StatusCode::BAD_GATEWAY);
         let business_body = to_bytes(business_response.into_body(), usize::MAX)
             .await
@@ -3676,11 +3608,10 @@ mod tests {
             let original = C2Error::new(code, format!("rejected: {}", code.name()))
                 .with_details(BTreeMap::from([("source".into(), "server".into())]));
             for business in [false, true] {
-                let budget = crate::payload::memory_only_budget(64 * 1024);
                 let response = ipc_route_error_response(
                     "grid",
                     &c2_ipc::IpcError::CallRejected(original.clone()),
-                    business.then_some(&budget),
+                    business,
                 );
                 assert_eq!(response.status(), status, "code={code:?}");
                 let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
@@ -3706,8 +3637,7 @@ mod tests {
             ),
         );
         for business in [false, true] {
-            let budget = crate::payload::memory_only_budget(64 * 1024);
-            let response = ipc_route_error_response("grid", &error, business.then_some(&budget));
+            let response = ipc_route_error_response("grid", &error, business);
             let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
             let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
             if business {
@@ -4399,7 +4329,10 @@ mod tests {
                 Some(candidate.server_instance_id.as_str())
             );
             let binding = ipc.acquire_route(&expected).await.unwrap();
-            let response = ipc.call_bound(&binding, "ping", b"").await.unwrap();
+            let response = ipc
+                .call_bound(&binding, "ping", b"", &CallMetadata::empty())
+                .await
+                .unwrap();
             assert_eq!(
                 response.into_owned_bytes().unwrap(),
                 if index == 0 {
@@ -4426,7 +4359,10 @@ mod tests {
             .unwrap();
             assert!(matches!(target, RelayResolvedTarget::Http { .. }));
             assert_eq!(
-                wrong_client.call_async("ping", b"").await.unwrap(),
+                wrong_client
+                    .call_async("ping", b"", &CallMetadata::empty())
+                    .await
+                    .unwrap(),
                 if index == 0 {
                     b"root-a".to_vec()
                 } else {
@@ -4477,7 +4413,10 @@ mod tests {
             // Force the data plane to reconnect in its captured namespace.
             relay_states[index].evict_connection("grid");
             assert_eq!(
-                wrong_client.call_async("ping", b"").await.unwrap(),
+                wrong_client
+                    .call_async("ping", b"", &CallMetadata::empty())
+                    .await
+                    .unwrap(),
                 if index == 0 {
                     b"root-a".to_vec()
                 } else {
@@ -4798,6 +4737,90 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn retired_business_paths_return_bare_not_found() {
+        let app = build_router(test_state());
+        for uri in [
+            "/grid/ping",
+            "/grid/_topics/state",
+            "/grid/_topics/state/_confirm",
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    add_expected_echo_headers(Request::builder().method("POST").uri(uri))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::NOT_FOUND, "{uri}");
+            assert!(
+                to_bytes(response.into_body(), 1024)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn duplicate_call_metadata_is_rejected_on_every_call_endpoint() {
+        let app = build_router(test_state());
+        for (verb, path, accept) in [
+            (
+                "POST",
+                format!("{CALL_PATH}?route=grid&method=ping"),
+                "application/octet-stream",
+            ),
+            (
+                "POST",
+                format!("{CALL_PATH}?route=grid&method=ping"),
+                crate::stream_wire::MEDIA_TYPE,
+            ),
+            (
+                "POST",
+                format!("{KEYED_PATH}?route=grid&method=ping"),
+                "application/octet-stream",
+            ),
+            (
+                "POST",
+                format!("{RECOVER_PATH}?route=grid&method=ping"),
+                "application/octet-stream",
+            ),
+            (
+                "GET",
+                format!("{OUTCOME_PATH}?route=grid"),
+                "application/json",
+            ),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    add_expected_echo_headers(Request::builder().method(verb).uri(path))
+                        .header(CALL_ID_HEADER, "key")
+                        .header(header::ACCEPT, accept)
+                        .header("x-c2-meta-trace.id", "first")
+                        .header("x-c2-meta-trace.id", "second")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            let body = to_bytes(
+                response.into_body(),
+                crate::http_wire::MAX_CONTROL_ERROR_BYTES,
+            )
+            .await
+            .unwrap();
+            let error = crate::decode_control_error(400, &body).unwrap();
+            assert_eq!(error.code, c2_error::ErrorCode::ProtocolViolation);
+            assert_eq!(error.details["stage"], "call_metadata_validation");
+            assert_eq!(error.details["dispatch_phase"], "pre_dispatch");
+        }
+    }
+
+    #[tokio::test]
     async fn outcome_endpoints_check_actual_body_and_one_legal_call_id() {
         let app = build_router(test_state());
         for (verb, path) in [
@@ -4955,6 +4978,14 @@ mod tests {
         server_task.await.unwrap().unwrap();
     }
 
+    fn call_uri(route: &str, method: &str) -> String {
+        use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
+
+        let route = utf8_percent_encode(route, NON_ALPHANUMERIC);
+        let method = utf8_percent_encode(method, NON_ALPHANUMERIC);
+        format!("{CALL_PATH}?route={route}&method={method}")
+    }
+
     async fn post_call(state: Arc<RelayState>, name: &str, method: &str) -> StatusCode {
         let app = build_router(state);
         let response = app
@@ -4962,7 +4993,7 @@ mod tests {
                 add_expected_echo_headers(
                     Request::builder()
                         .method("POST")
-                        .uri(format!("/{name}/{method}"))
+                        .uri(call_uri(name, method))
                         .header("content-type", "application/octet-stream"),
                 )
                 .body(Body::from(Vec::new()))
@@ -4986,7 +5017,7 @@ mod tests {
                 add_expected_echo_headers(
                     Request::builder()
                         .method("POST")
-                        .uri(format!("/{name}/{method}"))
+                        .uri(call_uri(name, method))
                         .header("content-type", "application/octet-stream"),
                 )
                 .body(Body::from(Vec::new()))
@@ -5013,7 +5044,7 @@ mod tests {
                 add_expected_crm_tag_headers(
                     Request::builder()
                         .method("POST")
-                        .uri(format!("/{name}/{method}"))
+                        .uri(call_uri(name, method))
                         .header("content-type", "application/octet-stream"),
                     crm_ns,
                     crm_name,
@@ -5254,7 +5285,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/grid/ping")
+                    .uri("/_c2/calls/call?route=grid&method=ping")
                     .header("content-type", "application/octet-stream")
                     .body(Body::empty())
                     .unwrap(),
@@ -5410,7 +5441,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/grid/ping")
+                    .uri("/_c2/calls/call?route=grid&method=ping")
                     .header("content-type", "application/octet-stream")
                     .header("x-c2-expected-crm-ns", "test.echo")
                     .header("x-c2-expected-crm-name", "Echo")
@@ -6086,7 +6117,7 @@ mod tests {
                 add_expected_echo_headers(
                     Request::builder()
                         .method("POST")
-                        .uri("/grid/ping")
+                        .uri("/_c2/calls/call?route=grid&method=ping")
                         .header("content-type", "application/octet-stream")
                         .header("content-length", "5")
                         .header("expect", "100-continue"),
@@ -6142,8 +6173,11 @@ mod tests {
                 #[allow(unreachable_code)]
                 Ok::<Bytes, std::io::Error>(Bytes::new())
             });
-            let mut request =
-                add_expected_echo_headers(Request::builder().method("POST").uri("/grid/ping"));
+            let mut request = add_expected_echo_headers(
+                Request::builder()
+                    .method("POST")
+                    .uri("/_c2/calls/call?route=grid&method=ping"),
+            );
             for value in values {
                 request = request.header(header::CONTENT_LENGTH, value);
             }
@@ -6184,7 +6218,7 @@ mod tests {
                 add_expected_echo_headers(
                     Request::builder()
                         .method("POST")
-                        .uri("/grid/ping")
+                        .uri("/_c2/calls/call?route=grid&method=ping")
                         .header("content-type", "application/octet-stream"),
                 )
                 .body(Body::from_stream(stream))
@@ -6224,7 +6258,7 @@ mod tests {
                 add_expected_echo_headers(
                     Request::builder()
                         .method("POST")
-                        .uri("/grid/ping")
+                        .uri("/_c2/calls/call?route=grid&method=ping")
                         .header("content-type", "application/octet-stream")
                         .header("content-length", content_length),
                 )
@@ -6335,7 +6369,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/grid/ping")
+                    .uri("/_c2/calls/call?route=grid&method=ping")
                     .header("content-type", "application/octet-stream")
                     .header("x-c2-expected-crm-ns", "test.echo")
                     .header("x-c2-expected-crm-name", "Echo")
@@ -6546,7 +6580,7 @@ mod tests {
             let mut request = add_expected_echo_headers(
                 Request::builder()
                     .method("POST")
-                    .uri(format!("/{route}/ping")),
+                    .uri(call_uri(&route, "ping")),
             );
             let body = if known_length {
                 request = request.header("content-length", 4);
@@ -7052,7 +7086,7 @@ mod tests {
                 add_expected_echo_headers(
                     Request::builder()
                         .method("POST")
-                        .uri("/conflict-grid/_topics/state"),
+                        .uri("/_c2/topics/subscribe?route=conflict-grid&topic=state"),
                 )
                 .header("accept", crate::topic_wire::MEDIA_TYPE)
                 .header("x-c2-topic-start", "latest")
@@ -7094,11 +7128,11 @@ mod tests {
         );
     }
 
-    fn state_with_live_peer_route(name: &str) -> Arc<RelayState> {
+    fn state_with_live_peer_route(name: &str, relay_url: &str) -> Arc<RelayState> {
         let state = test_state();
         state.register_peer(crate::relay::types::PeerInfo {
             relay_id: "peer-origin".into(),
-            url: "http://127.0.0.1:18083".into(),
+            url: relay_url.into(),
             route_count: 1,
             last_heartbeat: std::time::Instant::now(),
             status: PeerStatus::Alive,
@@ -7107,7 +7141,7 @@ mod tests {
             assert!(table.register_route(RouteEntry {
                 name: name.into(),
                 relay_id: "peer-origin".into(),
-                relay_url: "http://127.0.0.1:18083".into(),
+                relay_url: relay_url.into(),
                 server_id: None,
                 server_instance_id: None,
                 ipc_address: None,
@@ -7133,14 +7167,141 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn topic_anchor_isolates_existing_readers_when_source_refuses_its_token() {
+        use crate::topic_wire::{self, RecordKind};
+        use c2_error::ErrorCode;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let token = "0".repeat(32);
+        let cancelled = CancellationToken::new();
+        let source = Router::new()
+            .route(
+                TOPIC_SUBSCRIBE_PATH,
+                post({
+                    let cancelled = cancelled.clone();
+                    let token = token.clone();
+                    move || {
+                        let cancelled = cancelled.clone();
+                        let token = token.clone();
+                        async move {
+                            let stream = futures::stream::iter([Ok::<_, Infallible>(Bytes::from(
+                                topic_wire::ready(1).unwrap(),
+                            ))])
+                            .chain(futures::stream::once(async move {
+                                cancelled.cancelled().await;
+                                Ok(Bytes::from(topic_wire::terminal(&topic_wire::Terminal {
+                                    status: topic_wire::Status::Failed,
+                                    complete_items: 0,
+                                    error: c2_error::C2Error::new(
+                                        ErrorCode::CallCancelled,
+                                        "source received DELETE",
+                                    ),
+                                })))
+                            }));
+                            Response::builder()
+                                .header(header::CONTENT_TYPE, topic_wire::MEDIA_TYPE)
+                                .header("x-c2-topic-admission-required", "1")
+                                .header("x-c2-topic-head-seq", "0")
+                                .header("x-c2-topic-registration", "a".repeat(64))
+                                .header("x-c2-call-token", token)
+                                .body(Body::from_stream(stream))
+                                .unwrap()
+                        }
+                    }
+                }),
+            )
+            .route(
+                TOPIC_CONFIRM_PATH,
+                post(move |headers: HeaderMap| {
+                    let token = token.clone();
+                    async move {
+                        assert_eq!(headers["x-c2-topic-upstream-token"], token);
+                        assert_eq!(headers["x-c2-meta-credential"], "late");
+                        topic_error_response(super::super::topic_hub::closed_confirmation())
+                    }
+                }),
+            )
+            .route(
+                "/_calls/{token}",
+                delete({
+                    let cancelled = cancelled.clone();
+                    move || {
+                        let cancelled = cancelled.clone();
+                        async move {
+                            cancelled.cancel();
+                            StatusCode::NO_CONTENT
+                        }
+                    }
+                }),
+            );
+        let source = tokio::spawn(async move { axum::serve(listener, source).await.unwrap() });
+        let state = state_with_live_peer_route("remote-grid", &url);
+        let subscribe = |credential: &str| {
+            add_expected_echo_headers(
+                Request::builder()
+                    .method("POST")
+                    .uri("/_c2/topics/subscribe?route=remote-grid&topic=state"),
+            )
+            .header(header::ACCEPT, topic_wire::MEDIA_TYPE)
+            .header("x-c2-topic-start", "latest")
+            .header("x-c2-topic-on-lag", "skip")
+            .header("x-c2-meta-credential", credential)
+            .body(Body::empty())
+            .unwrap()
+        };
+        let first = build_router(state.clone())
+            .oneshot(subscribe("first"))
+            .await
+            .unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+        let mut items = first.into_body().into_data_stream();
+        assert_eq!(
+            items.next().await.unwrap().unwrap(),
+            topic_wire::ready(1).unwrap()
+        );
+        assert!(!cancelled.is_cancelled());
+
+        let (status, refused) = response_json(
+            build_router(state)
+                .oneshot(subscribe("late"))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(refused["code"], 707);
+        let terminal = tokio::time::timeout(Duration::from_secs(5), items.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let (header, payload) = terminal.split_at(topic_wire::RECORD_HEADER_LEN);
+        assert_eq!(
+            topic_wire::decode_header(header.try_into().unwrap())
+                .unwrap()
+                .0,
+            RecordKind::Terminal
+        );
+        assert_eq!(
+            topic_wire::decode_terminal(payload).unwrap().error.code,
+            ErrorCode::ResourceClosed
+        );
+        tokio::time::timeout(Duration::from_secs(5), cancelled.cancelled())
+            .await
+            .unwrap();
+        source.abort();
+    }
+
+    #[tokio::test]
     async fn origin_only_topic_request_for_a_remote_route_is_refused_pre_dispatch() {
-        let state = state_with_live_peer_route("remote-grid");
+        let state = state_with_live_peer_route("remote-grid", "http://127.0.0.1:18083");
         let topic = build_router(state.clone())
             .oneshot(
                 add_expected_echo_headers(
                     Request::builder()
                         .method("POST")
-                        .uri("/remote-grid/_topics/state"),
+                        .uri("/_c2/topics/subscribe?route=remote-grid&topic=state"),
                 )
                 .header("accept", crate::topic_wire::MEDIA_TYPE)
                 .header("x-c2-topic-start", "latest")
@@ -7168,7 +7329,7 @@ mod tests {
                 add_expected_echo_headers(
                     Request::builder()
                         .method("POST")
-                        .uri("/remote-grid/_topics/state"),
+                        .uri("/_c2/topics/subscribe?route=remote-grid&topic=state"),
                 )
                 .header("accept", crate::topic_wire::MEDIA_TYPE)
                 .header("x-c2-topic-start", "latest")
@@ -7186,56 +7347,36 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn origin_only_confirmation_refuses_remote_routes_and_stale_registrations() {
-        let fingerprint = |instance: &str, route_uid: &str| {
-            super::super::topic_remote::registration_fingerprint(instance, route_uid)
-        };
-        // A confirmation for a route this relay only knows remotely is loop
-        // prevention: refused before dispatch, never forwarded.
-        let state = state_with_live_peer_route("remote-grid");
-        let confirm = build_router(state)
-            .oneshot(
-                add_expected_echo_headers(
-                    Request::builder()
-                        .method("POST")
-                        .uri("/remote-grid/_topics/state/_confirm"),
-                )
-                .header("x-c2-relay-origin-only", "1")
-                .header("x-c2-expected-registration", "0".repeat(64))
-                .header("content-length", "0")
-                .body(Body::empty())
-                .unwrap(),
-            )
-            .await
-            .unwrap();
-        let (status, json) = response_json(confirm).await;
-        assert_eq!(status, StatusCode::BAD_GATEWAY);
-        assert_eq!(json["code"], 702);
-        assert_eq!(json["details"]["dispatch_phase"], "pre_dispatch");
-
-        // A name that left the mesh entirely is an unregistered registration:
-        // 701 isolates the requester's hub instead of leaving it retrying.
+    async fn topic_requests_return_canonical_metadata_validation_errors() {
         let state = test_state();
-        let confirm = build_router(state.clone())
-            .oneshot(
-                add_expected_echo_headers(
-                    Request::builder()
-                        .method("POST")
-                        .uri("/gone-grid/_topics/state/_confirm"),
-                )
+        for path in [
+            "/_c2/topics/subscribe?route=missing&topic=state",
+            "/_c2/topics/confirm?route=missing&topic=state",
+        ] {
+            let request = add_expected_echo_headers(Request::builder().method("POST").uri(path))
+                .header("accept", crate::topic_wire::MEDIA_TYPE)
+                .header("x-c2-topic-start", "latest")
+                .header("x-c2-topic-on-lag", "skip")
                 .header("x-c2-relay-origin-only", "1")
-                .header("x-c2-expected-registration", "0".repeat(64))
+                .header("x-c2-meta-credential", "first")
+                .header("x-c2-meta-credential", "second")
                 .header("content-length", "0")
                 .body(Body::empty())
-                .unwrap(),
-            )
-            .await
-            .unwrap();
-        let (status, json) = response_json(confirm).await;
-        assert_eq!(status, StatusCode::NOT_FOUND);
-        assert_eq!(json["code"], 701);
-        assert_eq!(json["details"]["dispatch_phase"], "pre_dispatch");
+                .unwrap();
+            let response = build_router(state.clone()).oneshot(request).await.unwrap();
+            let (status, json) = response_json(response).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert_eq!(json["code"], 713);
+            assert_eq!(json["details"]["stage"], "call_metadata_validation");
+            assert_eq!(json["details"]["dispatch_phase"], "pre_dispatch");
+        }
+    }
 
+    #[tokio::test]
+    async fn confirmation_rejects_unknown_scopes_and_duplicate_origin_headers() {
+        let fingerprint =
+            super::super::topic_remote::registration_fingerprint("srv-a-inst", "uid-a");
+        let state = state_with_live_peer_route("remote-grid", "http://127.0.0.1:18083");
         state.with_route_table_mut(|table| {
             assert!(table.register_route(RouteEntry {
                 name: "local-grid".into(),
@@ -7255,102 +7396,62 @@ mod tests {
                 registered_at: 1.0,
             }))
         });
-
-        // Without the relay origin header the confirmation endpoint refuses.
-        let confirm = build_router(state.clone())
-            .oneshot(
-                add_expected_echo_headers(
-                    Request::builder()
-                        .method("POST")
-                        .uri("/local-grid/_topics/state/_confirm"),
-                )
-                .header("x-c2-expected-registration", fingerprint("srv-a-inst", "uid-a"))
-                .header("content-length", "0")
-                .body(Body::empty())
-                .unwrap(),
-            )
-            .await
-            .unwrap();
-        let (status, json) = response_json(confirm).await;
-        assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert_eq!(json["code"], 713);
-
-        // The same server instance re-registering issues a new route UID: the
-        // old registration's fingerprint no longer matches and the requester's
-        // hub is isolated with 718 route_unregistered before dispatch.
-        let confirm = build_router(state.clone())
-            .oneshot(
-                add_expected_echo_headers(
-                    Request::builder()
-                        .method("POST")
-                        .uri("/local-grid/_topics/state/_confirm"),
-                )
-                .header("x-c2-relay-origin-only", "1")
-                .header(
-                    "x-c2-expected-registration",
-                    fingerprint("srv-a-inst", "uid-replacement"),
-                )
-                .header("content-length", "0")
-                .body(Body::empty())
-                .unwrap(),
-            )
-            .await
-            .unwrap();
-        let (status, json) = response_json(confirm).await;
-        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(json["code"], 718);
-        assert_eq!(json["details"]["cause"], "route_unregistered");
-        assert_eq!(json["details"]["dispatch_phase"], "pre_dispatch");
-
-        // A matching registration with no live hub cannot answer a head
-        // sequence; the anchor retries rather than trusting cached state.
-        let confirm = build_router(state.clone())
-            .oneshot(
-                add_expected_echo_headers(
-                    Request::builder()
-                        .method("POST")
-                        .uri("/local-grid/_topics/state/_confirm"),
-                )
-                .header("x-c2-relay-origin-only", "1")
-                .header("x-c2-expected-registration", fingerprint("srv-a-inst", "uid-a"))
-                .header("content-length", "0")
-                .body(Body::empty())
-                .unwrap(),
-            )
-            .await
-            .unwrap();
-        let (status, json) = response_json(confirm).await;
-        assert_eq!(status, StatusCode::BAD_GATEWAY);
-        assert_eq!(json["code"], 702);
-        assert!(
-            json["message"]
-                .as_str()
-                .is_some_and(|message| message.contains("not active")),
-            "the refusal must name the inactive source: {json}"
-        );
-
-        // A contract mismatch keeps its canonical 709 refusal.
-        let confirm = build_router(state)
-            .oneshot(
+        let request = |route: &str, registration: &str, origin_headers: &[&str]| {
+            let mut request = add_expected_echo_headers(
                 Request::builder()
                     .method("POST")
-                    .uri("/local-grid/_topics/state/_confirm")
-                    .header("x-c2-relay-origin-only", "1")
-                    .header("x-c2-expected-registration", fingerprint("srv-a-inst", "uid-a"))
-                    .header("x-c2-expected-crm-ns", "test.echo")
-                    .header("x-c2-expected-crm-name", "Other")
-                    .header("x-c2-expected-crm-ver", "0.1.0")
-                    .header("x-c2-expected-abi-hash", TEST_ABI_HASH)
-                    .header("x-c2-expected-signature-hash", TEST_SIGNATURE_HASH)
-                    .header("content-length", "0")
-                    .body(Body::empty())
+                    .uri(format!("/_c2/topics/confirm?route={route}&topic=state")),
+            )
+            .header("x-c2-expected-registration", registration)
+            .header("x-c2-topic-upstream-token", "0".repeat(32))
+            .header("content-length", "0");
+            for &origin in origin_headers {
+                request = request.header("x-c2-relay-origin-only", origin);
+            }
+            request.body(Body::empty()).unwrap()
+        };
+        for (route, registration) in [
+            ("remote-grid", fingerprint.as_str()),
+            ("gone-grid", fingerprint.as_str()),
+            ("local-grid", &"0".repeat(64)),
+            ("local-grid", fingerprint.as_str()),
+        ] {
+            let response = build_router(state.clone())
+                .oneshot(request(route, registration, &["1"]))
+                .await
+                .unwrap();
+            let (status, json) = response_json(response).await;
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(json["code"], 707);
+            assert_eq!(json["details"]["dispatch_phase"], "pre_dispatch");
+        }
+        for origin in [&[][..], &["1", "1"][..]] {
+            let response = build_router(state.clone())
+                .oneshot(request("local-grid", &fingerprint, origin))
+                .await
+                .unwrap();
+            let (status, json) = response_json(response).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert_eq!(json["code"], 713);
+        }
+
+        let _permits = state
+            .outcome_queries
+            .try_acquire_many(
+                state
+                    .outcome_queries
+                    .available_permits()
+                    .try_into()
                     .unwrap(),
             )
+            .unwrap();
+        let response = build_router(state.clone())
+            .oneshot(request("local-grid", &fingerprint, &["1", "1"]))
             .await
             .unwrap();
-        let (status, json) = response_json(confirm).await;
-        assert_eq!(status, StatusCode::CONFLICT);
-        assert_eq!(json["code"], 709);
+        let (status, json) = response_json(response).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(json["code"], 717);
     }
 
     #[tokio::test]
@@ -7683,7 +7784,7 @@ mod tests {
                         add_expected_echo_headers(
                             Request::builder()
                                 .method("POST")
-                                .uri("/grid/ping")
+                                .uri("/_c2/calls/call?route=grid&method=ping")
                                 .header("content-type", "application/octet-stream"),
                         )
                         .body(Body::from(Vec::new()))
@@ -7806,7 +7907,7 @@ mod tests {
                 add_expected_echo_headers(
                     Request::builder()
                         .method("POST")
-                        .uri("/builder/ping")
+                        .uri("/_c2/calls/call?route=builder&method=ping")
                         .header("content-type", "application/octet-stream"),
                 )
                 .body(Body::empty())
@@ -7962,7 +8063,7 @@ mod tests {
                     add_expected_echo_headers(
                         Request::builder()
                             .method("POST")
-                            .uri("/grid/ping")
+                            .uri("/_c2/calls/call?route=grid&method=ping")
                             .header(header::ACCEPT, accept)
                             .header(header::CONTENT_TYPE, "application/octet-stream"),
                     )
@@ -8461,7 +8562,9 @@ mod forwarding_admission_tests {
         let response = axum::body::to_bytes(response.into_body(), 4096)
             .await
             .unwrap();
-        assert_eq!(budget.snapshot().memory.peak_bytes, response.len() as u64);
+        // Three retained input bytes and one byte per forwarding window.
+        assert_eq!(budget.snapshot().memory.peak_bytes, 5);
+        assert_eq!(budget.snapshot().memory.used_bytes, 0);
         let error: serde_json::Value = serde_json::from_slice(&response).unwrap();
         assert_eq!(error["error"], "RequestBodyReadError");
         drop(response);
@@ -8607,46 +8710,35 @@ mod forwarding_admission_tests {
     }
 
     #[tokio::test]
-    async fn generated_error_bytes_refund_after_last_slice() {
-        use axum::body::HttpBody;
+    async fn control_json_keeps_code_and_phase_when_details_exceed_the_limit() {
+        use c2_error::{C2Error, ErrorCode};
 
-        let budget = crate::payload::memory_only_budget(1024);
-        let response = budgeted_json_response(
-            StatusCode::BAD_REQUEST,
-            serde_json::json!({"error": "InvalidContentLength"}),
-            &budget,
-            false,
-        );
-        let advertised_length = response.headers()[header::CONTENT_LENGTH]
-            .to_str()
-            .unwrap()
-            .parse::<u64>()
-            .unwrap();
-        assert_eq!(budget.snapshot().memory.used_bytes, advertised_length);
-        let mut body = response.into_body();
-        let frame = std::future::poll_fn(|cx| std::pin::Pin::new(&mut body).poll_frame(cx))
+        let error =
+            C2Error::new(ErrorCode::AdmissionDenied, "denied").with_details(BTreeMap::from([
+                ("dispatch_phase".into(), "pre_dispatch".into()),
+                ("reason".into(), "policy".into()),
+                (
+                    "detail".repeat(MAX_CONTROL_ERROR_BYTES),
+                    "é".repeat(MAX_CONTROL_ERROR_BYTES),
+                ),
+            ]));
+        let response = control_error_response(StatusCode::FORBIDDEN, error);
+        let body = axum::body::to_bytes(response.into_body(), MAX_CONTROL_ERROR_BYTES)
             .await
-            .unwrap()
             .unwrap();
-        let bytes = frame.into_data().unwrap();
-        let length = bytes.len() as u64;
-        assert_eq!(advertised_length, length);
-        assert_eq!(budget.snapshot().memory.used_bytes, length);
-        let alias = bytes.slice(..1);
-        drop((body, bytes));
-        assert_eq!(budget.snapshot().memory.used_bytes, length);
-        drop(alias);
-        assert_eq!(budget.snapshot().memory.used_bytes, 0);
+        let projected = crate::decode_control_error(403, &body).unwrap();
+        assert_eq!(projected.code, ErrorCode::AdmissionDenied);
+        assert_eq!(projected.details["dispatch_phase"], "pre_dispatch");
+        assert_eq!(projected.details["reason"], "policy");
+        assert_eq!(projected.details["truncated"], "true");
     }
 
     #[tokio::test]
-    async fn generated_error_that_cannot_fit_preserves_dispatch_uncertainty() {
-        let budget = crate::payload::memory_only_budget(0);
-        let response = resource_unavailable_response_budgeted(
+    async fn control_error_preserves_dispatch_uncertainty() {
+        let response = phased_resource_unavailable_response(
             "grid",
             "upstream failed after dispatch",
             "dispatch_uncertain",
-            &budget,
         );
         assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
         let bytes = axum::body::to_bytes(response.into_body(), 4096)
@@ -8655,6 +8747,6 @@ mod forwarding_admission_tests {
         let envelope: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(envelope["code"], 702);
         assert_eq!(envelope["details"]["dispatch_phase"], "dispatch_uncertain");
-        assert_eq!(budget.snapshot().memory.used_bytes, 0);
+        assert!(crate::decode_control_error(502, &bytes).is_none());
     }
 }

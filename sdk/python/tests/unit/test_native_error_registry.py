@@ -25,6 +25,7 @@ def test_native_error_registry_exposes_canonical_codes():
     assert registry["CallIdConflict"][0] == 721
     assert registry["CallResultUnavailable"][0] == 722
     assert registry["CallOutcomeUnknown"][0] == 723
+    assert registry["AdmissionDenied"][0] == 724
     assert registry["FallbackDenied"][0] == 714
 
 

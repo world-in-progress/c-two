@@ -4,6 +4,12 @@
 //! - `relay`: HTTP relay server bridging HTTP→IPC (requires `relay` feature)
 
 pub mod client;
+mod http_wire;
+pub use http_wire::{
+    CALL_PATH, KEYED_PATH, OUTCOME_PATH, RECOVER_PATH, TOPIC_CONFIRM_PATH, TOPIC_SUBSCRIBE_PATH,
+    decode_control_error,
+};
+
 mod outcome_wire;
 mod payload;
 pub mod send_budget;
