@@ -747,8 +747,15 @@ class Runtime:
 
         # Signal handlers — install BEFORE banner so that SIGINT is
         # handled correctly as soon as the caller sees the output.
+        # Keep the handler lock-free: ``threading.Event`` uses a non-reentrant
+        # ``Lock``, so calling ``serve_stop.set()`` from a signal handler that
+        # interrupts ``serve_stop.wait()`` while the main thread holds that
+        # lock self-deadlocks permanently.
+        signaled = False
+
         def _handle_signal(signum, frame):  # noqa: ARG001
-            serve_stop.set()
+            nonlocal signaled
+            signaled = True
 
         try:
             signal.signal(signal.SIGINT, _handle_signal)
@@ -771,7 +778,7 @@ class Runtime:
         # for example after a direct IPC shutdown request, without any signal,
         # so serve() must also watch the native terminal outcome instead of
         # polling only for a stop request.
-        while not serve_stop.wait(timeout=0.1):
+        while not signaled and not serve_stop.wait(timeout=0.1):
             if self._native_host_terminated():
                 break
 
