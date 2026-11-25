@@ -539,11 +539,7 @@ fn lag_policy_skip_and_error_exact_boundaries_over_ipc() {
         .unwrap();
 
     // Start two subscribers at seq 1 (on empty topic), then consume seq 1 so
-    // the client capacity-1 channel + in-flight demand lets us fill the ring
-    // deterministically while both subscribers hold seq 1 unread or after seq 1.
-    // Even simpler: publish 1, attach with start=Latest (start_seq=1), read seq 1,
-    // wait until server has sent seq 2 into client's capacity-1 channel, then
-    // burst seq 3, 4, 5, 6 so next_expected = 3 is evicted from ring [5, 6]!
+    // both are synchronized at next_expected = 2 with demand = 1.
     let sub_skip = client
         .subscribe(
             "burst",
@@ -568,40 +564,52 @@ fn lag_policy_skip_and_error_exact_boundaries_over_ipc() {
     assert_eq!(sub_skip.next_delivery().unwrap().seq(), 1);
     assert_eq!(sub_err.next_delivery().unwrap().seq(), 1);
 
-    // Publish seq 2 -> both client receivers fill their capacity-1 channel with
-    // seq 2 and immediately grant demand=1 for seq 3; then seq 3 fills the next
-    // in-flight slot; wait briefly so both receivers buffer seq 2 without us
-    // calling next_delivery(), then publish 3, 4, 5, 6, 7 so intermediate seqs
-    // are guaranteed evicted from the capacity=2 ring [6, 7].
-    assert_eq!(pub_burst.publish(b"v2".to_vec()).unwrap(), 2);
-    std::thread::sleep(Duration::from_millis(50));
-    for seq in 3..=7u64 {
+    // Without calling next_delivery(), each client can absorb at most 2 items
+    // (1 buffered in the capacity-1 output channel + 1 parked in deliver waiting
+    // to send before granting the next demand), and the server ring holds k = 2.
+    // Publishing 6 items (seq 2..=7) therefore guarantees eviction (2 + 2 < 6)
+    // under any OS scheduling, without relying on sleeps.
+    for seq in 2..=7u64 {
         assert_eq!(pub_burst.publish(format!("v{seq}").into_bytes()).unwrap(), seq);
     }
 
-    // Drain buffered items from sub_skip until we observe the skipped jump to seq 7.
+    // Drain sub_skip until seq 7. Depending on when the server task is scheduled
+    // during the burst, the skip may land on an intermediate ring tail (e.g. 5 or
+    // 6) before normal delivery catches up to 7; verify exact gap accounting on
+    // every frame and that a k=2 ring skip always jumps to the ring tail (dropped >= 2).
     let mut saw_skip = false;
     let mut last_seq = 1u64;
-    for _ in 0..4 {
+    for _ in 0..6 {
         let d = sub_skip.next_delivery().unwrap();
-        assert!(d.seq() > last_seq);
+        assert!(d.seq() > last_seq && d.seq() <= 7, "unexpected seq {}", d.seq());
+        assert_eq!(d.dropped(), d.seq() - (last_seq + 1));
+        assert_eq!(d.bytes(), format!("v{}", d.seq()).as_bytes());
         if d.dropped() > 0 {
-            assert_eq!(d.seq() - (last_seq + 1), d.dropped());
-            assert_eq!(d.seq(), 7);
-            assert_eq!(d.bytes(), b"v7");
+            assert!(
+                d.dropped() >= 2,
+                "LagPolicy::Skip on a k=2 ring must jump to the ring tail, got dropped={}",
+                d.dropped()
+            );
             saw_skip = true;
-            break;
         }
         last_seq = d.seq();
+        if last_seq == 7 {
+            break;
+        }
     }
-    assert!(saw_skip, "skip subscriber must report dropped > 0 and jump to latest");
+    assert_eq!(last_seq, 7, "skip subscriber must reach the burst head");
+    assert!(saw_skip, "skip subscriber must report dropped > 0 and jump to ring tail");
 
     // Drain any already-buffered items from sub_err until it terminates with 720.
+    let mut err_last_seq = 1u64;
     let mut lag_err = None;
     for _ in 0..4 {
         match sub_err.next_delivery() {
             Ok(d) => {
                 assert_eq!(d.dropped(), 0);
+                assert_eq!(d.seq(), err_last_seq + 1);
+                assert_eq!(d.bytes(), format!("v{}", d.seq()).as_bytes());
+                err_last_seq = d.seq();
             }
             Err(err) => {
                 lag_err = Some(assert_semantic_code(err, ErrorCode::SubscriptionLagged));
@@ -611,13 +619,101 @@ fn lag_policy_skip_and_error_exact_boundaries_over_ipc() {
     }
     let lag_err = lag_err.expect("on_lag=error subscriber must terminate with 720");
     assert_eq!(lag_err.details.get("topic").map(String::as_str), Some("burst"));
-    assert!(lag_err.details.contains_key("expected_seq"));
-    assert!(lag_err.details.contains_key("available_first_seq"));
-    assert!(lag_err.details.contains_key("available_last_seq"));
-    assert!(lag_err.details.contains_key("dropped"));
+    let expected_seq: u64 = lag_err.details["expected_seq"].parse().unwrap();
+    let available_first: u64 = lag_err.details["available_first_seq"].parse().unwrap();
+    let available_last: u64 = lag_err.details["available_last_seq"].parse().unwrap();
+    let dropped: u64 = lag_err.details["dropped"].parse().unwrap();
+    assert_eq!(expected_seq, err_last_seq + 1);
+    assert!(available_first > expected_seq);
+    assert_eq!(available_last, available_first + 1);
+    assert!(available_last <= 7);
+    assert_eq!(dropped, available_first - expected_seq);
+
+    // Post-skip continuity: sub_skip continues receiving fresh frames without drops.
+    assert_eq!(pub_burst.publish(b"v8".to_vec()).unwrap(), 8);
+    let after_skip = sub_skip.next_delivery().unwrap();
+    assert_eq!(after_skip.seq(), 8);
+    assert_eq!(after_skip.dropped(), 0);
+    assert_eq!(after_skip.bytes(), b"v8");
 
     assert!(sub_skip.close().completed);
     assert!(sub_err.close().completed);
+
+    // Deterministic tail-jump check: a raw IPC peer consumes the initial demand=1
+    // on seq 8 and withholds the next demand grant while seq 9..=11 fill the k=2
+    // ring to [10, 11]. Granting demand=1 afterwards must jump directly to the
+    // ring tail (seq 11, not oldest retained frame 10).
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            let (mut peer, _) = topic_peer_on(
+                &host,
+                &release,
+                "burst",
+                0,
+                rpc::WireSubscribeOptions {
+                    start: rpc::WireTopicStart::Latest,
+                    on_lag: rpc::WireLagPolicy::Skip,
+                },
+                8,
+            )
+            .await;
+
+            // Consume initial demand=1 on seq 8 ("v8"), leaving server demand == 0.
+            let (header, payload) = read_ipc_frame(&mut peer).await;
+            assert_eq!(header.request_id, 1);
+            assert!(matches!(
+                rpc::decode_rpc_record(&header, &payload, Some(CallMode::Subscribe)).unwrap(),
+                RpcRecord::ItemBegin {
+                    seq: Some(8),
+                    total_bytes: 2
+                }
+            ));
+            peer.write_all(&rpc::encode_credit_frame(1, 2, 0).unwrap())
+                .await
+                .unwrap();
+            let (header, payload) = read_ipc_frame(&mut peer).await;
+            assert_eq!(header.request_id, 1);
+            assert!(matches!(
+                rpc::decode_rpc_record(&header, &payload, Some(CallMode::Subscribe)).unwrap(),
+                RpcRecord::ItemData { value } if value.storage == ValueStorage::Inline(b"v8")
+            ));
+
+            // With server demand == 0, fill the k=2 ring deterministically to [10, 11].
+            for seq in 9..=11u64 {
+                assert_eq!(
+                    pub_burst.publish(format!("v{seq}").into_bytes()).unwrap(),
+                    seq
+                );
+            }
+
+            // Now grant demand=1: Skip must select ring tail seq 11 (not first_seq 10).
+            peer.write_all(&rpc::encode_credit_frame(1, 0, 1).unwrap())
+                .await
+                .unwrap();
+            let (header, payload) = read_ipc_frame(&mut peer).await;
+            assert_eq!(header.request_id, 1);
+            assert!(matches!(
+                rpc::decode_rpc_record(&header, &payload, Some(CallMode::Subscribe)).unwrap(),
+                RpcRecord::ItemBegin {
+                    seq: Some(11),
+                    total_bytes: 3
+                }
+            ));
+            peer.write_all(&rpc::encode_credit_frame(1, 3, 0).unwrap())
+                .await
+                .unwrap();
+            let (header, payload) = read_ipc_frame(&mut peer).await;
+            assert_eq!(header.request_id, 1);
+            assert!(matches!(
+                rpc::decode_rpc_record(&header, &payload, Some(CallMode::Subscribe)).unwrap(),
+                RpcRecord::ItemData { value } if value.storage == ValueStorage::Inline(b"v11")
+            ));
+            drop(peer);
+        });
+
     drop(reg);
     let _ = host.shutdown();
 }
@@ -1084,6 +1180,25 @@ async fn topic_peer(
     release: &ContractRelease,
     capability_flags: u16,
 ) -> (LocalStream, RouteCallIdentity) {
+    topic_peer_on(
+        host,
+        release,
+        "field",
+        capability_flags,
+        rpc::WireSubscribeOptions::default(),
+        1,
+    )
+    .await
+}
+
+async fn topic_peer_on(
+    host: &Host,
+    release: &ContractRelease,
+    topic: &str,
+    capability_flags: u16,
+    options: rpc::WireSubscribeOptions,
+    expected_start_seq: u64,
+) -> (LocalStream, RouteCallIdentity) {
     let mut peer = LocalStream::connect(host.local_endpoint(), DEFAULT_CONNECT_TIMEOUT)
         .await
         .unwrap();
@@ -1122,8 +1237,8 @@ async fn topic_peer(
     let open = rpc::encode_open_subscribe_frame(
         1,
         &identity,
-        "field",
-        rpc::WireSubscribeOptions::default(),
+        topic,
+        options,
         &c2_core::CallMetadata::empty(),
     )
     .unwrap();
@@ -1133,9 +1248,9 @@ async fn topic_peer(
     assert!(matches!(
         rpc::decode_rpc_record(&header, &payload, Some(CallMode::Subscribe)).unwrap(),
         RpcRecord::Ready {
-            start_seq: 1,
+            start_seq,
             head_seq: _
-        }
+        } if start_seq == expected_start_seq
     ));
     (peer, identity)
 }
