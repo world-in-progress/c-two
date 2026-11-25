@@ -814,12 +814,24 @@ fn host_shutdown_drains_remote_subscriptions_with_718_host_shutdown() {
     drop(reg);
 }
 
+fn wait_for_server_slots(host_rt: &Runtime, expected: u64, context: &str) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while host_rt.call_execution_snapshot().server.used_operations != Some(expected) {
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for server used_operations == {expected} ({context}): {:?}",
+            host_rt.call_execution_snapshot().server
+        );
+        std::thread::sleep(Duration::from_millis(2));
+    }
+}
+
 #[test]
 fn subscription_slot_guard_n2_preserves_unary_headroom_and_n1_n0_boundaries() {
     let dir = tempfile::tempdir().unwrap();
     // Server N = 2, Client N = 2 -> at most 1 active subscription, 1 slot
     // always kept free for normal unary control calls!
-    let (_host_rt, host) = make_host(&dir, "ipc-n2", None, Some(2));
+    let (host_rt, host) = make_host(&dir, "ipc-n2", None, Some(2));
     let release = release_with_topics(&["state"]);
     let reg = host.register(echo_def(&release, "sim")).unwrap();
 
@@ -862,10 +874,17 @@ fn subscription_slot_guard_n2_preserves_unary_headroom_and_n1_n0_boundaries() {
     );
     // Unary control calls succeed on BOTH clients while sub1 is active!
     assert_eq!(client.call_owned("echo", b"ctrl-1").unwrap(), b"ctrl-1");
+    // Connection 1's writer drops ctrl-1's server slot right after sending
+    // CALL_END; wait until only sub1 occupies a server slot before issuing
+    // ctrl-2 from an independent physical connection.
+    wait_for_server_slots(&host_rt, 1, "after ctrl-1");
     assert_eq!(client2.call_owned("echo", b"ctrl-2").unwrap(), b"ctrl-2");
 
     // Closing sub1 frees both client and server slots -> new subscription succeeds.
+    // The server drops sub1's operation permit once its terminal write finishes,
+    // so wait for the slot count to reach 0 before opening sub2.
     assert!(sub1.close().completed);
+    wait_for_server_slots(&host_rt, 0, "after sub1 close");
     let sub2 = client
         .subscribe("state", SubscribeOptions::default())
         .unwrap();
