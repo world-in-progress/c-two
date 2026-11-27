@@ -72,6 +72,7 @@ The dated plans and reviews in `design/` belong to work still in progress; each 
 | [0005](decisions/0005-publish-subscribe.md) | Resource-scoped publish/subscribe: 1-to-N single-write multi-loan SHM and relay fan-out |
 | [0006](decisions/0006-post-dispatch-outcome-and-dedup.md) | Post-dispatch call outcome query and idempotent deduplication for unary calls |
 | [0007](decisions/0007-call-metadata-and-admission-hooks.md) | Call metadata, Host-level admission hooks and read-only call context |
+| [0008](decisions/0008-relay-tls-http2-and-iroh-mesh.md) | `c3 relay` surface separation, native TLS/HTTP2, per-stream eviction and `iroh` cross-NAT mesh |
 
 ## Records
 
