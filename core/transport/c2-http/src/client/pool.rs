@@ -1,5 +1,6 @@
 //! Reference-counted pool of [`HttpClient`] instances.
 
+use c2_config::ResolvedRelayClientConfig;
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -87,12 +88,12 @@ impl Drop for HttpPoolLease {
 
 /// Reference-counted pool of [`HttpClient`] instances.
 ///
-/// Clients connecting to the same relay URL and proxy policy share a single
-/// `HttpClient` (and its underlying connection pool).  When all references
+/// Clients connecting to the same relay URL and client policy share a single
+/// `HttpClient` and its control and data pools.  When all references
 /// are released, the client is kept for the idle grace period before being
 /// destroyed.
 pub struct HttpClientPool {
-    entries: Mutex<HashMap<(String, bool), PoolEntry>>,
+    entries: Mutex<HashMap<(String, ResolvedRelayClientConfig), PoolEntry>>,
     grace_period: Duration,
     default_max_connections: usize,
 }
@@ -122,21 +123,21 @@ impl HttpClientPool {
     pub(super) fn acquire_lease(
         &self,
         base_url: &str,
-        use_proxy: bool,
+        policy: &ResolvedRelayClientConfig,
         deadline: c2_config::ConnectDeadline,
     ) -> Result<HttpPoolLease, HttpError> {
-        self.acquire_view(base_url, use_proxy, deadline)
+        self.acquire_view(base_url, policy, deadline)
             .map(|(client, references)| HttpPoolLease { client, references })
     }
 
     fn acquire_view(
         &self,
         base_url: &str,
-        use_proxy: bool,
+        policy: &ResolvedRelayClientConfig,
         deadline: c2_config::ConnectDeadline,
     ) -> Result<(Arc<HttpClient>, Arc<PoolReferences>), HttpError> {
         super::connect_deadline::check(deadline, "relay_pool_acquire")?;
-        let key = (canonical_base_url(base_url), use_proxy);
+        let key = (canonical_base_url(base_url), policy.clone());
 
         let mut entries =
             super::connect_deadline::lock(&self.entries, deadline, "relay_pool_acquire")?;
@@ -147,11 +148,11 @@ impl HttpClientPool {
             return Ok((Arc::clone(&entry.client), Arc::clone(&entry.references)));
         }
 
-        // Create a new client (lock held — HttpClient::new is fast).
+        // Publish both pools together after the trust policy has been loaded.
         let client = Arc::new(HttpClient::new(
             &key.0,
             self.default_max_connections,
-            use_proxy,
+            policy,
         )?);
 
         super::connect_deadline::check(deadline, "relay_pool_acquire")?;
@@ -189,9 +190,9 @@ impl HttpClientPool {
     pub fn refcount(&self, base_url: &str) -> usize {
         let entries = self.entries.lock();
         let url = canonical_base_url(base_url);
-        [false, true]
-            .into_iter()
-            .filter_map(|use_proxy| entries.get(&(url.clone(), use_proxy)))
+        entries
+            .iter()
+            .filter_map(|((base, _), entry)| (base == &url).then_some(entry))
             .map(|entry| entry.references.count.load(Ordering::Acquire))
             .sum()
     }
@@ -215,8 +216,15 @@ mod tests {
     use super::*;
 
     fn lease(pool: &HttpClientPool, url: &str, use_proxy: bool) -> HttpPoolLease {
-        pool.acquire_lease(url, use_proxy, c2_config::ConnectDeadline::default())
-            .unwrap()
+        pool.acquire_lease(
+            url,
+            &ResolvedRelayClientConfig {
+                use_proxy,
+                ..Default::default()
+            },
+            c2_config::ConnectDeadline::default(),
+        )
+        .unwrap()
     }
 
     #[test]
@@ -245,7 +253,7 @@ mod tests {
             released_tx.send(()).unwrap();
         });
         let released_while_map_held = released_rx.recv_timeout(Duration::from_millis(500)).is_ok();
-        let count = held[&(url.into(), false)]
+        let count = held[&(url.into(), Default::default())]
             .references
             .count
             .load(Ordering::Acquire);
@@ -270,7 +278,7 @@ mod tests {
             .unwrap();
             let start = Instant::now();
             let error = waiter_pool
-                .acquire_lease("http://localhost:9988", false, deadline)
+                .acquire_lease("http://localhost:9988", &Default::default(), deadline)
                 .err()
                 .expect("pool lock must expire");
             assert!(start.elapsed() < Duration::from_millis(500));
@@ -344,6 +352,28 @@ mod tests {
         assert_eq!(pool.refcount(url), 3);
         drop((proxied, same_policy));
         assert_eq!(pool.refcount(url), 1);
+    }
+
+    #[test]
+    fn tls_policies_use_independent_pool_entries() {
+        let pool = HttpClientPool::new(Duration::from_secs(60));
+        let url = "https://localhost:9995";
+        let pinned = |byte| ResolvedRelayClientConfig {
+            tls_trust: c2_config::RelayTlsTrust::CertSha256([byte; 32]),
+            ..Default::default()
+        };
+        let acquire = |policy: &ResolvedRelayClientConfig| {
+            pool.acquire_lease(url, policy, c2_config::ConnectDeadline::default())
+                .unwrap()
+        };
+        let default_client = acquire(&Default::default());
+        let first_pin = acquire(&pinned(1));
+        let second_pin = acquire(&pinned(2));
+        let same_pin = acquire(&pinned(1));
+        assert!(!Arc::ptr_eq(&default_client.client, &first_pin.client));
+        assert!(!Arc::ptr_eq(&first_pin.client, &second_pin.client));
+        assert!(Arc::ptr_eq(&first_pin.client, &same_pin.client));
+        assert_eq!(pool.refcount(url), 4);
     }
 
     #[test]

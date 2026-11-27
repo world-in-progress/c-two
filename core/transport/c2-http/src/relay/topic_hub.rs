@@ -1746,15 +1746,25 @@ async fn drive_remote(
 ) {
     let shutdown = relay.forwarding.shutdown_token();
     let upstream_wait = hub.inner.lock().upstream_wait.clone();
-    let client = crate::relay_client_builder_with_proxy(relay.config().use_proxy)
-        .retry(reqwest::retry::never())
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .expect("c-two: failed to build reqwest Client for relay traffic");
+    let policy = c2_config::ResolvedRelayClientConfig {
+        use_proxy: relay.config().use_proxy,
+        ..Default::default()
+    };
+    let build_client = || {
+        crate::relay_client_builder(&policy)
+            .expect("system relay TLS configuration")
+            .retry(reqwest::retry::never())
+            .build()
+            .expect("c-two: failed to build reqwest Client for relay traffic")
+    };
+    let data_client = build_client();
+    let control_client = build_client();
     // A hub still opening has no source handle to cancel, so the cross-relay
     // subscription request selects on the hub's wait token.
     let opened = match tokio::select! {
-        opened = open_remote_upstream(client.clone(), &entry.relay_url, &expected, &topic_name, &metadata) => opened,
+        opened = open_remote_upstream(
+            data_client, control_client.clone(), &entry.relay_url, &expected, &topic_name, &metadata
+        ) => opened,
         _ = upstream_wait.cancelled() => {
             finish_failed_open(&relay.topics, &hub, leader_result, cancelled_open(&shutdown));
             return;
@@ -1778,7 +1788,7 @@ async fn drive_remote(
         return;
     }
     let confirm = Arc::new(RemoteConfirm::new(
-        client,
+        control_client,
         &entry.relay_url,
         &expected,
         &topic_name,

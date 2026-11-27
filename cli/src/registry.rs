@@ -1,5 +1,5 @@
 use anyhow::{Result, anyhow};
-use c2_config::{ConfigResolver, ConfigSources, EnvCatalog};
+use c2_config::{ConfigResolver, ConfigSources, EnvCatalog, ResolvedRelayClientConfig};
 use clap::{Args, Subcommand};
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
@@ -106,15 +106,7 @@ pub fn run(args: RegistryArgs) -> Result<()> {
 
 fn force_leave(relay: &str, relay_id: &str) -> Result<()> {
     let url = format!("{}/_admin/force-leave", relay.trim_end_matches('/'));
-    let builder = reqwest::blocking::Client::builder().timeout(std::time::Duration::from_secs(5));
-    let builder = if resolve_relay_use_proxy(ConfigSources::from_process())? {
-        builder
-    } else {
-        builder.no_proxy()
-    };
-    let client = builder
-        .build()
-        .map_err(|e| anyhow!("failed to build HTTP client: {e}"))?;
+    let client = registry_http_client()?;
     let response = client
         .post(&url)
         .json(&serde_json::json!({"relay_id": relay_id}))
@@ -146,15 +138,7 @@ fn get_json<T: DeserializeOwned>(relay: &str, path: &str) -> Result<T> {
         relay.trim_end_matches('/'),
         path.trim_start_matches('/')
     );
-    let builder = reqwest::blocking::Client::builder().timeout(std::time::Duration::from_secs(5));
-    let builder = if resolve_relay_use_proxy(ConfigSources::from_process())? {
-        builder
-    } else {
-        builder.no_proxy()
-    };
-    let client = builder
-        .build()
-        .map_err(|e| anyhow!("failed to build HTTP client: {e}"))?;
+    let client = registry_http_client()?;
     let response = client
         .get(&url)
         .send()
@@ -168,9 +152,25 @@ fn get_json<T: DeserializeOwned>(relay: &str, path: &str) -> Result<T> {
         .map_err(|e| anyhow!("invalid JSON from {url}: {e}"))
 }
 
-fn resolve_relay_use_proxy(sources: ConfigSources) -> Result<bool> {
+fn registry_http_client() -> Result<reqwest::blocking::Client> {
+    let policy = resolve_relay_client(ConfigSources::from_process())?;
+    let builder = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .redirect(reqwest::redirect::Policy::none())
+        .use_preconfigured_tls(c2_http::relay_tls_config(&policy.tls_trust)?);
+    let builder = if policy.use_proxy {
+        builder
+    } else {
+        builder.no_proxy()
+    };
+    builder
+        .build()
+        .map_err(|e| anyhow!("failed to build HTTP client: {e}"))
+}
+
+fn resolve_relay_client(sources: ConfigSources) -> Result<ResolvedRelayClientConfig> {
     let catalog = EnvCatalog::load(sources)?;
-    Ok(ConfigResolver::resolve_relay_client(None, &catalog)?.use_proxy)
+    Ok(ConfigResolver::resolve_relay_client(None, &catalog)?)
 }
 
 fn list_routes(relay: &str) -> Result<()> {
@@ -224,31 +224,28 @@ mod tests {
         let env_file = tempdir.path().join(".env");
         std::fs::write(&env_file, "C2_RELAY_USE_PROXY=1\n").unwrap();
 
-        let use_proxy = resolve_relay_use_proxy(ConfigSources {
+        let policy = resolve_relay_client(ConfigSources {
             env_file: c2_config::EnvFilePolicy::Path(env_file),
             process_env: Default::default(),
         })
         .unwrap();
 
-        assert!(use_proxy);
+        assert!(policy.use_proxy);
     }
 
     #[test]
     fn proxy_policy_ignores_relay_server_env() {
-        let use_proxy = resolve_relay_use_proxy(ConfigSources {
+        let policy = resolve_relay_client(ConfigSources {
             env_file: c2_config::EnvFilePolicy::Disabled,
             process_env: [
                 ("C2_RELAY_USE_PROXY".to_string(), "1".into()),
-                (
-                    "C2_MEMORY_BUDGET_BYTES".to_string(),
-                    "not-a-number".into(),
-                ),
+                ("C2_MEMORY_BUDGET_BYTES".to_string(), "not-a-number".into()),
             ]
             .into_iter()
             .collect(),
         })
         .unwrap();
 
-        assert!(use_proxy);
+        assert!(policy.use_proxy);
     }
 }

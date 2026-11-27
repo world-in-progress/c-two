@@ -113,6 +113,7 @@ impl HttpResponseStream {
             // ACK only submits intent. The POST actor remains authoritative.
             let _ = client
                 .delete(format!("{base_url}/_calls/{token}"))
+                .timeout(super::http_client::CONTROL_REQUEST_TIMEOUT)
                 .send()
                 .await;
         });

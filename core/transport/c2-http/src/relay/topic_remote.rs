@@ -375,7 +375,8 @@ pub(crate) struct OpenedRemoteUpstream {
 /// The request always carries the one-hop loop-prevention header; the source
 /// relays only local routes for it and never forwards again.
 pub(crate) async fn open_remote_upstream(
-    client: reqwest::Client,
+    data_client: reqwest::Client,
+    control_client: reqwest::Client,
     source_relay_url: &str,
     expected: &ExpectedRouteContract,
     topic_name: &str,
@@ -385,7 +386,7 @@ pub(crate) async fn open_remote_upstream(
     let url = format!("{base}{TOPIC_SUBSCRIBE_PATH}");
     let request = add_metadata(
         add_expected_contract_headers(
-            client
+            data_client
                 .post(&url)
                 .query(&[
                     ("route", expected.route_name.as_str()),
@@ -402,7 +403,7 @@ pub(crate) async fn open_remote_upstream(
     )
     .build()
     .map_err(|error| transport(format!("topic upstream request build failed: {error}")))?;
-    let response = client
+    let response = data_client
         .execute(request)
         .await
         .map_err(|error| transport(format!("topic upstream request failed: {error}")))?;
@@ -433,7 +434,7 @@ pub(crate) async fn open_remote_upstream(
             ready: None,
             terminal: None,
             cancel: std::sync::Arc::new(HttpUpstreamCancel {
-                client,
+                client: control_client,
                 delete_url: format!("{base}/_calls/{token}"),
                 handle,
                 sent: std::sync::atomic::AtomicBool::new(false),
@@ -746,6 +747,7 @@ mod tests {
             });
             let error = open_remote_upstream(
                 reqwest::Client::new(),
+                reqwest::Client::new(),
                 &format!("http://{address}"),
                 &expected_contract(),
                 "state",
@@ -780,10 +782,17 @@ mod tests {
         let client = reqwest::Client::new();
         let expected = expected_contract();
         let metadata = CallMetadata::default();
-        let open_error = open_remote_upstream(client.clone(), &base, &expected, "state", &metadata)
-            .await
-            .err()
-            .expect("bare 404 must fail");
+        let open_error = open_remote_upstream(
+            client.clone(),
+            reqwest::Client::new(),
+            &base,
+            &expected,
+            "state",
+            &metadata,
+        )
+        .await
+        .err()
+        .expect("bare 404 must fail");
         let confirm = RemoteConfirm::new(
             client,
             &base,
@@ -1020,6 +1029,7 @@ mod tests {
         });
         let opened = open_remote_upstream(
             reqwest::Client::new(),
+            reqwest::Client::new(),
             &format!("http://{address}"),
             &expected_contract(),
             "state",
@@ -1065,6 +1075,7 @@ mod tests {
         });
         let opened = open_remote_upstream(
             reqwest::Client::new(),
+            reqwest::Client::new(),
             &format!("http://{address}"),
             &expected_contract(),
             "state",
@@ -1105,6 +1116,7 @@ mod tests {
                 .unwrap();
         });
         let opened = open_remote_upstream(
+            reqwest::Client::new(),
             reqwest::Client::new(),
             &format!("http://{address}"),
             &expected_contract(),

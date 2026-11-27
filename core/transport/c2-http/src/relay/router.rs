@@ -4306,7 +4306,7 @@ mod tests {
             let client = RelayAwareHttpClient::new(
                 &urls[index],
                 expected.clone(),
-                false,
+                &Default::default(),
                 RelayAwareClientConfig::default(),
             )
             .unwrap()
@@ -4345,7 +4345,7 @@ mod tests {
             let wrong_client = RelayAwareHttpClient::new(
                 &urls[index],
                 expected.clone(),
-                false,
+                &Default::default(),
                 RelayAwareClientConfig::default(),
             )
             .unwrap()
@@ -4373,7 +4373,7 @@ mod tests {
             let legacy = RelayAwareHttpClient::new(
                 &urls[index],
                 expected.clone(),
-                false,
+                &Default::default(),
                 RelayAwareClientConfig::default(),
             )
             .unwrap();

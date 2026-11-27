@@ -2564,6 +2564,7 @@ async function probeResolvedHttpRoute(
         `${relayUrl}${controlRoutePath("_probe", routeName)}`,
         {
           method: "GET",
+          redirect: "error",
           headers: requestHeadersForRouteContract(headers, routeContract),
           signal: fetchSignal,
         },
@@ -2802,8 +2803,12 @@ function selectLocalIpcRoute<Payload extends C2ResponsePayload>(routes: readonly
 }
 
 function relayAnchorAllowsLocalIpc(anchorUrl: string): boolean {
-  const hostname = new URL(anchorUrl).hostname.toLowerCase();
-  return hostname === "localhost" || hostname.startsWith("127.") || hostname === "::1" || hostname === "[::1]";
+  return isRelayLoopback(new URL(anchorUrl));
+}
+
+function isRelayLoopback(url: URL): boolean {
+  const hostname = url.hostname;
+  return hostname === "localhost" || /^127(?:\.\d{1,3}){3}$/.test(hostname) || hostname === "[::1]";
 }
 
 function localRouteEndpointKey(route: C2RelayRouteInfo): string {
@@ -3024,6 +3029,7 @@ async function resolveRelayRoutes(
     try {
       response = await fetchImpl(resolveUrl, {
         method: "GET",
+        redirect: "error",
         headers,
         signal: fetchSignal,
       });
@@ -3072,6 +3078,14 @@ async function resolveRelayRoutes(
       }
     } catch (error) {
       throw new C2HttpTransportError(`C-Two relay resolve contract invalid: ${formatCaughtError(error)}`, error, "pre_dispatch");
+    }
+    if (new URL(anchorUrl).protocol === "https:") {
+      for (const route of routes) {
+        const target = new URL(route.relayUrl);
+        if (target.protocol === "http:" && !isRelayLoopback(target)) {
+          throw new C2HttpTransportError("HTTPS relay resolved to a non-loopback HTTP target.", undefined, "pre_dispatch");
+        }
+      }
     }
     return routes;
   }, resolveTimeoutMs, "C-Two relay resolve");

@@ -4,7 +4,9 @@ use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
 use serde::{Deserialize, Serialize};
 
 use super::http_client::{HttpError, runtime};
-use c2_config::LocalEndpointContext;
+use c2_config::{
+    ConfigResolver, ConfigSources, EnvCatalog, LocalEndpointContext, ResolvedRelayClientConfig,
+};
 use c2_contract::ExpectedRouteContract;
 
 /// Optional discovery hint; it grants no permission to open an endpoint.
@@ -154,27 +156,34 @@ impl Default for RelayControlClientConfig {
 pub struct RelayControlClient {
     client: reqwest::Client,
     base_url: String,
+    policy: ResolvedRelayClientConfig,
     config: RelayControlClientConfig,
     local_endpoint_context: Option<LocalEndpointContext>,
 }
 
 impl RelayControlClient {
+    /// Resolve process TLS trust with an explicit proxy override.
     pub fn new(base_url: &str, use_proxy: bool) -> Result<Self, HttpError> {
-        Self::new_with_config(base_url, use_proxy, RelayControlClientConfig::default())
+        let catalog = EnvCatalog::load(ConfigSources::from_process())
+            .map_err(|error| HttpError::InvalidInput(error.to_string()))?;
+        let policy = ConfigResolver::resolve_relay_client(Some(use_proxy), &catalog)
+            .map_err(|error| HttpError::InvalidInput(error.to_string()))?;
+        Self::new_with_config(base_url, &policy, RelayControlClientConfig::default())
     }
 
     pub fn new_with_config(
         base_url: &str,
-        use_proxy: bool,
+        policy: &ResolvedRelayClientConfig,
         config: RelayControlClientConfig,
     ) -> Result<Self, HttpError> {
-        let client = crate::relay_client_builder_with_proxy(use_proxy)
+        let client = crate::relay_client_builder(policy)?
             .timeout(config.timeout)
             .build()
             .map_err(|e| HttpError::Transport(e.to_string()))?;
         Ok(Self {
             client,
             base_url: canonical_base_url(base_url),
+            policy: policy.clone(),
             config,
             local_endpoint_context: None,
         })
@@ -351,6 +360,10 @@ impl RelayControlClient {
             routes,
             local_endpoint_namespace,
         })
+    }
+
+    pub(super) fn policy(&self) -> &ResolvedRelayClientConfig {
+        &self.policy
     }
 
     pub fn base_url(&self) -> &str {
@@ -613,7 +626,7 @@ mod tests {
     fn resolve_matching_rejects_malformed_expected_contract_before_request() {
         let client = RelayControlClient::new_with_config(
             "http://127.0.0.1:9",
-            false,
+            &Default::default(),
             RelayControlClientConfig {
                 timeout: Duration::from_millis(50),
                 retry_attempts: 1,
@@ -778,7 +791,7 @@ mod tests {
 
         let client = RelayControlClient::new_with_config(
             &format!("http://{addr}"),
-            false,
+            &Default::default(),
             RelayControlClientConfig {
                 timeout: Duration::from_secs(2),
                 retry_attempts: 3,

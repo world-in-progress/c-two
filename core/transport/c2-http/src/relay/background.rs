@@ -182,10 +182,14 @@ async fn anti_entropy_loop(state: Arc<RelayState>, cancel: CancellationToken) {
     ticker.tick().await;
     let mut round_robin_idx: usize = 0;
 
-    let client = crate::relay_client_builder_with_proxy(state.config().use_proxy)
-        .timeout(Duration::from_secs(5))
-        .build()
-        .expect("c-two: failed to build reqwest Client for relay traffic");
+    let client = crate::relay_client_builder(&c2_config::ResolvedRelayClientConfig {
+        use_proxy: state.config().use_proxy,
+        ..Default::default()
+    })
+    .expect("system relay TLS configuration")
+    .timeout(Duration::from_secs(5))
+    .build()
+    .expect("c-two: failed to build reqwest Client for relay traffic");
 
     loop {
         tokio::select! {
@@ -245,10 +249,14 @@ async fn dead_peer_probe_loop(state: Arc<RelayState>, cancel: CancellationToken)
     let mut ticker = tokio::time::interval(interval);
     ticker.tick().await;
 
-    let client = crate::relay_client_builder_with_proxy(state.config().use_proxy)
-        .timeout(Duration::from_secs(5))
-        .build()
-        .expect("c-two: failed to build reqwest Client for relay traffic");
+    let client = crate::relay_client_builder(&c2_config::ResolvedRelayClientConfig {
+        use_proxy: state.config().use_proxy,
+        ..Default::default()
+    })
+    .expect("system relay TLS configuration")
+    .timeout(Duration::from_secs(5))
+    .build()
+    .expect("c-two: failed to build reqwest Client for relay traffic");
 
     loop {
         tokio::select! {
@@ -318,10 +326,14 @@ async fn dead_peer_probe_loop(state: Arc<RelayState>, cancel: CancellationToken)
 async fn seed_retry_loop(state: Arc<RelayState>, cancel: CancellationToken) {
     let interval = state.config().seed_retry_interval;
     let seeds = state.config().seeds.clone();
-    let client = crate::relay_client_builder_with_proxy(state.config().use_proxy)
-        .timeout(Duration::from_secs(5))
-        .build()
-        .expect("c-two: failed to build reqwest Client for relay traffic");
+    let client = crate::relay_client_builder(&c2_config::ResolvedRelayClientConfig {
+        use_proxy: state.config().use_proxy,
+        ..Default::default()
+    })
+    .expect("system relay TLS configuration")
+    .timeout(Duration::from_secs(5))
+    .build()
+    .expect("c-two: failed to build reqwest Client for relay traffic");
 
     loop {
         // The first join and later retries use the same path.

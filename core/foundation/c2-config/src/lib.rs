@@ -46,7 +46,7 @@ pub use pool::{
 pub use relay::RelayConfig;
 pub use resolver::{
     ConfigError, ConfigResolver, ConfigSources, EnvCatalog, EnvFilePolicy, EnvMap,
-    RelayConfigOverrides, ResolvedRelayClientConfig, ResolvedServerConfig, ServerConfigOverrides,
-    ServerConfigPatch,
+    RelayConfigOverrides, RelayTlsTrust, ResolvedRelayClientConfig, ResolvedServerConfig,
+    ServerConfigOverrides, ServerConfigPatch,
 };
 pub use timeout::{TimeoutError, deadline_after, timeout_from_seconds, validate_timeout};

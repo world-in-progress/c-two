@@ -931,10 +931,14 @@ async fn capacity_rejection_case(kind: CapacityRequest) {
                 max_attempts: 3,
                 ..Default::default()
             };
-            let client =
-                crate::client::RelayAwareHttpClient::new(&entry.relay_url, expected, false, config)
-                    .unwrap()
-                    .with_http_only();
+            let client = crate::client::RelayAwareHttpClient::new(
+                &entry.relay_url,
+                expected,
+                &Default::default(),
+                config,
+            )
+            .unwrap()
+            .with_http_only();
             Some(
                 bounded(tokio::task::spawn_blocking(move || {
                     client

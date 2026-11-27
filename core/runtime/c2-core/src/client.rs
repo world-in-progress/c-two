@@ -1890,7 +1890,7 @@ impl Runtime {
                 .connect_explicit_relay_http_client_with_deadline(
                     anchor,
                     expected.clone(),
-                    settings.use_proxy,
+                    settings,
                     deadline,
                 )
                 .map(http);
@@ -1898,7 +1898,7 @@ impl Runtime {
         let resolved = self.resolve_relay_connection_with_deadline(
             anchor,
             expected.clone(),
-            settings.use_proxy,
+            settings,
             deadline,
         )?;
         self.ensure_active_with_deadline(deadline)?;
@@ -2046,8 +2046,13 @@ mod tests {
             abi_hash: "a".repeat(64),
             signature_hash: "b".repeat(64),
         };
-        let client = RelayAwareHttpClient::new("http://127.0.0.1:9", expected, false, Default::default())
-            .unwrap();
+        let client = RelayAwareHttpClient::new(
+            "http://127.0.0.1:9",
+            expected,
+            &Default::default(),
+            Default::default(),
+        )
+        .unwrap();
         let target = ClientTarget::new(ObservedPath::ExplicitRelay, ClientInner::Http(client));
         for code in [
             ErrorCode::CallIdConflict,

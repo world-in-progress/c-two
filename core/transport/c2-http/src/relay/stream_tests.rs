@@ -824,7 +824,7 @@ async fn call_metadata_reaches_host_admission_over_live_relay() {
             abi_hash: fixture.entry.abi_hash.clone(),
             signature_hash: fixture.entry.signature_hash.clone(),
         },
-        false,
+        &Default::default(),
         RelayAwareClientConfig::default(),
     )
     .unwrap()
@@ -2374,7 +2374,7 @@ async fn mismatched_http_call_modes_are_not_executed_and_keep_upstream() {
     let client = RelayAwareHttpClient::new(
         &format!("http://{}", fixture.socket),
         expected,
-        false,
+        &Default::default(),
         RelayAwareClientConfig::default(),
     )
     .unwrap()
@@ -2554,7 +2554,7 @@ async fn relay_oversized_item_keeps_real_terminal_and_refunds_b() {
             abi_hash: fixture.entry.abi_hash.clone(),
             signature_hash: fixture.entry.signature_hash.clone(),
         },
-        false,
+        &Default::default(),
         RelayAwareClientConfig::default(),
     )
     .unwrap()

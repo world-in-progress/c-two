@@ -28,7 +28,10 @@ const RELAY_ADVERTISE_URL: &str = "C2_RELAY_ADVERTISE_URL";
 const RELAY_SEEDS: &str = "C2_RELAY_SEEDS";
 const RELAY_USE_PROXY: &str = "C2_RELAY_USE_PROXY";
 
-const ENV_KEYS: [&str; 15] = [
+const RELAY_CA_CERT: &str = "C2_RELAY_CA_CERT";
+const RELAY_CERT_SHA256: &str = "C2_RELAY_CERT_SHA256";
+
+const ENV_KEYS: [&str; 17] = [
     ENV_FILE,
     RELAY_ANCHOR,
     IPC_ROOT,
@@ -44,6 +47,8 @@ const ENV_KEYS: [&str; 15] = [
     RELAY_ADVERTISE_URL,
     RELAY_SEEDS,
     RELAY_USE_PROXY,
+    RELAY_CA_CERT,
+    RELAY_CERT_SHA256,
 ];
 
 pub type EnvMap = BTreeMap<String, OsString>;
@@ -182,9 +187,20 @@ pub struct RelayConfigOverrides {
     pub domain_limits: DomainLimitsOverrides,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Trust policy for a relay HTTPS connection.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
+pub enum RelayTlsTrust {
+    #[default]
+    SystemDefault,
+    CustomCaCert(PathBuf),
+    /// Exact SHA-256 digest of the leaf certificate's DER encoding.
+    CertSha256([u8; 32]),
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
 pub struct ResolvedRelayClientConfig {
     pub use_proxy: bool,
+    pub tls_trust: RelayTlsTrust,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -357,7 +373,7 @@ impl ConfigResolver {
             relay_id,
             advertise_url,
             seeds,
-            use_proxy: Self::resolve_relay_client(overrides.use_proxy, catalog)?.use_proxy,
+            use_proxy: Self::resolve_relay_use_proxy(overrides.use_proxy, catalog)?,
             domain_limits: Self::resolve_domain_limits(&overrides.domain_limits, catalog)?,
             ..defaults
         };
@@ -375,7 +391,44 @@ impl ConfigResolver {
         use_proxy: Option<bool>,
         catalog: &EnvCatalog,
     ) -> Result<ResolvedRelayClientConfig, ConfigError> {
-        let use_proxy = match use_proxy {
+        let use_proxy = Self::resolve_relay_use_proxy(use_proxy, catalog)?;
+        let tls_trust = match (catalog.raw(RELAY_CA_CERT)?, catalog.raw(RELAY_CERT_SHA256)?) {
+            (Some(_), Some(_)) => {
+                return Err(ConfigError::new(format!(
+                    "{RELAY_CA_CERT} and {RELAY_CERT_SHA256} are mutually exclusive"
+                )));
+            }
+            (Some(path), None) => {
+                if path.trim().is_empty() {
+                    return Err(ConfigError::new(format!(
+                        "{RELAY_CA_CERT} must be a nonempty path"
+                    )));
+                }
+                RelayTlsTrust::CustomCaCert(PathBuf::from(path))
+            }
+            (None, Some(pin)) => {
+                let mut digest = [0; 32];
+                hex::decode_to_slice(pin.strip_prefix("sha256:").unwrap_or(pin), &mut digest)
+                    .map_err(|_| {
+                        ConfigError::new(format!(
+                            "{RELAY_CERT_SHA256} must be a 64-digit hexadecimal SHA-256 digest"
+                        ))
+                    })?;
+                RelayTlsTrust::CertSha256(digest)
+            }
+            (None, None) => RelayTlsTrust::SystemDefault,
+        };
+        Ok(ResolvedRelayClientConfig {
+            use_proxy,
+            tls_trust,
+        })
+    }
+
+    fn resolve_relay_use_proxy(
+        use_proxy: Option<bool>,
+        catalog: &EnvCatalog,
+    ) -> Result<bool, ConfigError> {
+        Ok(match use_proxy {
             Some(value) => value,
             None => match catalog
                 .text(RELAY_USE_PROXY)?
@@ -390,8 +443,7 @@ impl ConfigResolver {
                     )));
                 }
             },
-        };
-        Ok(ResolvedRelayClientConfig { use_proxy })
+        })
     }
 
     /// Resolve the immutable local endpoint context from typed options and

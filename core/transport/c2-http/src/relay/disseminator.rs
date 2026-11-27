@@ -21,10 +21,14 @@ pub struct FullBroadcast {
 impl FullBroadcast {
     pub fn with_proxy_policy(use_proxy: bool) -> Self {
         Self {
-            http_client: crate::relay_client_builder_with_proxy(use_proxy)
-                .timeout(std::time::Duration::from_secs(5))
-                .build()
-                .expect("c-two: failed to build reqwest Client for relay traffic"),
+            http_client: crate::relay_client_builder(&c2_config::ResolvedRelayClientConfig {
+                use_proxy: use_proxy,
+                ..Default::default()
+            })
+            .expect("system relay TLS configuration")
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .expect("c-two: failed to build reqwest Client for relay traffic"),
         }
     }
 

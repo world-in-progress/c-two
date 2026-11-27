@@ -452,10 +452,14 @@ async fn live_relay_reregistration_larger_limit_preserves_old_client_unary_and_s
     let client = tokio::task::spawn_blocking({
         let url = url.clone();
         move || {
-            let client =
-                RelayAwareHttpClient::new(&url, expected, false, RelayAwareClientConfig::default())
-                    .unwrap()
-                    .with_http_only();
+            let client = RelayAwareHttpClient::new(
+                &url,
+                expected,
+                &Default::default(),
+                RelayAwareClientConfig::default(),
+            )
+            .unwrap()
+            .with_http_only();
             client
                 .resolve_http_target_with_deadline(c2_config::ConnectDeadline::default())
                 .unwrap();
@@ -628,7 +632,7 @@ fn client(registry: &Server) -> RelayAwareHttpClient {
     RelayAwareHttpClient::new(
         &registry.url,
         expected(),
-        false,
+        &Default::default(),
         RelayAwareClientConfig::default(),
     )
     .unwrap()
@@ -675,7 +679,6 @@ async fn selected_http_target_stays_pinned_when_another_client_refreshes_shared_
         RelayAwareHttpClient::new_with_control(
             Arc::clone(&control),
             expected(),
-            false,
             RelayAwareClientConfig::default(),
         )
         .unwrap(),
@@ -684,7 +687,6 @@ async fn selected_http_target_stays_pinned_when_another_client_refreshes_shared_
         RelayAwareHttpClient::new_with_control(
             Arc::clone(&control),
             expected(),
-            false,
             RelayAwareClientConfig::default(),
         )
         .unwrap(),
@@ -1191,7 +1193,7 @@ async fn owned_payloads_preserve_content_length_contract_headers_and_contents() 
     let client = RelayAwareHttpClient::new(
         &registry.url,
         expected(),
-        false,
+        &Default::default(),
         RelayAwareClientConfig::default(),
     )
     .unwrap();
@@ -1890,7 +1892,7 @@ async fn completed_request_budget_is_reused_by_its_known_length_response() {
     let client = RelayAwareHttpClient::new(
         &registry.url,
         expected(),
-        false,
+        &Default::default(),
         RelayAwareClientConfig::default(),
     )
     .unwrap();
@@ -1992,7 +1994,6 @@ async fn controlled_stream_uses_one_bound_post_and_stream_accept_header() {
     let client = RelayAwareHttpClient::new_with_control(
         Arc::clone(&relay_control),
         expected(),
-        false,
         RelayAwareClientConfig::default(),
     )
     .unwrap();
@@ -2010,7 +2011,6 @@ async fn controlled_stream_uses_one_bound_post_and_stream_accept_header() {
     let newer_client = RelayAwareHttpClient::new_with_control(
         Arc::clone(&relay_control),
         expected(),
-        false,
         RelayAwareClientConfig::default(),
     )
     .unwrap();

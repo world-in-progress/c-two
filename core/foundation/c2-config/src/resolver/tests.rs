@@ -340,3 +340,88 @@ fn outcome_store_limits_resolve_and_validate_against_memory_budget() {
             .contains("C2_OUTCOME_MAX_RETAINED_BYTES")
     );
 }
+
+fn relay_client_settings(vars: &[(&str, &str)]) -> Result<ResolvedRelayClientConfig, ConfigError> {
+    ConfigResolver::resolve_relay_client(None, &catalog(vars))
+}
+
+#[test]
+fn relay_tls_trust_defaults_to_builtin_roots_and_accepts_a_ca_path() {
+    assert_eq!(
+        relay_client_settings(&[]).unwrap(),
+        ResolvedRelayClientConfig::default()
+    );
+    assert_eq!(
+        relay_client_settings(&[(RELAY_CA_CERT, "my CA.pem"), (RELAY_USE_PROXY, "yes")]).unwrap(),
+        ResolvedRelayClientConfig {
+            use_proxy: true,
+            tls_trust: RelayTlsTrust::CustomCaCert("my CA.pem".into()),
+        }
+    );
+}
+
+#[test]
+fn relay_certificate_fingerprint_has_one_identity() {
+    let digest = "ab".repeat(32);
+    let prefixed = format!("sha256:{}", digest.to_ascii_uppercase());
+    let bare = relay_client_settings(&[(RELAY_CERT_SHA256, &digest)]).unwrap();
+    assert_eq!(bare.tls_trust, RelayTlsTrust::CertSha256([0xab; 32]));
+    assert_eq!(
+        bare,
+        relay_client_settings(&[(RELAY_CERT_SHA256, &prefixed)]).unwrap()
+    );
+}
+
+#[test]
+fn relay_tls_rejects_ambiguous_or_malformed_configuration() {
+    let pin = "ab".repeat(32);
+    let invalid_hex = "ag".repeat(32);
+    for (vars, expected) in [
+        (
+            vec![(RELAY_CA_CERT, "ca.pem"), (RELAY_CERT_SHA256, pin.as_str())],
+            "mutually exclusive",
+        ),
+        (vec![(RELAY_CA_CERT, "")], RELAY_CA_CERT),
+        (vec![(RELAY_CA_CERT, "  ")], RELAY_CA_CERT),
+        (vec![(RELAY_CERT_SHA256, "")], RELAY_CERT_SHA256),
+        (vec![(RELAY_CERT_SHA256, "sha256:abcd")], RELAY_CERT_SHA256),
+        (
+            vec![(RELAY_CERT_SHA256, invalid_hex.as_str())],
+            RELAY_CERT_SHA256,
+        ),
+    ] {
+        assert!(
+            relay_client_settings(&vars)
+                .unwrap_err()
+                .to_string()
+                .contains(expected)
+        );
+    }
+}
+
+#[test]
+fn relay_tls_requires_utf8() {
+    #[cfg(unix)]
+    let invalid = {
+        use std::os::unix::ffi::OsStringExt;
+        OsString::from_vec(vec![0xff])
+    };
+    #[cfg(windows)]
+    let invalid = {
+        use std::os::windows::ffi::OsStringExt;
+        OsString::from_wide(&[0xd800])
+    };
+    for key in [RELAY_CA_CERT, RELAY_CERT_SHA256] {
+        let catalog = EnvCatalog::load(ConfigSources {
+            env_file: EnvFilePolicy::Disabled,
+            process_env: [(key.to_owned(), invalid.clone())].into(),
+        })
+        .unwrap();
+        assert!(
+            ConfigResolver::resolve_relay_client(None, &catalog)
+                .unwrap_err()
+                .to_string()
+                .contains(&format!("{key} must be valid UTF-8"))
+        );
+    }
+}
