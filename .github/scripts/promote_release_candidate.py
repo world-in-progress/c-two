@@ -817,7 +817,8 @@ def verify_candidate_receipts(
             f"sdist-proof isolated_wheel {isolated['name']!r} is not a valid wheel filename: {error}"
         ) from error
     _require(
-        isolated_dist.replace("_", "-").lower() == "c-two"
+        str(isolated["name"]).startswith(f"c_two-{c_two_version}-")
+        and isolated_dist.replace("_", "-").lower() == "c-two"
         and str(isolated_version) == c_two_version,
         f"sdist-proof isolated_wheel {isolated['name']!r} does not match c-two {c_two_version}",
     )
@@ -1039,7 +1040,7 @@ def github_release_state(
     else:
         for asset in assets:
             asset["disposition"] = "upload"
-    if prerelease:
+    if prerelease or release_exists:
         make_latest = False
     else:
         latest_status, latest_release = api.get_json(f"/repos/{api.repository}/releases/latest")
@@ -1057,11 +1058,16 @@ def github_release_state(
             )
             latest_version = latest_tag.removeprefix(TAG_PREFIX)
             try:
-                rc_helper.validate_c3_version(latest_version)
+                latest_is_prerelease = rc_helper.validate_c3_version(latest_version)
             except rc_helper.HelperError as error:
                 raise PromotionError(
                     f"latest release tag {latest_tag!r} has invalid c3 version: {error}"
                 ) from error
+            _require(
+                not latest_is_prerelease,
+                f"latest release tag {latest_tag!r} is a pre-release version; "
+                "refusing to compare Latest against a non-stable baseline",
+            )
             make_latest = (
                 rc_helper.c3_version_sort_key(resolved_version)
                 >= rc_helper.c3_version_sort_key(latest_version)

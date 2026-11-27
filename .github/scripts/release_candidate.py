@@ -444,7 +444,8 @@ def _validate_fastdb_decisions(problems: list[str], decisions: list[tuple[str, d
 
 def _validate_candidate_bindings(options: argparse.Namespace, problems: list[str],
                                  cli: list[dict], wheels: list[dict], fastdb_proof: list[dict],
-                                 parsed_receipts: dict[str, dict | None]) -> tuple[int, dict]:
+                                 parsed_receipts: dict[str, dict | None],
+                                 meta: dict[str, str] | None = None) -> tuple[int, dict]:
     """Cross-bind retained bytes, receipts, published metadata, and row coverage.
 
     Returns the ABI-row count for the manifest counts section. Deep checks are
@@ -595,6 +596,34 @@ def _validate_candidate_bindings(options: argparse.Namespace, problems: list[str
                 if inventory is None or inventory["sha256"] != cli_art.get("sha256"):
                     problems.append(f"receipt {name} CLI bytes do not match the retained "
                                     f"{cli_name or 'CLI artifact'}")
+                if meta and "c3_version" in meta:
+                    expected_cli_version = f"c3 {meta['c3_version']}"
+                    if payload.get("cli_version") != expected_cli_version:
+                        problems.append(
+                            f"receipt {name} cli_version {payload.get('cli_version')!r} "
+                            f"does not match {expected_cli_version!r}"
+                        )
+
+            expected_ctwo_version = (
+                meta.get("c_two_version") if meta else None
+            ) or options.expect_wheel_version
+            if expected_ctwo_version:
+                checks = payload.get("checks")
+                if isinstance(checks, list):
+                    for check in checks:
+                        if not isinstance(check, dict):
+                            continue
+                        installed_versions = check.get("versions")
+                        actual_version = (
+                            installed_versions.get("c-two")
+                            if isinstance(installed_versions, dict)
+                            else None
+                        )
+                        if actual_version != expected_ctwo_version:
+                            problems.append(
+                                f"receipt {name} check installed c-two version "
+                                f"{actual_version!r} does not match {expected_ctwo_version!r}"
+                            )
 
             if fastdb_art is not None and isinstance(decision, dict):
                 mode = decision.get("mode")
@@ -755,12 +784,17 @@ def command_manifest(options: argparse.Namespace) -> int:
                     f"sdist {entry['name']} does not match expected {expected_sdist_name}"
                 )
         inspect_payload = parsed_receipts.get("sdist-inspect.json")
-        if isinstance(inspect_payload, dict) and "project" in inspect_payload:
+        if isinstance(inspect_payload, dict):
             project = inspect_payload.get("project")
-            if not isinstance(project, dict) or project.get("version") != meta["c_two_version"]:
+            if (
+                not isinstance(project, dict)
+                or not isinstance(project.get("name"), str)
+                or project["name"].replace("_", "-").lower() != "c-two"
+                or project.get("version") != meta["c_two_version"]
+            ):
                 problems.append(
                     f"sdist-inspect.json project {project!r} does not match "
-                    f"c_two_version {meta['c_two_version']!r}"
+                    f"c-two {meta['c_two_version']!r}"
                 )
     if "c3_version" in meta:
         try:
@@ -769,7 +803,7 @@ def command_manifest(options: argparse.Namespace) -> int:
             problems.append(str(error))
 
     abi_rows, _proof_by_name = _validate_candidate_bindings(
-        options, problems, cli, wheels, fastdb_proof, parsed_receipts)
+        options, problems, cli, wheels, fastdb_proof, parsed_receipts, meta=meta)
 
     if problems:
         for problem in problems:

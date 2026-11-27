@@ -1768,6 +1768,18 @@ _FAKE_GH = """#!/usr/bin/env python3
 import os, sys
 with open(os.environ["GH_LOG"], "a", encoding="utf-8", newline="\\n") as log:
     log.write("\\0".join(sys.argv[1:]) + "\\n")
+if len(sys.argv) >= 2 and sys.argv[1] == "api":
+    endpoint = sys.argv[-1]
+    if "/releases/latest" in endpoint:
+        latest = os.environ.get("GH_LATEST_JSON", "")
+        if latest:
+            sys.stdout.write(latest)
+            sys.exit(0)
+        sys.stderr.write("gh: Not Found (HTTP 404)\\n")
+        sys.exit(1)
+    if "/releases?" in endpoint or endpoint.endswith("/releases"):
+        sys.stdout.write(os.environ.get("GH_RELEASES_JSON", "[]"))
+        sys.exit(0)
 sys.exit(0)
 """
 
@@ -1822,8 +1834,13 @@ def test_cli_publish_harness_roundtrip(tmp_path: Path, environment) -> None:
         tag_exists: str,
         prerelease: str = "false",
         make_latest: str = "true",
-    ) -> list[list[str]]:
-        workspace = tmp_path / f"publish-{release_exists}-{tag_exists}-{prerelease}-{make_latest}"
+        gh_releases_json: str = "[]",
+        gh_latest_json: str = "",
+        expect_rc: int = 0,
+        label: str = "",
+    ) -> tuple[list[list[str]], str]:
+        suffix = f"-{label}" if label else ""
+        workspace = tmp_path / f"publish-{release_exists}-{tag_exists}-{prerelease}-{make_latest}{suffix}"
         workspace.mkdir()
         (workspace / "promotion-plan.json").write_text(plan.read_text())
         (workspace / "release-body.md").write_text("body")
@@ -1845,7 +1862,10 @@ def test_cli_publish_harness_roundtrip(tmp_path: Path, environment) -> None:
             "TAG_EXISTS": tag_exists,
             "PRERELEASE": prerelease,
             "MAKE_LATEST": make_latest,
+            "GH_RELEASES_JSON": gh_releases_json,
+            "GH_LATEST_JSON": gh_latest_json,
         })
+        stderr = ""
         for step in (create_step, upload_step):
             if step["if"] and release_exists != "false":
                 continue
@@ -1853,10 +1873,14 @@ def test_cli_publish_harness_roundtrip(tmp_path: Path, environment) -> None:
                 [posix_shell(), "-c", step["run"]], cwd=workspace, env=env,
                 capture_output=True, text=True, encoding="utf-8", timeout=30,
             )
+            stderr += result.stderr
+            if expect_rc != 0:
+                assert result.returncode == expect_rc, result.stderr
+                break
             assert result.returncode == 0, result.stderr
         if not log.exists():
-            return []
-        return [line.split("\0") for line in log.read_text().splitlines()]
+            return [], stderr
+        return [line.split("\0") for line in log.read_text().splitlines()], stderr
 
     def uploads(invocations: list[list[str]]) -> set[str]:
         return {arg for args in invocations
@@ -1864,7 +1888,7 @@ def test_cli_publish_harness_roundtrip(tmp_path: Path, environment) -> None:
                 for arg in args if arg.startswith("staging/")}
 
     # Missing release and tag: create targets the candidate source commit.
-    invocations = run_publish(release_exists="false", tag_exists="false")
+    invocations, _ = run_publish(release_exists="false", tag_exists="false")
     create_calls = [a for a in invocations if a[:3] == ["release", "create", "c3-v0.2.0"]]
     assert len(create_calls) == 1
     assert "--target" in create_calls[0] and plan_data["source_sha"] in create_calls[0]
@@ -1874,7 +1898,7 @@ def test_cli_publish_harness_roundtrip(tmp_path: Path, environment) -> None:
     assert uploads(invocations) == {a["staged_path"] for a in assets}
 
     # Pre-release channel always passes --prerelease --latest=false.
-    invocations = run_publish(
+    invocations, _ = run_publish(
         release_exists="false", tag_exists="false", prerelease="true", make_latest="false",
     )
     create_calls = [a for a in invocations if a[:3] == ["release", "create", "c3-v0.2.0"]]
@@ -1883,7 +1907,7 @@ def test_cli_publish_harness_roundtrip(tmp_path: Path, environment) -> None:
     assert "--latest" not in create_calls[0]
 
     # Backfilling an older stable release passes --latest=false without --prerelease.
-    invocations = run_publish(
+    invocations, _ = run_publish(
         release_exists="false", tag_exists="false", prerelease="false", make_latest="false",
     )
     create_calls = [a for a in invocations if a[:3] == ["release", "create", "c3-v0.2.0"]]
@@ -1891,8 +1915,37 @@ def test_cli_publish_harness_roundtrip(tmp_path: Path, environment) -> None:
     assert "--prerelease" not in create_calls[0]
     assert "--latest" not in create_calls[0]
 
+    # Re-running publish after a newer stable release published in between must
+    # re-check remote Latest live and NOT roll Latest back to 0.2.0.
+    invocations, _ = run_publish(
+        release_exists="false",
+        tag_exists="false",
+        prerelease="false",
+        make_latest="true",
+        gh_latest_json=json.dumps({"tag_name": "c3-v0.9.0", "draft": False, "prerelease": False}),
+        label="live-latest-advanced",
+    )
+    create_calls = [a for a in invocations if a[:3] == ["release", "create", "c3-v0.2.0"]]
+    assert len(create_calls) == 1
+    assert "--latest=false" in create_calls[0]
+    assert "--latest" not in create_calls[0]
+
+    # A draft release carrying the same tag (hidden from GET /releases/tags/{tag})
+    # must fail closed before gh release create is invoked.
+    invocations, stderr = run_publish(
+        release_exists="false",
+        tag_exists="false",
+        gh_releases_json=json.dumps([
+            {"tag_name": "c3-v0.2.0", "draft": True, "prerelease": False},
+        ]),
+        expect_rc=1,
+        label="draft-collision",
+    )
+    assert not any(a[:2] == ["release", "create"] for a in invocations)
+    assert "draft=True" in stderr
+
     # Existing tag, missing release: create guards with --verify-tag.
-    invocations = run_publish(release_exists="false", tag_exists="true")
+    invocations, _ = run_publish(release_exists="false", tag_exists="true")
     create_calls = [a for a in invocations if a[:3] == ["release", "create", "c3-v0.2.0"]]
     assert "--verify-tag" in create_calls[0]
     assert "--target" not in create_calls[0]
@@ -1902,7 +1955,7 @@ def test_cli_publish_harness_roundtrip(tmp_path: Path, environment) -> None:
     for asset in assets[:5]:
         asset["disposition"] = "verified-existing"
     plan.write_text(json.dumps(plan_data, indent=2, sort_keys=True) + "\n")
-    invocations = run_publish(release_exists="true", tag_exists="true")
+    invocations, _ = run_publish(release_exists="true", tag_exists="true")
     assert not any(a[:3] == ["release", "create", "c3-v0.2.0"] for a in invocations)
     expected = {a["staged_path"] for a in assets if a["disposition"] == "upload"}
     assert uploads(invocations) == expected
@@ -2179,3 +2232,46 @@ def test_invalid_candidate_versions_fail_closed_at_promotion(
     code, plan, _ = run_prepare(tmp_path)
     assert code == 1
     assert not plan.exists()
+
+
+def test_prerelease_latest_tag_fails_closed_and_existing_release_skips_latest_query(
+    tmp_path: Path, environment, capsys,
+) -> None:
+    bad_latest = _default_world()
+    bad_latest.latest_release = {"tag_name": "c3-v0.8.0-rc.1", "draft": False, "prerelease": False}
+    environment(bad_latest)
+    code, plan_path, _ = run_prepare(tmp_path / "bad-latest")
+    assert code == 1
+    assert not plan_path.exists()
+    assert "pre-release version" in capsys.readouterr().err
+
+    # Completing an already-existing stable release must not query /releases/latest
+    # and therefore is not blocked by an unrelated latest tag.
+    existing = _default_world()
+    existing.tag_refs["c3-v0.2.0"] = {
+        "ref": "refs/tags/c3-v0.2.0", "object": {"sha": SOURCE_SHA, "type": "commit"}}
+    existing.releases["c3-v0.2.0"] = {
+        "tag_name": "c3-v0.2.0", "name": "c3 0.2.0", "draft": False, "prerelease": False, "assets": []}
+    existing.latest_release = {"tag_name": "unrelated-legacy-tag", "draft": False, "prerelease": False}
+    api = environment(existing)
+    code, plan_path, _ = run_prepare(tmp_path / "existing")
+    assert code == 0
+    assert not any(path.endswith("/releases/latest") for path in api.paths)
+
+
+def test_sdist_proof_rejects_unnormalized_isolated_wheel_filename_spelling(
+    tmp_path: Path, environment, capsys,
+) -> None:
+    builder = CandidateBuilder(c_two_version="0.13.0rc1", c3_version="0.9.0-rc.1")
+    unnormalized = "c_two-0.13.0RC01-cp312-cp312-manylinux_2_39_x86_64.whl"
+    proof = json.loads(builder.members["sdist-proof.json"])
+    proof["isolated_wheel"]["name"] = unnormalized
+    proof["lifecycle"]["artifacts"][0]["name"] = unnormalized
+    builder._rewrite_json("sdist-proof.json", proof)
+    world = World(candidate=builder)
+    world.set_source_runs(_run(201, "Source Validation"))
+    environment(world)
+    code, plan_path, _ = run_prepare(tmp_path)
+    assert code == 1
+    assert not plan_path.exists()
+    assert "isolated_wheel" in capsys.readouterr().err

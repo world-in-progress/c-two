@@ -175,6 +175,10 @@ def _check_readmes_for_c3_version(root: Path, version: str) -> None:
         f"{releases}/latest/download/c3-installer.sh",
         f"{releases}/download/c3-v{version}/c3-installer.sh",
     )
+    exact_version_flag = re.compile(
+        rf"--version {re.escape(version)}(?:[\s`\"']|$)",
+        re.ASCII,
+    )
     stable_version_flag = re.compile(
         r"--version (0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(?:[\s`\"']|$)",
         re.ASCII,
@@ -198,9 +202,9 @@ def _check_readmes_for_c3_version(root: Path, version: str) -> None:
             assert any(url in text for url in installers), path
         if path != root / "examples" / "README.md":
             if is_prerelease:
-                assert f"--version {version}" in text or stable_version_flag.search(text), path
+                assert exact_version_flag.search(text) or stable_version_flag.search(text), path
             else:
-                assert f"--version {version}" in text, path
+                assert exact_version_flag.search(text), path
 
 
 def test_readmes_document_the_c3_installer_asset():
@@ -209,11 +213,34 @@ def test_readmes_document_the_c3_installer_asset():
     _check_readmes_for_c3_version(root, version)
 
 
-def test_readmes_check_allows_stable_version_during_prerelease_bumps():
-    root = _repo_root()
-    _check_readmes_for_c3_version(root, "0.9.0-rc.1")
+def test_readmes_check_distinguishes_stable_prerelease_and_whole_version_tokens(tmp_path: Path):
+    releases = "https://github.com/world-in-progress/c-two/releases"
+
+    def write_readmes(installer_version: str, flag_version: str) -> None:
+        body = (
+            f"curl -fsSL {releases}/download/c3-v{installer_version}/c3-installer.sh "
+            f"| sh -s -- --version {flag_version}\n"
+        )
+        for rel in ("README.md", "README.zh-CN.md", "examples/README.md", "cli/README.md"):
+            target = tmp_path / rel
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(body, encoding="utf-8")
+
+    # Stable README satisfies both its exact stable version and pre-release bumps.
+    write_readmes("0.8.0", "0.8.0")
+    _check_readmes_for_c3_version(tmp_path, "0.8.0")
+    _check_readmes_for_c3_version(tmp_path, "0.9.0-rc.1")
     with pytest.raises(AssertionError):
-        _check_readmes_for_c3_version(root, "99.99.99")
+        _check_readmes_for_c3_version(tmp_path, "0.9.0")
+
+    # A pre-release flag "--version 0.8.0-rc.1" must NOT satisfy stable "0.8.0".
+    write_readmes("0.8.0", "0.8.0-rc.1")
+    with pytest.raises(AssertionError):
+        _check_readmes_for_c3_version(tmp_path, "0.8.0")
+
+    # A README explicitly updated to the matching pre-release also passes.
+    write_readmes("0.9.0-rc.2", "0.9.0-rc.2")
+    _check_readmes_for_c3_version(tmp_path, "0.9.0-rc.2")
 
 
 def test_ci_runs_cli_rust_tests():

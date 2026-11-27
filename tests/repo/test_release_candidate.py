@@ -412,7 +412,11 @@ def candidate_tree(tmp_path: Path) -> Path:
                 "row": {"target": target, "python": python, "fastdb_mode": decision["mode"]},
                 "wheel_abi": {"interpreter": tag, "abi": tag},
                 "fastdb": decision,
-                "checks": [{"status": "passed"}, {"status": "passed"}],
+                "cli_version": "c3 0.2.0",
+                "checks": [
+                    {"status": "passed", "versions": {"c-two": "0.6.0"}},
+                    {"status": "passed", "versions": {"c-two": "0.6.0"}},
+                ],
             }
             retain(f"abi-{target}-{python}.json",
                    json.dumps(receipt, indent=2, sort_keys=True).encode())
@@ -436,7 +440,8 @@ def candidate_tree(tmp_path: Path) -> Path:
          "source_commit_sha": SOURCE_SHA}).encode())
     retain("sdist-inspect.json", json.dumps(
         {"schema": "c-two.release-candidate.sdist-inspection.v1", "status": "passed",
-         "source_commit_sha": SOURCE_SHA}).encode())
+         "source_commit_sha": SOURCE_SHA,
+         "project": {"name": "c-two", "version": "0.6.0"}}).encode())
     retain("sdist-proof.json", json.dumps(
         {"schema": "c-two.release-candidate.sdist-proof.v1", "status": "executed",
          "source_commit_sha": SOURCE_SHA,
@@ -1030,3 +1035,33 @@ def test_manifest_accepts_prerelease_versions_and_rejects_invalid_meta_versions(
     )
     assert rc.main(manifest_args(root, root / "rc-manifest.json")) == 1
     assert "c-two wheel version" in capsys.readouterr().err
+
+    # Mismatched ABI cli_version fails closed at candidate sealing.
+    root2 = candidate_tree(tmp_path / "cli-mismatch")
+    rewrite_receipt(
+        root2,
+        "abi-x86_64-unknown-linux-gnu-3.12.json",
+        lambda payload: payload.update(cli_version="c3 0.1.9"),
+    )
+    assert rc.main(manifest_args(root2, root2 / "rc-manifest.json")) == 1
+    assert "cli_version" in capsys.readouterr().err
+
+    # Mismatched installed check version fails closed at candidate sealing.
+    root3 = candidate_tree(tmp_path / "check-mismatch")
+    rewrite_receipt(
+        root3,
+        "abi-x86_64-unknown-linux-gnu-3.12.json",
+        lambda payload: payload["checks"][0]["versions"].update({"c-two": "0.5.9"}),
+    )
+    assert rc.main(manifest_args(root3, root3 / "rc-manifest.json")) == 1
+    assert "installed c-two version" in capsys.readouterr().err
+
+    # Missing sdist-inspect.json project metadata fails closed at candidate sealing.
+    root4 = candidate_tree(tmp_path / "inspect-missing")
+    rewrite_receipt(
+        root4,
+        "sdist-inspect.json",
+        lambda payload: payload.pop("project", None),
+    )
+    assert rc.main(manifest_args(root4, root4 / "rc-manifest.json")) == 1
+    assert "sdist-inspect.json project" in capsys.readouterr().err

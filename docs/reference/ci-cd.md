@@ -70,8 +70,8 @@ Pre-releases reuse the exact same immutable `Source Validation` → `Release Can
 2. Explicitly dispatch `release-candidate.yml` on `main`.
 3. Promote the verified candidate run ID to GitHub Releases and PyPI. Release channels are derived strictly from the validated versions—never from a manual checkbox:
    - Pre-release `c3` versions (`X.Y.Z-{alpha,beta,rc}.N`) publish with `gh release create ... --prerelease --latest=false`, leaving `latest` and default installer users untouched.
-   - Stable `c3` versions compare against the current GitHub `latest` release and pass `--latest` only when monotonic (`>=` current latest, or when no stable release exists yet); backfilling an older stable candidate passes `--latest=false`.
-   - Retries against an existing GitHub release require `draft == false` and an exact `prerelease` channel match before classifying assets.
+   - Stable `c3` versions compare against the current stable GitHub `latest` release both at `prepare` and live inside `publish` right before `gh release create`, passing `--latest` only when monotonic (`>=` current latest, or when no stable release exists yet); backfilling or re-running an older stable candidate passes `--latest=false`.
+   - Retries against an existing GitHub release require `draft == false` and an exact `prerelease` channel match before classifying assets; before creating a new release, `publish` also queries the full releases list with `contents: write` authority so any draft release carrying the target tag fails closed.
    - Pre-release `c-two` versions (`X.Y.Z{a,b,rc}N`) upload to PyPI as standard PEP 440 pre-releases (installable explicitly via `uv add "c-two==0.13.0rc1"` or `pip install --pre "c-two==0.13.0rc1"`; `c3` via `c3-installer.sh --version 0.9.0-rc.1`).
 4. Graduating from an RC to a stable release requires a new stable version bump commit, a new `release-candidate.yml` dispatch, and promotion of the new candidate artifacts.
 
