@@ -42,6 +42,8 @@ jobs:
       source_sha: ${{ steps.prepare.outputs.source_sha }}
       release_exists: ${{ steps.prepare.outputs.release_exists }}
       tag_exists: ${{ steps.prepare.outputs.tag_exists }}
+      prerelease: ${{ steps.prepare.outputs.prerelease }}
+      make_latest: ${{ steps.prepare.outputs.make_latest }}
     steps:
       # The default checkout is the current main code: the promotion trusts
       # the reviewed validators on main, never the candidate's input SHA.
@@ -80,6 +82,8 @@ jobs:
               output.write(f"source_sha={plan['source_sha']}\n")
               output.write(f"release_exists={str(release['release_exists']).lower()}\n")
               output.write(f"tag_exists={str(release['tag_exists']).lower()}\n")
+              output.write(f"prerelease={str(release['prerelease']).lower()}\n")
+              output.write(f"make_latest={str(release['make_latest']).lower()}\n")
           PY
 
       # The upload's least-common ancestor is the staging directory itself, so
@@ -157,6 +161,8 @@ jobs:
           TITLE: ${{ needs.prepare.outputs.title }}
           SOURCE_SHA: ${{ needs.prepare.outputs.source_sha }}
           TAG_EXISTS: ${{ needs.prepare.outputs.tag_exists }}
+          PRERELEASE: ${{ needs.prepare.outputs.prerelease }}
+          MAKE_LATEST: ${{ needs.prepare.outputs.make_latest }}
         run: |
           set -euo pipefail
           extra=()
@@ -164,6 +170,13 @@ jobs:
             extra+=(--verify-tag)
           else
             extra+=(--target "$SOURCE_SHA")
+          fi
+          if [ "$PRERELEASE" = "true" ]; then
+            extra+=(--prerelease --latest=false)
+          elif [ "$MAKE_LATEST" = "true" ]; then
+            extra+=(--latest)
+          else
+            extra+=(--latest=false)
           fi
           gh release create "$TAG" --repo "$REPO" --title "$TITLE" \
             --notes-file release-body.md "${extra[@]}"

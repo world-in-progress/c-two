@@ -160,13 +160,29 @@ def test_cli_release_body_links_provenance_and_arm64_coverage():
     assert "Source Validation tested commit" in script
 
 
-def test_readmes_document_the_c3_installer_asset():
-    root = _repo_root()
-    version = tomllib.loads((root / "cli" / "Cargo.toml").read_text(encoding="utf-8"))["package"]["version"]
+def _check_readmes_for_c3_version(root: Path, version: str) -> None:
+    import re
+    import sys
+
+    scripts_dir = str(root / ".github" / "scripts")
+    if scripts_dir not in sys.path:
+        sys.path.insert(0, scripts_dir)
+    import release_candidate as rc_helper
+
+    is_prerelease = rc_helper.validate_c3_version(version)
     releases = "https://github.com/world-in-progress/c-two/releases"
     installers = (
         f"{releases}/latest/download/c3-installer.sh",
         f"{releases}/download/c3-v{version}/c3-installer.sh",
+    )
+    stable_version_flag = re.compile(
+        r"--version (0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(?:[\s`\"']|$)",
+        re.ASCII,
+    )
+    stable_installer_url = re.compile(
+        re.escape(releases)
+        + r"/download/c3-v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)/c3-installer\.sh",
+        re.ASCII,
     )
 
     for path in [
@@ -176,9 +192,28 @@ def test_readmes_document_the_c3_installer_asset():
         root / "cli" / "README.md",
     ]:
         text = path.read_text(encoding="utf-8")
-        assert any(url in text for url in installers), path
+        if is_prerelease:
+            assert any(url in text for url in installers) or stable_installer_url.search(text), path
+        else:
+            assert any(url in text for url in installers), path
         if path != root / "examples" / "README.md":
-            assert f"--version {version}" in text, path
+            if is_prerelease:
+                assert f"--version {version}" in text or stable_version_flag.search(text), path
+            else:
+                assert f"--version {version}" in text, path
+
+
+def test_readmes_document_the_c3_installer_asset():
+    root = _repo_root()
+    version = tomllib.loads((root / "cli" / "Cargo.toml").read_text(encoding="utf-8"))["package"]["version"]
+    _check_readmes_for_c3_version(root, version)
+
+
+def test_readmes_check_allows_stable_version_during_prerelease_bumps():
+    root = _repo_root()
+    _check_readmes_for_c3_version(root, "0.9.0-rc.1")
+    with pytest.raises(AssertionError):
+        _check_readmes_for_c3_version(root, "99.99.99")
 
 
 def test_ci_runs_cli_rust_tests():

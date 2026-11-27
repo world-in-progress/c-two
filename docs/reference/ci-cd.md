@@ -53,9 +53,27 @@ Dispatch immediately after merging the release commit; packaging does not wait f
 gh workflow run release-candidate.yml --ref main
 ```
 
-Every build and receipt uses the dispatch commit, not a later moving branch head. `rc-context.json` uses `c-two.release-candidate.context.v2` and records source identity and versions; source validation is selected later during promotion. The existing Linux/native reusable workflows produce and verify 35 wheels, 6 c3 binaries, 1 sdist, 2 installers and 56 receipts. Windows ARM64 covers Python 3.11–3.14 and 3.14t; the other five targets also cover 3.10. Installed consumers validate native architecture, cross-language calls and cleanup, including standard-user checks on both Windows architectures.
+Every build and receipt uses the dispatch commit, not a later moving branch head. `rc-context.json` uses `c-two.release-candidate.context.v2` and records source identity and versions; source validation is selected later during promotion. The `context` job reads `sdk/python/pyproject.toml` and `cli/Cargo.toml` through TOML parsing and validates both versions before any packaging job starts:
+
+- `c-two` (`sdk/python/pyproject.toml`): canonical ASCII PEP 440 `X.Y.Z` or pre-release `X.Y.Z{a,b,rc}N` (epoch 0, no `.dev`, `.post`, or `+local` segments; unnormalized forms such as `0.13.0-rc.1` fail closed so filenames match `rc-context.json`).
+- `c3` (`cli/Cargo.toml`): strict ASCII SemVer 2.0 `X.Y.Z` or pre-release `X.Y.Z-{alpha,beta,rc}.N` (no leading zeros, no build metadata).
+
+The existing Linux/native reusable workflows produce and verify 35 wheels, 6 c3 binaries, 1 sdist, 2 installers and 56 receipts. Windows ARM64 covers Python 3.11–3.14 and 3.14t; the other five targets also cover 3.10. Installed consumers validate native architecture, cross-language calls and cleanup, including standard-user checks on both Windows architectures.
 
 Only a successful candidate is eligible for promotion. Keep its run ID and use it for both publication destinations. Explicit candidate builds do not cancel each other. Publication requires retained, unexpired artifacts; an expired or failed candidate needs a new candidate build. Candidate artifact handling is separate from source-lane reruns: rebuild the complete candidate if candidate qualification fails.
+
+## Pre-release (RC) qualification and promotion
+
+Pre-releases reuse the exact same immutable `Source Validation` → `Release Candidate` → approved promotion chain without weakening `main`-only or Trusted Publisher protections:
+
+1. Bump versions and refresh lockfiles together on `main` (`sdk/python/pyproject.toml`, `uv.lock`, `cli/Cargo.toml`, `cli/Cargo.lock`). While `cli/Cargo.toml` carries a pre-release version, root and CLI READMEs may keep referencing the latest stable `--version X.Y.Z` instead of churning on every `rcN`.
+2. Explicitly dispatch `release-candidate.yml` on `main`.
+3. Promote the verified candidate run ID to GitHub Releases and PyPI. Release channels are derived strictly from the validated versions—never from a manual checkbox:
+   - Pre-release `c3` versions (`X.Y.Z-{alpha,beta,rc}.N`) publish with `gh release create ... --prerelease --latest=false`, leaving `latest` and default installer users untouched.
+   - Stable `c3` versions compare against the current GitHub `latest` release and pass `--latest` only when monotonic (`>=` current latest, or when no stable release exists yet); backfilling an older stable candidate passes `--latest=false`.
+   - Retries against an existing GitHub release require `draft == false` and an exact `prerelease` channel match before classifying assets.
+   - Pre-release `c-two` versions (`X.Y.Z{a,b,rc}N`) upload to PyPI as standard PEP 440 pre-releases (installable explicitly via `uv add "c-two==0.13.0rc1"` or `pip install --pre "c-two==0.13.0rc1"`; `c3` via `c3-installer.sh --version 0.9.0-rc.1`).
+4. Graduating from an RC to a stable release requires a new stable version bump commit, a new `release-candidate.yml` dispatch, and promotion of the new candidate artifacts.
 
 ## Promote the retained bytes
 

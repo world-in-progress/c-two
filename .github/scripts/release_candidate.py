@@ -51,6 +51,87 @@ class HelperError(RuntimeError):
     """A validation failed; the candidate must not be accepted."""
 
 
+# Strict ASCII-only SemVer 2.0 subset for c3 (no leading zeros, no build metadata).
+C3_VERSION_PATTERN = re.compile(
+    r"^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)"
+    r"(?:-(alpha|beta|rc)\.(0|[1-9][0-9]*))?$",
+    re.ASCII,
+)
+_C3_PRERELEASE_RANK = {"alpha": 0, "beta": 1, "rc": 2}
+
+
+def parse_c3_version(value: str) -> tuple[int, int, int, str | None, int | None]:
+    """Parse and validate a c3 SemVer 2.0 version (stable or alpha/beta/rc)."""
+    if not isinstance(value, str) or not value or not value.isascii():
+        raise HelperError(f"c3 version {value!r} must be a non-empty ASCII SemVer string")
+    match = C3_VERSION_PATTERN.fullmatch(value)
+    if match is None:
+        raise HelperError(
+            f"c3 version {value!r} must match X.Y.Z or X.Y.Z-{{alpha,beta,rc}}.N "
+            "(strict ASCII SemVer 2.0 without leading zeros)"
+        )
+    major, minor, patch = int(match.group(1)), int(match.group(2)), int(match.group(3))
+    pre_kind = match.group(4)
+    pre_num = int(match.group(5)) if match.group(5) is not None else None
+    return major, minor, patch, pre_kind, pre_num
+
+
+def validate_c3_version(value: str) -> bool:
+    """Validate c3 version and return True when it is a pre-release."""
+    _, _, _, pre_kind, _ = parse_c3_version(value)
+    return pre_kind is not None
+
+
+def c3_version_sort_key(value: str) -> tuple[int, int, int, int, int, int]:
+    """Return a total SemVer 2.0 precedence key for validated c3 versions."""
+    major, minor, patch, pre_kind, pre_num = parse_c3_version(value)
+    if pre_kind is None:
+        return (major, minor, patch, 1, 3, 0)
+    return (major, minor, patch, 0, _C3_PRERELEASE_RANK[pre_kind], pre_num or 0)
+
+
+def validate_c_two_version(value: str) -> bool:
+    """Validate canonical PEP 440 c-two version (stable or a/b/rc) and return is_prerelease."""
+    if not isinstance(value, str) or not value or not value.isascii():
+        raise HelperError(f"c-two version {value!r} must be a non-empty ASCII PEP 440 string")
+    from packaging.version import InvalidVersion, Version
+
+    try:
+        parsed = Version(value)
+    except InvalidVersion as error:
+        raise HelperError(f"c-two version {value!r} is not valid PEP 440: {error}") from error
+    if str(parsed) != value:
+        raise HelperError(
+            f"c-two version {value!r} is not canonical PEP 440 (expected {str(parsed)!r})"
+        )
+    if (
+        parsed.epoch != 0
+        or parsed.dev is not None
+        or parsed.local is not None
+        or parsed.post is not None
+        or len(parsed.release) != 3
+        or (parsed.pre is not None and parsed.pre[0] not in ("a", "b", "rc"))
+    ):
+        raise HelperError(
+            f"c-two version {value!r} must be X.Y.Z or X.Y.Z{{a,b,rc}}N "
+            "(epoch 0, no dev/post/local segments)"
+        )
+    return bool(parsed.is_prerelease)
+
+
+def read_repo_versions(root: Path) -> tuple[str, str]:
+    """Read and validate c-two and c3 versions from repository TOML manifests."""
+    import tomllib
+
+    pyproject = tomllib.loads((root / "sdk" / "python" / "pyproject.toml").read_text(encoding="utf-8"))
+    cargo = tomllib.loads((root / "cli" / "Cargo.toml").read_text(encoding="utf-8"))
+    c_two_version = pyproject.get("project", {}).get("version")
+    c3_version = cargo.get("package", {}).get("version")
+    validate_c_two_version(c_two_version)
+    validate_c3_version(c3_version)
+    return c_two_version, c3_version
+
+
 def sha256_file(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as handle:
@@ -475,6 +556,11 @@ def _validate_candidate_bindings(options: argparse.Namespace, problems: list[str
                                     "retained wheel with those bytes")
                 else:
                     referenced_wheels.add(identity)
+                    if options.expect_wheel_version and ctwo_art.get("version") != options.expect_wheel_version:
+                        problems.append(
+                            f"receipt {name} c-two wheel version is {ctwo_art.get('version')!r}, "
+                            f"expected {options.expect_wheel_version!r}"
+                        )
                     try:
                         _, _, _, wheel_tags = parse_wheel_filename(str(identity[0]))
                     except InvalidWheelFilename:
@@ -651,6 +737,37 @@ def command_manifest(options: argparse.Namespace) -> int:
             if not isinstance(payload, dict) or payload.get("source_commit_sha") != options.source_sha:
                 problems.append(f"receipt {name} does not bind source sha {options.source_sha}")
 
+    meta = dict(entry.split("=", 1) for entry in options.meta)
+    if "c_two_version" in meta:
+        try:
+            validate_c_two_version(meta["c_two_version"])
+        except HelperError as error:
+            problems.append(str(error))
+        if options.expect_wheel_version and options.expect_wheel_version != meta["c_two_version"]:
+            problems.append(
+                f"meta c_two_version {meta['c_two_version']!r} differs from "
+                f"--expect-wheel-version {options.expect_wheel_version!r}"
+            )
+        expected_sdist_name = f"c_two-{meta['c_two_version']}.tar.gz"
+        for entry in sdist:
+            if entry["name"] != expected_sdist_name:
+                problems.append(
+                    f"sdist {entry['name']} does not match expected {expected_sdist_name}"
+                )
+        inspect_payload = parsed_receipts.get("sdist-inspect.json")
+        if isinstance(inspect_payload, dict) and "project" in inspect_payload:
+            project = inspect_payload.get("project")
+            if not isinstance(project, dict) or project.get("version") != meta["c_two_version"]:
+                problems.append(
+                    f"sdist-inspect.json project {project!r} does not match "
+                    f"c_two_version {meta['c_two_version']!r}"
+                )
+    if "c3_version" in meta:
+        try:
+            validate_c3_version(meta["c3_version"])
+        except HelperError as error:
+            problems.append(str(error))
+
     abi_rows, _proof_by_name = _validate_candidate_bindings(
         options, problems, cli, wheels, fastdb_proof, parsed_receipts)
 
@@ -664,7 +781,7 @@ def command_manifest(options: argparse.Namespace) -> int:
         "source_commit_sha": options.source_sha,
         "event": options.event,
         "ref": options.ref,
-        "meta": dict(entry.split("=", 1) for entry in options.meta),
+        "meta": meta,
         "counts": {**actual_counts, "abi_rows": abi_rows,
                    "receipts_by_prefix": receipts_by_prefix,
                    "receipts": len(receipts)},

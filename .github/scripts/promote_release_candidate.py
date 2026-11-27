@@ -287,6 +287,11 @@ def verify_manifest_binding(
     _require(meta.get("fastdb_source_rev") == FASTDB_SOURCE_REV,
              "rc-manifest FastDB source differs from the verified source pair")
     c_two_version, c3_version = meta["c_two_version"], meta["c3_version"]
+    try:
+        rc_helper.validate_c_two_version(c_two_version)
+        rc_helper.validate_c3_version(c3_version)
+    except rc_helper.HelperError as error:
+        raise PromotionError(str(error)) from error
 
     extracted = {}
     for path in extraction.rglob("*"):
@@ -460,7 +465,12 @@ def _receipt_artifact(receipt_name: str, artifacts: Any, predicate, label: str) 
     return matches[0]
 
 
-def _verify_lifecycle_cleanup(receipt_name: str, payload: dict[str, Any]) -> None:
+def _verify_lifecycle_cleanup(
+    receipt_name: str,
+    payload: dict[str, Any],
+    *,
+    expected_c_two_version: str | None = None,
+) -> None:
     """Lifecycle receipts must prove orderly shutdown and full cleanup."""
     base = payload.get("base_install") or {}
     _require(base.get("status") == "passed"
@@ -483,6 +493,18 @@ def _verify_lifecycle_cleanup(receipt_name: str, payload: dict[str, Any]) -> Non
                  f"receipt {receipt_name} {transport} observed_mode is inconsistent")
         _require(check.get("held_view_invalidated") is True,
                  f"receipt {receipt_name} {transport} did not invalidate held views")
+        if expected_c_two_version is not None:
+            installed_versions = check.get("versions")
+            actual_version = (
+                installed_versions.get("c-two")
+                if isinstance(installed_versions, dict)
+                else None
+            )
+            _require(
+                actual_version == expected_c_two_version,
+                f"receipt {receipt_name} {transport} installed c-two version {actual_version!r} "
+                f"does not match candidate version {expected_c_two_version!r}",
+            )
     _require(transports == {"direct", "relay"},
              f"receipt {receipt_name} transports are not direct+relay")
     _require(payload.get("borrowed_inputs_invalidated") == 4,
@@ -556,6 +578,10 @@ def _bind_smoke_artifacts(
     _require(identity in wheels_by_identity,
              f"receipt {receipt_name} c-two wheel {identity[0]} is not a retained wheel "
              "with those bytes")
+    expected_c_two_version = manifest["meta"]["c_two_version"]
+    _require(ctwo.get("version") == expected_c_two_version,
+             f"receipt {receipt_name} c-two wheel metadata version {ctwo.get('version')!r} "
+             f"does not match candidate version {expected_c_two_version!r}")
     if wheel_name is not None:
         _require(ctwo.get("name") == wheel_name,
                  f"receipt {receipt_name} consumed wheel {ctwo.get('name')!r}, expected {wheel_name}")
@@ -568,6 +594,10 @@ def _bind_smoke_artifacts(
         cli_inventory = {entry["name"]: entry["sha256"] for entry in manifest["cli"]}
         _require(cli_inventory.get(cli_name) == cli.get("sha256"),
                  f"receipt {receipt_name} CLI bytes do not match the retained {cli_name}")
+        expected_cli_version = f"c3 {manifest['meta']['c3_version']}"
+        _require(payload.get("cli_version") == expected_cli_version,
+                 f"receipt {receipt_name} cli_version {payload.get('cli_version')!r} "
+                 f"does not match {expected_cli_version!r}")
         if cli_name.endswith("-pc-windows-msvc.exe"):
             _verify_windows_architecture(receipt_name, payload,
                                          "win-arm64" if "aarch64" in cli_name else "win-amd64")
@@ -656,6 +686,10 @@ def verify_candidate_receipts(
                          and wheel_platform_matches_target(tag.platform, target) for tag in tags),
                      f"FastDB proof wheel {name} does not support the cp312 target {target}")
 
+    c_two_version = manifest["meta"]["c_two_version"]
+    c3_version = manifest["meta"]["c3_version"]
+    expected_cli_version = f"c3 {c3_version}"
+
     # 35 executed ABI rows: installed-wheel-smoke receipts bound to their row.
     rows: dict[tuple[str, str], str] = {}
     for path in sorted(extraction.glob("abi-*.json")):
@@ -680,7 +714,7 @@ def verify_candidate_receipts(
                  and (recorded_abi.get("interpreter"), recorded_abi.get("abi")) == expected_pair,
                  f"receipt {path.name} wheel_abi {recorded_abi!r} differs from row python "
                  f"{expected_pair[0]}-{expected_pair[1]}")
-        _verify_lifecycle_cleanup(path.name, payload)
+        _verify_lifecycle_cleanup(path.name, payload, expected_c_two_version=c_two_version)
         decision = payload.get("fastdb")
         ctwo = _bind_smoke_artifacts(
             path.name, payload, manifest, context,
@@ -711,7 +745,7 @@ def verify_candidate_receipts(
                  f"{receipt_name} status {payload.get('status')!r} is not passed")
         _require(payload.get("source_commit_sha") == source_sha,
                  f"{receipt_name} source_commit_sha is not the candidate source")
-        _verify_lifecycle_cleanup(receipt_name, payload)
+        _verify_lifecycle_cleanup(receipt_name, payload, expected_c_two_version=c_two_version)
         _bind_smoke_artifacts(
             receipt_name, payload, manifest, context,
             cli_name=f"c3-{target}{'.exe' if target in WINDOWS_TARGETS else ''}",
@@ -730,7 +764,7 @@ def verify_candidate_receipts(
         identity = standard.get("identity")
         _require(isinstance(identity, dict) and identity.get("administrator") is False,
                  "standard-user receipt was not run by a non-administrator identity")
-        _verify_lifecycle_cleanup(receipt_name, standard)
+        _verify_lifecycle_cleanup(receipt_name, standard, expected_c_two_version=c_two_version)
         _bind_smoke_artifacts(
             receipt_name, standard, manifest, context,
             cli_name=f"c3-{target}.exe",
@@ -756,6 +790,14 @@ def verify_candidate_receipts(
     _require(inspect.get("archive") == sdist_entry["name"], "sdist-inspect archive mismatch")
     _require(inspect.get("source_commit_sha") == source_sha,
              "sdist-inspect source_commit_sha is not the candidate source")
+    inspect_project = inspect.get("project")
+    _require(
+        isinstance(inspect_project, dict)
+        and isinstance(inspect_project.get("name"), str)
+        and inspect_project["name"].replace("_", "-").lower() == "c-two"
+        and inspect_project.get("version") == c_two_version,
+        f"sdist-inspect project metadata {inspect_project!r} does not match c-two {c_two_version}",
+    )
     proof = load("sdist-proof.json")
     _require(proof.get("schema") == SDIST_PROOF_SCHEMA, "sdist-proof schema mismatch")
     _require(proof.get("status") == "executed", "sdist-proof status is not executed")
@@ -768,6 +810,17 @@ def verify_candidate_receipts(
     isolated = proof.get("isolated_wheel")
     _require(isinstance(isolated, dict) and isolated.get("name") and isolated.get("sha256"),
              "sdist-proof does not record the isolated repaired wheel")
+    try:
+        isolated_dist, isolated_version, _, _ = parse_wheel_filename(str(isolated["name"]))
+    except (InvalidWheelFilename, ValueError) as error:
+        raise PromotionError(
+            f"sdist-proof isolated_wheel {isolated['name']!r} is not a valid wheel filename: {error}"
+        ) from error
+    _require(
+        isolated_dist.replace("_", "-").lower() == "c-two"
+        and str(isolated_version) == c_two_version,
+        f"sdist-proof isolated_wheel {isolated['name']!r} does not match c-two {c_two_version}",
+    )
     _require(proof.get("link_mode") == "system",
              "sdist-proof link_mode is not the packaged-consumer system mode")
     _require(proof.get("standalone_import") == "passed",
@@ -778,12 +831,18 @@ def verify_candidate_receipts(
     _require(lifecycle.get("schema") == SMOKE_SCHEMA
              and lifecycle.get("source_commit_sha") == source_sha,
              "sdist-proof embedded lifecycle schema/source mismatch")
-    _verify_lifecycle_cleanup("sdist-proof lifecycle", lifecycle)
+    _verify_lifecycle_cleanup("sdist-proof lifecycle", lifecycle, expected_c_two_version=c_two_version)
     artifacts = lifecycle.get("artifacts")
     derived = _receipt_artifact("sdist-proof", artifacts,
                                lambda entry: entry.get("distribution") == "c-two", "derived wheel")
     _require((derived.get("name"), derived.get("sha256")) == (isolated["name"], isolated["sha256"]),
              "sdist-proof lifecycle did not consume the recorded derived wheel")
+    _require(derived.get("version") == c_two_version,
+             f"sdist-proof derived wheel version {derived.get('version')!r} does not match "
+             f"{c_two_version!r}")
+    _require(lifecycle.get("cli_version") == expected_cli_version,
+             f"sdist-proof lifecycle cli_version {lifecycle.get('cli_version')!r} "
+             f"does not match {expected_cli_version!r}")
     cli_name = "c3-x86_64-unknown-linux-gnu"
     cli = _receipt_artifact("sdist-proof", artifacts,
                            lambda entry: entry.get("name") == cli_name, "retained CLI")
@@ -905,9 +964,30 @@ def resolve_tag_commit(api: GitHubApi, tag: str) -> str | None:
 
 
 def github_release_state(
-    api: GitHubApi, tag: str, title: str, source_sha: str, assets: list[dict[str, Any]],
+    api: GitHubApi,
+    tag: str,
+    title: str,
+    source_sha: str,
+    assets: list[dict[str, Any]],
+    *,
+    prerelease: bool = False,
+    c3_version: str | None = None,
 ) -> dict[str, Any]:
     """Classify each planned asset against the existing release; never clobber or move tags."""
+    _require(tag.startswith(TAG_PREFIX), f"release tag {tag!r} must start with {TAG_PREFIX!r}")
+    resolved_version = c3_version if c3_version is not None else tag.removeprefix(TAG_PREFIX)
+    _require(
+        tag == f"{TAG_PREFIX}{resolved_version}",
+        f"release tag {tag!r} does not match c3 version {resolved_version!r}",
+    )
+    try:
+        derived_prerelease = rc_helper.validate_c3_version(resolved_version)
+    except rc_helper.HelperError as error:
+        raise PromotionError(str(error)) from error
+    _require(
+        derived_prerelease is prerelease,
+        f"release channel prerelease={prerelease!r} conflicts with c3 version {resolved_version!r}",
+    )
     tag_commit = resolve_tag_commit(api, tag)
     if tag_commit is not None and tag_commit != source_sha:
         raise PromotionError(
@@ -920,6 +1000,16 @@ def github_release_state(
         _require(isinstance(release, dict), f"malformed release for {tag}")
         _require(release.get("name") == title,
                  f"existing release for {tag} is named {release.get('name')!r}, expected {title!r}")
+        _require(
+            release.get("draft") is False,
+            f"existing release for {tag} is a draft (draft={release.get('draft')!r}); "
+            "refusing to treat an unpublished draft as a release",
+        )
+        _require(
+            release.get("prerelease") is prerelease,
+            f"existing release for {tag} has prerelease={release.get('prerelease')!r}, "
+            f"expected {prerelease!r}",
+        )
         remote_assets = {
             asset.get("name"): asset
             for asset in release.get("assets", [])
@@ -949,10 +1039,39 @@ def github_release_state(
     else:
         for asset in assets:
             asset["disposition"] = "upload"
+    if prerelease:
+        make_latest = False
+    else:
+        latest_status, latest_release = api.get_json(f"/repos/{api.repository}/releases/latest")
+        if latest_status == 404:
+            make_latest = True
+        else:
+            _require(
+                latest_status == 200 and isinstance(latest_release, dict),
+                f"cannot query latest release for {api.repository}: HTTP {latest_status}",
+            )
+            latest_tag = latest_release.get("tag_name")
+            _require(
+                isinstance(latest_tag, str) and latest_tag.startswith(TAG_PREFIX),
+                f"latest release tag {latest_tag!r} does not start with {TAG_PREFIX!r}",
+            )
+            latest_version = latest_tag.removeprefix(TAG_PREFIX)
+            try:
+                rc_helper.validate_c3_version(latest_version)
+            except rc_helper.HelperError as error:
+                raise PromotionError(
+                    f"latest release tag {latest_tag!r} has invalid c3 version: {error}"
+                ) from error
+            make_latest = (
+                rc_helper.c3_version_sort_key(resolved_version)
+                >= rc_helper.c3_version_sort_key(latest_version)
+            )
     to_upload = [asset["name"] for asset in assets if asset["disposition"] == "upload"]
     return {
         "tag": tag,
         "title": title,
+        "prerelease": prerelease,
+        "make_latest": make_latest,
         "tag_exists": tag_commit is not None,
         "tag_commit": tag_commit,
         "release_exists": release_exists,
@@ -991,11 +1110,21 @@ def pypi_state(
     project: str, version: str, files: list[dict[str, Any]],
 ) -> dict[str, Any]:
     """Compare the staged dist files with the registry; only byte-equal files may be skipped."""
+    try:
+        prerelease = rc_helper.validate_c_two_version(version)
+    except rc_helper.HelperError as error:
+        raise PromotionError(str(error)) from error
     published = _pypi_version_listing(project, version)
     if published is None:
         for entry in files:
             entry["disposition"] = "upload"
-        return {"project": project, "version": version, "action": "upload", "files": files}
+        return {
+            "project": project,
+            "version": version,
+            "prerelease": prerelease,
+            "action": "upload",
+            "files": files,
+        }
     planned_names = {entry["name"] for entry in files}
     foreign = sorted(set(published) - planned_names)
     _require(not foreign,
@@ -1020,18 +1149,40 @@ def pypi_state(
             "refusing to clobber"
         )
     to_upload = [entry["name"] for entry in files if entry["disposition"] == "upload"]
-    return {"project": project, "version": version,
-            "action": "upload" if to_upload else "none", "files": files}
+    return {
+        "project": project,
+        "version": version,
+        "prerelease": prerelease,
+        "action": "upload" if to_upload else "none",
+        "files": files,
+    }
 
 
 def write_release_body(path: Path, plan: dict[str, Any], manifest_sha: str) -> None:
     versions = plan["versions"]
     candidate = plan["candidate_run"]
+    release = plan["github_release"]
+    prerelease = bool(release.get("prerelease"))
     lines = [
-        f"# {plan['github_release']['title']}",
+        f"# {release['title']}",
         "",
+    ]
+    if prerelease:
+        lines += [
+            "> **Pre-release**: this release is published to the pre-release channel and does not update `latest`.",
+            "",
+            "Install this pre-release explicitly:",
+            "",
+            "```bash",
+            f"curl -fsSL https://github.com/world-in-progress/c-two/releases/download/{release['tag']}/c3-installer.sh | sh -s -- --version {versions['c3_version']}",
+            f'uv add "c-two=={versions["c_two_version"]}"',
+            "```",
+            "",
+        ]
+    lines += [
         "Promoted from the exact tested release-candidate bytes; nothing was rebuilt for this release.",
         "",
+        f"- Channel: `{'pre-release' if prerelease else 'stable'}`",
         f"- c3 version: `{versions['c3_version']}` (Python package `c-two=={versions['c_two_version']}`)",
         f"- Source commit: `{plan['source_sha']}` (Release Candidate dispatch on canonical `main`)",
         f"- Native FastDB Core: `{FASTDB_CORE_VERSION}`, statically linked "
@@ -1070,9 +1221,14 @@ def write_promotion_summary(path: Path, plan: dict[str, Any]) -> None:
     group = plan["github_release"] if github_release else plan["pypi"]
     entries = group["assets"] if github_release else group["files"]
     evidence = plan["source_validation"]
+    channel = "pre-release" if group.get("prerelease") else "stable"
     with path.open("a", encoding="utf-8") as summary:
         summary.write(f"## Publication plan\n\nCandidate: {plan['candidate_run']['url']}\n\n")
         summary.write(f"Source: `{plan['source_sha']}`\n\nVersions: `{plan['versions']}`\n\n")
+        summary.write(f"Channels: `{plan['channels']}`\n\n")
+        summary.write(f"Channel: **{channel}**\n\n")
+        if github_release:
+            summary.write(f"Make latest: `{group['make_latest']}`\n\n")
         summary.write(f"Source Validation: {evidence['run_url']} ({evidence['event']})\n\n")
         summary.write(f"Tested commit: `{evidence['tested_sha']}`; tree: `{evidence['tree_sha']}`\n\n")
         summary.write(f"Action: **{group['action']}**\n\n")
@@ -1146,6 +1302,12 @@ def command_prepare(options: argparse.Namespace) -> int:
 
     source_validation = find_source_evidence(api, source_sha)
 
+    try:
+        c_two_prerelease = rc_helper.validate_c_two_version(versions["c_two_version"])
+        c3_prerelease = rc_helper.validate_c3_version(versions["c3_version"])
+    except rc_helper.HelperError as error:
+        raise PromotionError(str(error)) from error
+
     staging = download_dir / "staging"
     plan: dict[str, Any] = {
         "schema": PLAN_SCHEMA,
@@ -1153,6 +1315,10 @@ def command_prepare(options: argparse.Namespace) -> int:
         "repository": repository,
         "source_sha": source_sha,
         "versions": versions,
+        "channels": {
+            "c_two_prerelease": c_two_prerelease,
+            "c3_prerelease": c3_prerelease,
+        },
         "candidate_run": {"id": candidate.get("id"), "url": candidate.get("html_url")},
         "source_validation": source_validation,
         "manifest_sha256": manifest_sha,
@@ -1161,7 +1327,15 @@ def command_prepare(options: argparse.Namespace) -> int:
         tag = f"{TAG_PREFIX}{versions['c3_version']}"
         title = f"c3 {versions['c3_version']}"
         assets = stage_github_release_assets(extraction, manifest, staging, download_dir)
-        plan["github_release"] = github_release_state(api, tag, title, source_sha, assets)
+        plan["github_release"] = github_release_state(
+            api,
+            tag,
+            title,
+            source_sha,
+            assets,
+            prerelease=c3_prerelease,
+            c3_version=versions["c3_version"],
+        )
     else:
         files = stage_pypi_files(extraction, manifest, staging / "dist", download_dir)
         plan["pypi"] = pypi_state(options.pypi_project, versions["c_two_version"], files)
