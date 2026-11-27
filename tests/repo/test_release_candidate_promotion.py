@@ -106,9 +106,9 @@ def _cli_name(target: str) -> str:
     return f"c3-{target}{'.exe' if target in WINDOWS_TARGETS else ''}"
 
 
-def _wheel_name(target: str, python: str) -> str:
+def _wheel_name(target: str, python: str, version: str = C_TWO_VERSION) -> str:
     interpreter, abi = promote.PYTHON_ABI_PAIRS[python]
-    return f"c_two-{C_TWO_VERSION}-{interpreter}-{abi}-{PLATFORM_TAGS[target]}.whl"
+    return f"c_two-{version}-{interpreter}-{abi}-{PLATFORM_TAGS[target]}.whl"
 
 
 def _fastdb_wheel_name(target: str, python: str) -> str:
@@ -124,7 +124,11 @@ def _wheel_entry(name: str, data: bytes, distribution: str, version: str) -> dic
 
 
 def _smoke_body(
-    *, artifacts: list[dict[str, Any]], administrator: bool | None = None,
+    *,
+    artifacts: list[dict[str, Any]],
+    administrator: bool | None = None,
+    c_two_version: str = C_TWO_VERSION,
+    c3_version: str = C3_VERSION,
 ) -> dict[str, Any]:
     """A realistic installed-wheel-smoke receipt body (mirrors the runner output)."""
     installed = {
@@ -139,7 +143,7 @@ def _smoke_body(
         "prefix": "/tmp/venv",
         "pid": 111,
         "installed_wheels": installed,
-        "versions": {"c-two": C_TWO_VERSION, "fastdb4py": FASTDB_VERSION, "numpy": "2.5.3"},
+        "versions": {"c-two": c_two_version, "fastdb4py": FASTDB_VERSION, "numpy": "2.5.3"},
         "status": "passed",
         "transport": "direct",
         "observed_mode": "ipc",
@@ -166,11 +170,11 @@ def _smoke_body(
         "native_architecture": {"python_platform": windows_platform,
                                 "pe_machines": {item["name"]: machine for item in artifacts}},
         "installed_packages": [
-            {"name": "c-two", "version": C_TWO_VERSION},
+            {"name": "c-two", "version": c_two_version},
             {"name": "fastdb4py", "version": FASTDB_VERSION},
             {"name": "numpy", "version": "2.5.3"},
         ],
-        "cli_version": f"c3 {C3_VERSION}",
+        "cli_version": f"c3 {c3_version}",
         "host": {"paths": {}, "prefix": "/tmp/venv", "pid": 110, "status": "ready"},
         "borrowed_inputs_invalidated": 4,
         "logs": {"host.log": "", "relay.log": ""},
@@ -180,7 +184,9 @@ def _smoke_body(
 class CandidateBuilder:
     """Builds a structurally exact synthetic candidate plus its manifest."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, c_two_version: str = C_TWO_VERSION, c3_version: str = C3_VERSION) -> None:
+        self.c_two_version = c_two_version
+        self.c3_version = c3_version
         self.members: dict[str, bytes] = {}
         self.cli: list[dict[str, Any]] = []
         self.wheels: list[dict[str, Any]] = []
@@ -217,12 +223,12 @@ class CandidateBuilder:
             self.cli_by_name[entry["name"]] = entry
         for target in CLI_TARGETS:
             for python in PYTHONS_BY_TARGET[target]:
-                name = _wheel_name(target, python)
+                name = _wheel_name(target, python, self.c_two_version)
                 data = f"wheel-bytes-{target}-{python}".encode()
                 self.wheel_data[name] = data
                 self.wheels.append(self._put(name, data))
                 self.wheel_by_row[f"{target}/{python}"] = name
-        self.sdist.append(self._put(f"c_two-{C_TWO_VERSION}.tar.gz", b"sdist-bytes"))
+        self.sdist.append(self._put(f"c_two-{self.c_two_version}.tar.gz", b"sdist-bytes"))
 
         for name, data in (
             ("fastdb-LICENSE", b"fastdb upstream license\n"),
@@ -269,8 +275,8 @@ class CandidateBuilder:
             "event": "workflow_dispatch",
             "ref": "refs/heads/main",
             "pull_request_head_sha": None,
-            "c_two_version": C_TWO_VERSION,
-            "c3_version": C3_VERSION,
+            "c_two_version": self.c_two_version,
+            "c3_version": self.c3_version,
             "fastdb_version": FASTDB_VERSION,
             "fastdb_source_rev": FASTDB_SOURCE_REV,
         })
@@ -333,11 +339,15 @@ class CandidateBuilder:
                     }
                     decision = {"mode": "wheel", "filename": wheel_name, "sha256": wheel_sha}
                 interpreter, abi = promote.PYTHON_ABI_PAIRS[python]
-                receipt = _smoke_body(artifacts=[
-                    fastdb_artifact,
-                    _wheel_entry(ctwo_name, ctwo_data, "c-two", C_TWO_VERSION),
-                    {"name": cli["name"], "sha256": cli["sha256"], "bytes": cli["bytes"]},
-                ])
+                receipt = _smoke_body(
+                    artifacts=[
+                        fastdb_artifact,
+                        _wheel_entry(ctwo_name, ctwo_data, "c-two", self.c_two_version),
+                        {"name": cli["name"], "sha256": cli["sha256"], "bytes": cli["bytes"]},
+                    ],
+                    c_two_version=self.c_two_version,
+                    c3_version=self.c3_version,
+                )
                 receipt["row"] = {"target": target, "python": python,
                                   "fastdb_mode": decision["mode"]}
                 receipt["wheel_abi"] = {"interpreter": interpreter, "abi": abi}
@@ -353,11 +363,15 @@ class CandidateBuilder:
             fastdb_artifact = {"name": retained["name"], "sha256": retained["sha256"],
                                "bytes": retained["bytes"], "distribution": "fastdb4py",
                                "version": FASTDB_VERSION}
-            self._record_receipt(f"smoke-{target}.json", _smoke_body(artifacts=[
-                fastdb_artifact,
-                _wheel_entry(ctwo_name, self.wheel_data[ctwo_name], "c-two", C_TWO_VERSION),
-                {"name": cli["name"], "sha256": cli["sha256"], "bytes": cli["bytes"]},
-            ]))
+            self._record_receipt(f"smoke-{target}.json", _smoke_body(
+                artifacts=[
+                    fastdb_artifact,
+                    _wheel_entry(ctwo_name, self.wheel_data[ctwo_name], "c-two", self.c_two_version),
+                    {"name": cli["name"], "sha256": cli["sha256"], "bytes": cli["bytes"]},
+                ],
+                c_two_version=self.c_two_version,
+                c3_version=self.c3_version,
+            ))
 
         # Windows standard-user lifecycle/cleanup, ordinary + wrapper.
         for target in WINDOWS_TARGETS:
@@ -370,10 +384,13 @@ class CandidateBuilder:
                     {"name": retained["name"], "sha256": retained["sha256"],
                      "bytes": retained["bytes"], "distribution": "fastdb4py",
                      "version": FASTDB_VERSION},
-                    _wheel_entry(windows_ctwo, self.wheel_data[windows_ctwo], "c-two", C_TWO_VERSION),
+                    _wheel_entry(windows_ctwo, self.wheel_data[windows_ctwo], "c-two", self.c_two_version),
                     {"name": windows_cli["name"], "sha256": windows_cli["sha256"],
                      "bytes": windows_cli["bytes"]},
-                ])
+                ],
+                c_two_version=self.c_two_version,
+                c3_version=self.c3_version,
+            )
             self._record_receipt(f"standard-user-{target}.json", standard)
             self._record_receipt(f"standard-user-{target}.json.wrapper.json", {
                 "schema": "c-two.standard-user-wrapper.v1",
@@ -388,28 +405,34 @@ class CandidateBuilder:
             "schema": "c-two.release-candidate.sdist-inspection.v1",
             "status": "passed",
             "source_commit_sha": SOURCE_SHA,
-            "archive": f"c_two-{C_TWO_VERSION}.tar.gz",
-            "project": {"name": "c-two", "version": C_TWO_VERSION},
+            "archive": f"c_two-{self.c_two_version}.tar.gz",
+            "project": {"name": "c-two", "version": self.c_two_version},
         })
         linux_retained = self.retained_fastdb["x86_64-unknown-linux-gnu"]
+        isolated_wheel_name = f"c_two-{self.c_two_version}-cp312-cp312-manylinux_2_39_x86_64.whl"
         self._record_receipt("sdist-proof.json", {
             "schema": "c-two.release-candidate.sdist-proof.v1",
             "status": "executed",
             "source_commit_sha": SOURCE_SHA,
             "sdist": dict(self.sdist[0]),
-            "isolated_wheel": {"name": "c_two-0.6.0-cp312-cp312-manylinux_2_39_x86_64.whl",
+            "isolated_wheel": {"name": isolated_wheel_name,
                                "sha256": _sha(b"isolated-wheel")},
             "link_mode": "system",
             "sdk": {"version": FASTDB_CORE_VERSION, "source_sha": FASTDB_SOURCE_REV},
             "bundled_fastdb_libs": ["libfastdb.so"],
             "elf_dynamic": {"runpath": "$ORIGIN/../c_two.libs", "needed": ["libfastdb.so"]},
             "standalone_import": "passed",
-            "lifecycle": _smoke_body(artifacts=[
-                {"name": "c_two-0.6.0-cp312-cp312-manylinux_2_39_x86_64.whl",
-                 "sha256": _sha(b"isolated-wheel"), "distribution": "c-two", "version": C_TWO_VERSION},
-                {**linux_retained, "distribution": "fastdb4py", "version": FASTDB_VERSION},
-                self.cli_by_name["c3-x86_64-unknown-linux-gnu"],
-            ]),
+            "lifecycle": _smoke_body(
+                artifacts=[
+                    {"name": isolated_wheel_name,
+                     "sha256": _sha(b"isolated-wheel"), "distribution": "c-two",
+                     "version": self.c_two_version},
+                    {**linux_retained, "distribution": "fastdb4py", "version": FASTDB_VERSION},
+                    self.cli_by_name["c3-x86_64-unknown-linux-gnu"],
+                ],
+                c_two_version=self.c_two_version,
+                c3_version=self.c3_version,
+            ),
             "checks": ["build from extracted contents", "standalone import"],
             "fastdb": {"mode": "wheel", "filename": linux_retained["name"],
                        "sha256": linux_retained["sha256"]},
@@ -433,8 +456,8 @@ class CandidateBuilder:
             "event": "workflow_dispatch",
             "ref": "refs/heads/main",
             "meta": {
-                "c_two_version": C_TWO_VERSION,
-                "c3_version": C3_VERSION,
+                "c_two_version": self.c_two_version,
+                "c3_version": self.c3_version,
                 "fastdb_version": FASTDB_VERSION,
                 "fastdb_source_rev": FASTDB_SOURCE_REV,
                 "fastdb_sdist_sha256": _sha(self.fastdb_sdist_data),
@@ -538,6 +561,9 @@ class FakeApi(promote.GitHubApi):
         if path.startswith(f"{repo}/git/tags/"):
             annotated = world.annotated_tags.get(path.rsplit("/", 1)[1])
             return (200, dict(annotated)) if annotated else (404, None)
+        if path == f"{repo}/releases/latest":
+            latest = world.latest_release
+            return (200, json.loads(json.dumps(latest))) if latest else (404, None)
         if path.startswith(f"{repo}/releases/tags/"):
             release = world.releases.get(path.rsplit("/", 1)[1])
             return (200, json.loads(json.dumps(release))) if release else (404, None)
@@ -585,6 +611,7 @@ class World:
         self.tag_refs: dict[str, dict[str, Any]] = {}
         self.annotated_tags: dict[str, dict[str, Any]] = {}
         self.releases: dict[str, dict[str, Any]] = {}
+        self.latest_release: dict[str, Any] | None = None
         self.release_asset_bytes: dict[int, bytes] = {}
         self.pypi: dict[str, Any] | None = None
         self._add_candidate_artifacts()
@@ -1495,7 +1522,7 @@ def test_release_idempotency_skips_only_identical_assets(tmp_path: Path, environ
     published.tag_refs["c3-v0.2.0"] = {
         "ref": "refs/tags/c3-v0.2.0", "object": {"sha": SOURCE_SHA, "type": "commit"}}
     published.releases["c3-v0.2.0"] = {
-        "tag_name": "c3-v0.2.0", "name": "c3 0.2.0", "assets": []}
+        "tag_name": "c3-v0.2.0", "name": "c3 0.2.0", "draft": False, "prerelease": False, "assets": []}
     for index, asset in enumerate(assets):
         published.releases["c3-v0.2.0"]["assets"].append(
             {"id": 5000 + index, "name": asset["name"]})
@@ -1520,7 +1547,7 @@ def test_release_partial_state_stages_only_missing_uploads(tmp_path: Path, envir
     partial.tag_refs["c3-v0.2.0"] = {
         "ref": "refs/tags/c3-v0.2.0", "object": {"sha": SOURCE_SHA, "type": "commit"}}
     partial.releases["c3-v0.2.0"] = {
-        "tag_name": "c3-v0.2.0", "name": "c3 0.2.0", "assets": []}
+        "tag_name": "c3-v0.2.0", "name": "c3 0.2.0", "draft": False, "prerelease": False, "assets": []}
     kept = assets[:5]
     for index, asset in enumerate(kept):
         partial.releases["c3-v0.2.0"]["assets"].append(
@@ -1549,7 +1576,7 @@ def test_release_conflicts_fail_closed(tmp_path: Path, environment) -> None:
     conflicting.tag_refs["c3-v0.2.0"] = {
         "ref": "refs/tags/c3-v0.2.0", "object": {"sha": SOURCE_SHA, "type": "commit"}}
     conflicting.releases["c3-v0.2.0"] = {
-        "tag_name": "c3-v0.2.0", "name": "c3 0.2.0",
+        "tag_name": "c3-v0.2.0", "name": "c3 0.2.0", "draft": False, "prerelease": False,
         "assets": [{"id": 6001, "name": first["name"]}],
     }
     conflicting.release_asset_bytes[6001] = first_bytes + b"different"
@@ -1568,7 +1595,7 @@ def test_release_conflicts_fail_closed(tmp_path: Path, environment) -> None:
     foreign.tag_refs["c3-v0.2.0"] = {
         "ref": "refs/tags/c3-v0.2.0", "object": {"sha": SOURCE_SHA, "type": "commit"}}
     foreign.releases["c3-v0.2.0"] = {
-        "tag_name": "c3-v0.2.0", "name": "c3 0.2.0",
+        "tag_name": "c3-v0.2.0", "name": "c3 0.2.0", "draft": False, "prerelease": False,
         "assets": [{"id": 7001, "name": "rogue-asset.bin"}],
     }
     foreign.release_asset_bytes[7001] = b"rogue"
@@ -1638,7 +1665,7 @@ def test_prepare_performs_the_full_read_only_remote_comparison(
     world.tag_refs["c3-v0.2.0"] = {
         "ref": "refs/tags/c3-v0.2.0", "object": {"sha": SOURCE_SHA, "type": "commit"}}
     world.releases["c3-v0.2.0"] = {
-        "tag_name": "c3-v0.2.0", "name": "c3 0.2.0", "assets": []}
+        "tag_name": "c3-v0.2.0", "name": "c3 0.2.0", "draft": False, "prerelease": False, "assets": []}
     api = environment(world)
     code, plan, _ = run_prepare(tmp_path)
     assert code == 0
@@ -1741,6 +1768,18 @@ _FAKE_GH = """#!/usr/bin/env python3
 import os, sys
 with open(os.environ["GH_LOG"], "a", encoding="utf-8", newline="\\n") as log:
     log.write("\\0".join(sys.argv[1:]) + "\\n")
+if len(sys.argv) >= 2 and sys.argv[1] == "api":
+    endpoint = sys.argv[-1]
+    if "/releases/latest" in endpoint:
+        latest = os.environ.get("GH_LATEST_JSON", "")
+        if latest:
+            sys.stdout.write(latest)
+            sys.exit(0)
+        sys.stderr.write("gh: Not Found (HTTP 404)\\n")
+        sys.exit(1)
+    if "/releases?" in endpoint or endpoint.endswith("/releases"):
+        sys.stdout.write(os.environ.get("GH_RELEASES_JSON", "[]"))
+        sys.exit(0)
 sys.exit(0)
 """
 
@@ -1789,8 +1828,19 @@ def test_cli_publish_harness_roundtrip(tmp_path: Path, environment) -> None:
     staging_root = tmp_path / "roundtrip-staging"
     _simulate_staging_roundtrip(tmp_path, staging_root)
 
-    def run_publish(*, release_exists: str, tag_exists: str) -> list[list[str]]:
-        workspace = tmp_path / f"publish-{release_exists}-{tag_exists}"
+    def run_publish(
+        *,
+        release_exists: str,
+        tag_exists: str,
+        prerelease: str = "false",
+        make_latest: str = "true",
+        gh_releases_json: str = "[]",
+        gh_latest_json: str = "",
+        expect_rc: int = 0,
+        label: str = "",
+    ) -> tuple[list[list[str]], str]:
+        suffix = f"-{label}" if label else ""
+        workspace = tmp_path / f"publish-{release_exists}-{tag_exists}-{prerelease}-{make_latest}{suffix}"
         workspace.mkdir()
         (workspace / "promotion-plan.json").write_text(plan.read_text())
         (workspace / "release-body.md").write_text("body")
@@ -1810,7 +1860,12 @@ def test_cli_publish_harness_roundtrip(tmp_path: Path, environment) -> None:
             "SOURCE_SHA": plan_data["source_sha"],
             "RELEASE_EXISTS": release_exists,
             "TAG_EXISTS": tag_exists,
+            "PRERELEASE": prerelease,
+            "MAKE_LATEST": make_latest,
+            "GH_RELEASES_JSON": gh_releases_json,
+            "GH_LATEST_JSON": gh_latest_json,
         })
+        stderr = ""
         for step in (create_step, upload_step):
             if step["if"] and release_exists != "false":
                 continue
@@ -1818,10 +1873,14 @@ def test_cli_publish_harness_roundtrip(tmp_path: Path, environment) -> None:
                 [posix_shell(), "-c", step["run"]], cwd=workspace, env=env,
                 capture_output=True, text=True, encoding="utf-8", timeout=30,
             )
+            stderr += result.stderr
+            if expect_rc != 0:
+                assert result.returncode == expect_rc, result.stderr
+                break
             assert result.returncode == 0, result.stderr
         if not log.exists():
-            return []
-        return [line.split("\0") for line in log.read_text().splitlines()]
+            return [], stderr
+        return [line.split("\0") for line in log.read_text().splitlines()], stderr
 
     def uploads(invocations: list[list[str]]) -> set[str]:
         return {arg for args in invocations
@@ -1829,15 +1888,64 @@ def test_cli_publish_harness_roundtrip(tmp_path: Path, environment) -> None:
                 for arg in args if arg.startswith("staging/")}
 
     # Missing release and tag: create targets the candidate source commit.
-    invocations = run_publish(release_exists="false", tag_exists="false")
+    invocations, _ = run_publish(release_exists="false", tag_exists="false")
     create_calls = [a for a in invocations if a[:3] == ["release", "create", "c3-v0.2.0"]]
     assert len(create_calls) == 1
     assert "--target" in create_calls[0] and plan_data["source_sha"] in create_calls[0]
     assert "--repo" in create_calls[0] and REPOSITORY in create_calls[0]
+    assert "--latest" in create_calls[0]
+    assert "--prerelease" not in create_calls[0]
     assert uploads(invocations) == {a["staged_path"] for a in assets}
 
+    # Pre-release channel always passes --prerelease --latest=false.
+    invocations, _ = run_publish(
+        release_exists="false", tag_exists="false", prerelease="true", make_latest="false",
+    )
+    create_calls = [a for a in invocations if a[:3] == ["release", "create", "c3-v0.2.0"]]
+    assert "--prerelease" in create_calls[0]
+    assert "--latest=false" in create_calls[0]
+    assert "--latest" not in create_calls[0]
+
+    # Backfilling an older stable release passes --latest=false without --prerelease.
+    invocations, _ = run_publish(
+        release_exists="false", tag_exists="false", prerelease="false", make_latest="false",
+    )
+    create_calls = [a for a in invocations if a[:3] == ["release", "create", "c3-v0.2.0"]]
+    assert "--latest=false" in create_calls[0]
+    assert "--prerelease" not in create_calls[0]
+    assert "--latest" not in create_calls[0]
+
+    # Re-running publish after a newer stable release published in between must
+    # re-check remote Latest live and NOT roll Latest back to 0.2.0.
+    invocations, _ = run_publish(
+        release_exists="false",
+        tag_exists="false",
+        prerelease="false",
+        make_latest="true",
+        gh_latest_json=json.dumps({"tag_name": "c3-v0.9.0", "draft": False, "prerelease": False}),
+        label="live-latest-advanced",
+    )
+    create_calls = [a for a in invocations if a[:3] == ["release", "create", "c3-v0.2.0"]]
+    assert len(create_calls) == 1
+    assert "--latest=false" in create_calls[0]
+    assert "--latest" not in create_calls[0]
+
+    # A draft release carrying the same tag (hidden from GET /releases/tags/{tag})
+    # must fail closed before gh release create is invoked.
+    invocations, stderr = run_publish(
+        release_exists="false",
+        tag_exists="false",
+        gh_releases_json=json.dumps([
+            {"tag_name": "c3-v0.2.0", "draft": True, "prerelease": False},
+        ]),
+        expect_rc=1,
+        label="draft-collision",
+    )
+    assert not any(a[:2] == ["release", "create"] for a in invocations)
+    assert "draft=True" in stderr
+
     # Existing tag, missing release: create guards with --verify-tag.
-    invocations = run_publish(release_exists="false", tag_exists="true")
+    invocations, _ = run_publish(release_exists="false", tag_exists="true")
     create_calls = [a for a in invocations if a[:3] == ["release", "create", "c3-v0.2.0"]]
     assert "--verify-tag" in create_calls[0]
     assert "--target" not in create_calls[0]
@@ -1847,7 +1955,7 @@ def test_cli_publish_harness_roundtrip(tmp_path: Path, environment) -> None:
     for asset in assets[:5]:
         asset["disposition"] = "verified-existing"
     plan.write_text(json.dumps(plan_data, indent=2, sort_keys=True) + "\n")
-    invocations = run_publish(release_exists="true", tag_exists="true")
+    invocations, _ = run_publish(release_exists="true", tag_exists="true")
     assert not any(a[:3] == ["release", "create", "c3-v0.2.0"] for a in invocations)
     expected = {a["staged_path"] for a in assets if a["disposition"] == "upload"}
     assert uploads(invocations) == expected
@@ -1990,3 +2098,180 @@ def test_prepare_summary_exposes_plan_before_environment_approval(
     for entry in plan[group].get("assets", plan[group].get("files", [])):
         assert entry["name"] in text and entry["sha256"] in text and entry["disposition"] in text
     assert f"action={plan[group]['action']}\n" in outputs.read_text()
+
+
+# ── Pre-release (RC) promotion, channel checks, and receipt version bindings ─
+
+
+def _prerelease_world(
+    c_two_version: str = "0.13.0rc1", c3_version: str = "0.9.0-rc.1",
+) -> World:
+    world = World(candidate=CandidateBuilder(
+        c_two_version=c_two_version, c3_version=c3_version,
+    ))
+    world.set_source_runs(_run(201, "Source Validation"))
+    return world
+
+
+def test_prerelease_candidate_promotes_to_prerelease_channels(
+    tmp_path: Path, environment,
+) -> None:
+    world = _prerelease_world()
+    world.latest_release = {"tag_name": "c3-v0.8.0", "draft": False, "prerelease": False}
+    environment(world)
+    code, plan_path, body_path = run_prepare(tmp_path, target="github-release")
+    assert code == 0
+    plan = json.loads(plan_path.read_text())
+    assert plan["channels"] == {"c_two_prerelease": True, "c3_prerelease": True}
+    release = plan["github_release"]
+    assert release["tag"] == "c3-v0.9.0-rc.1"
+    assert release["title"] == "c3 0.9.0-rc.1"
+    assert release["prerelease"] is True
+    assert release["make_latest"] is False
+    assert release["action"] == "upload"
+    body = body_path.read_text(encoding="utf-8")
+    assert "Pre-release" in body
+    assert "--version 0.9.0-rc.1" in body
+    assert 'c-two==0.13.0rc1' in body
+
+    pypi_dir = tmp_path / "pypi"
+    pypi_dir.mkdir()
+    code, pypi_plan_path, _ = run_prepare(pypi_dir, target="pypi")
+    assert code == 0
+    pypi_plan = json.loads(pypi_plan_path.read_text())
+    assert pypi_plan["channels"] == {"c_two_prerelease": True, "c3_prerelease": True}
+    assert pypi_plan["pypi"]["version"] == "0.13.0rc1"
+    assert pypi_plan["pypi"]["prerelease"] is True
+    assert len(pypi_plan["pypi"]["files"]) == 36
+    assert all(entry["name"].startswith("c_two-0.13.0rc1") for entry in pypi_plan["pypi"]["files"])
+
+
+def test_stable_backfill_does_not_hijack_latest_while_newer_stable_sets_latest(
+    tmp_path: Path, environment,
+) -> None:
+    older = _default_world()
+    older.latest_release = {"tag_name": "c3-v0.9.0", "draft": False, "prerelease": False}
+    environment(older)
+    code, plan_path, _ = run_prepare(tmp_path / "older", target="github-release")
+    assert code == 0
+    older_plan = json.loads(plan_path.read_text())
+    assert older_plan["github_release"]["prerelease"] is False
+    assert older_plan["github_release"]["make_latest"] is False
+
+    newer = _default_world()
+    newer.latest_release = {"tag_name": "c3-v0.1.9", "draft": False, "prerelease": False}
+    environment(newer)
+    code, plan_path, _ = run_prepare(tmp_path / "newer", target="github-release")
+    assert code == 0
+    newer_plan = json.loads(plan_path.read_text())
+    assert newer_plan["github_release"]["prerelease"] is False
+    assert newer_plan["github_release"]["make_latest"] is True
+
+
+@pytest.mark.parametrize("bad_fields,error_fragment", [
+    ({"draft": True, "prerelease": False}, "draft"),
+    ({"draft": False, "prerelease": True}, "prerelease"),
+])
+def test_existing_github_release_draft_or_channel_mismatch_fails_closed(
+    tmp_path: Path, environment, capsys, bad_fields, error_fragment,
+) -> None:
+    environment(_default_world())
+    code, plan_path, _ = run_prepare(tmp_path / "seed")
+    assert code == 0
+    assets = json.loads(plan_path.read_text())["github_release"]["assets"]
+
+    mismatched = _default_world()
+    mismatched.tag_refs["c3-v0.2.0"] = {
+        "ref": "refs/tags/c3-v0.2.0", "object": {"sha": SOURCE_SHA, "type": "commit"}}
+    mismatched.releases["c3-v0.2.0"] = {
+        "tag_name": "c3-v0.2.0", "name": "c3 0.2.0", "assets": [], **bad_fields}
+    for index, asset in enumerate(assets):
+        mismatched.releases["c3-v0.2.0"]["assets"].append(
+            {"id": 5200 + index, "name": asset["name"]})
+        mismatched.release_asset_bytes[5200 + index] = (
+            tmp_path / "seed" / "candidate-download" / asset["staged_path"]).read_bytes()
+    environment(mismatched)
+    code, plan_out, _ = run_prepare(tmp_path / "retry")
+    assert code == 1
+    assert not plan_out.exists()
+    assert error_fragment in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("receipt_name,mutate", [
+    ("abi-x86_64-unknown-linux-gnu-3.12.json",
+     lambda p: p["artifacts"][1].update(version="0.5.9")),
+    ("abi-x86_64-unknown-linux-gnu-3.12.json",
+     lambda p: p.update(cli_version="c3 0.1.9")),
+    ("smoke-x86_64-unknown-linux-gnu.json",
+     lambda p: p["checks"][0]["versions"].update({"c-two": "0.5.9"})),
+    ("sdist-inspect.json",
+     lambda p: p["project"].update(version="0.5.9")),
+    ("sdist-proof.json",
+     lambda p: p["lifecycle"].update(cli_version="c3 0.1.9")),
+    ("sdist-proof.json",
+     lambda p: p["lifecycle"]["artifacts"][0].update(version="0.5.9")),
+])
+def test_receipt_version_mismatches_against_rc_context_fail_closed(
+    tmp_path: Path, environment, receipt_name: str, mutate,
+) -> None:
+    environment(_mutated_receipt_world(receipt_name, mutate))
+    code, plan, _ = run_prepare(tmp_path)
+    assert code == 1
+    assert not plan.exists()
+
+
+@pytest.mark.parametrize("bad_c_two,bad_c3", [
+    ("0.13.0-rc.1", "0.9.0-rc.1"),
+    ("0.13.0rc1", "0.09.0-rc.01"),
+])
+def test_invalid_candidate_versions_fail_closed_at_promotion(
+    tmp_path: Path, environment, bad_c_two: str, bad_c3: str,
+) -> None:
+    world = _prerelease_world(c_two_version=bad_c_two, c3_version=bad_c3)
+    environment(world)
+    code, plan, _ = run_prepare(tmp_path)
+    assert code == 1
+    assert not plan.exists()
+
+
+def test_prerelease_latest_tag_fails_closed_and_existing_release_skips_latest_query(
+    tmp_path: Path, environment, capsys,
+) -> None:
+    bad_latest = _default_world()
+    bad_latest.latest_release = {"tag_name": "c3-v0.8.0-rc.1", "draft": False, "prerelease": False}
+    environment(bad_latest)
+    code, plan_path, _ = run_prepare(tmp_path / "bad-latest")
+    assert code == 1
+    assert not plan_path.exists()
+    assert "pre-release version" in capsys.readouterr().err
+
+    # Completing an already-existing stable release must not query /releases/latest
+    # and therefore is not blocked by an unrelated latest tag.
+    existing = _default_world()
+    existing.tag_refs["c3-v0.2.0"] = {
+        "ref": "refs/tags/c3-v0.2.0", "object": {"sha": SOURCE_SHA, "type": "commit"}}
+    existing.releases["c3-v0.2.0"] = {
+        "tag_name": "c3-v0.2.0", "name": "c3 0.2.0", "draft": False, "prerelease": False, "assets": []}
+    existing.latest_release = {"tag_name": "unrelated-legacy-tag", "draft": False, "prerelease": False}
+    api = environment(existing)
+    code, plan_path, _ = run_prepare(tmp_path / "existing")
+    assert code == 0
+    assert not any(path.endswith("/releases/latest") for path in api.paths)
+
+
+def test_sdist_proof_rejects_unnormalized_isolated_wheel_filename_spelling(
+    tmp_path: Path, environment, capsys,
+) -> None:
+    builder = CandidateBuilder(c_two_version="0.13.0rc1", c3_version="0.9.0-rc.1")
+    unnormalized = "c_two-0.13.0RC01-cp312-cp312-manylinux_2_39_x86_64.whl"
+    proof = json.loads(builder.members["sdist-proof.json"])
+    proof["isolated_wheel"]["name"] = unnormalized
+    proof["lifecycle"]["artifacts"][0]["name"] = unnormalized
+    builder._rewrite_json("sdist-proof.json", proof)
+    world = World(candidate=builder)
+    world.set_source_runs(_run(201, "Source Validation"))
+    environment(world)
+    code, plan_path, _ = run_prepare(tmp_path)
+    assert code == 1
+    assert not plan_path.exists()
+    assert "isolated_wheel" in capsys.readouterr().err

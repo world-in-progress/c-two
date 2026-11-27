@@ -412,7 +412,11 @@ def candidate_tree(tmp_path: Path) -> Path:
                 "row": {"target": target, "python": python, "fastdb_mode": decision["mode"]},
                 "wheel_abi": {"interpreter": tag, "abi": tag},
                 "fastdb": decision,
-                "checks": [{"status": "passed"}, {"status": "passed"}],
+                "cli_version": "c3 0.2.0",
+                "checks": [
+                    {"status": "passed", "versions": {"c-two": "0.6.0"}},
+                    {"status": "passed", "versions": {"c-two": "0.6.0"}},
+                ],
             }
             retain(f"abi-{target}-{python}.json",
                    json.dumps(receipt, indent=2, sort_keys=True).encode())
@@ -436,7 +440,8 @@ def candidate_tree(tmp_path: Path) -> Path:
          "source_commit_sha": SOURCE_SHA}).encode())
     retain("sdist-inspect.json", json.dumps(
         {"schema": "c-two.release-candidate.sdist-inspection.v1", "status": "passed",
-         "source_commit_sha": SOURCE_SHA}).encode())
+         "source_commit_sha": SOURCE_SHA,
+         "project": {"name": "c-two", "version": "0.6.0"}}).encode())
     retain("sdist-proof.json", json.dumps(
         {"schema": "c-two.release-candidate.sdist-proof.v1", "status": "executed",
          "source_commit_sha": SOURCE_SHA,
@@ -908,3 +913,155 @@ def test_candidate_context_starts_packaging_without_source_actions_authority():
     commands = '\n'.join(step.get('run', '') for step in context['steps'])
     assert 'promote_release_candidate.py' not in commands
     assert 'c-two.release-candidate.context.v2' in commands
+
+
+# ── version validation & pre-release channels ────────────────────────────────
+
+
+@pytest.mark.parametrize("version,expected_prerelease", [
+    ("0.13.0", False),
+    ("1.0.0", False),
+    ("0.13.0a1", True),
+    ("0.13.0b2", True),
+    ("0.13.0rc0", True),
+    ("0.13.0rc1", True),
+    ("0.13.0rc12", True),
+])
+def test_validate_c_two_version_accepts_canonical_stable_and_prerelease(
+    rc, version, expected_prerelease
+):
+    assert rc.validate_c_two_version(version) is expected_prerelease
+
+
+@pytest.mark.parametrize("bad_version", [
+    "",
+    "0.13.0-rc.1",
+    "0.13.0rc01",
+    "0.13.0.rc1",
+    "0.13.0.dev1",
+    "0.13.0.post1",
+    "0.13.0+local",
+    "1!0.13.0",
+    "0.13",
+    "0.13.0.0",
+    "０.13.0",
+    "0.13.0rc١",
+])
+def test_validate_c_two_version_rejects_unnormalized_or_out_of_subset_versions(rc, bad_version):
+    with pytest.raises(rc.HelperError):
+        rc.validate_c_two_version(bad_version)
+
+
+@pytest.mark.parametrize("version,expected_prerelease", [
+    ("0.9.0", False),
+    ("1.2.3", False),
+    ("0.9.0-alpha.0", True),
+    ("0.9.0-beta.2", True),
+    ("0.9.0-rc.1", True),
+    ("0.9.0-rc.12", True),
+])
+def test_validate_c3_version_accepts_strict_ascii_semver(rc, version, expected_prerelease):
+    assert rc.validate_c3_version(version) is expected_prerelease
+
+
+@pytest.mark.parametrize("bad_version", [
+    "",
+    "0.09.0",
+    "0.9.0-rc.01",
+    "00.9.0",
+    "0.9.0rc1",
+    "0.9.0-dev.1",
+    "0.9.0+build.1",
+    "0.9",
+    "0.9.0-rc.١",
+    "０.9.0",
+])
+def test_validate_c3_version_rejects_leading_zeros_non_ascii_and_invalid_suffixes(rc, bad_version):
+    with pytest.raises(rc.HelperError):
+        rc.validate_c3_version(bad_version)
+
+
+def test_c3_version_sort_key_orders_prereleases_before_stable(rc):
+    ordered = [
+        "0.8.0",
+        "0.9.0-alpha.1",
+        "0.9.0-beta.1",
+        "0.9.0-rc.1",
+        "0.9.0-rc.2",
+        "0.9.0-rc.10",
+        "0.9.0",
+        "0.9.1",
+    ]
+    assert sorted(reversed(ordered), key=rc.c3_version_sort_key) == ordered
+
+
+def test_read_repo_versions_uses_toml_tables_and_ignores_dependency_versions(rc, tmp_path):
+    (tmp_path / "sdk" / "python").mkdir(parents=True)
+    (tmp_path / "cli").mkdir(parents=True)
+    (tmp_path / "sdk" / "python" / "pyproject.toml").write_text(
+        '[project]\nname = "c-two"\nversion = "0.13.0rc1"\n',
+        encoding="utf-8",
+    )
+    (tmp_path / "cli" / "Cargo.toml").write_text(
+        '[dependencies]\nfoo = { version = "9.9.9" }\n\n'
+        '[package]\nname = "c3"\nversion = "0.9.0-rc.1"\n',
+        encoding="utf-8",
+    )
+    assert rc.read_repo_versions(tmp_path) == ("0.13.0rc1", "0.9.0-rc.1")
+
+
+def test_manifest_accepts_prerelease_versions_and_rejects_invalid_meta_versions(rc, tmp_path, capsys):
+    root = candidate_tree(tmp_path)
+    # Invalid c_two_version / c3_version in meta fails closed.
+    bad_args = [
+        "c_two_version=0.13.0-rc.1" if arg == "c_two_version=0.6.0" else arg
+        for arg in manifest_args(root, root / "rc-manifest.json")
+    ]
+    assert rc.main(bad_args) == 1
+    assert "not canonical PEP 440" in capsys.readouterr().err
+
+    bad_c3 = [
+        "c3_version=0.09.0-rc.01" if arg == "c3_version=0.2.0" else arg
+        for arg in manifest_args(root, root / "rc-manifest.json")
+    ]
+    assert rc.main(bad_c3) == 1
+    assert "strict ASCII SemVer 2.0" in capsys.readouterr().err
+
+    # Mismatched ABI receipt wheel metadata version fails closed.
+    rewrite_receipt(
+        root,
+        "abi-x86_64-unknown-linux-gnu-3.12.json",
+        lambda payload: payload["artifacts"][1].update(version="0.5.9"),
+    )
+    assert rc.main(manifest_args(root, root / "rc-manifest.json")) == 1
+    assert "c-two wheel version" in capsys.readouterr().err
+
+    # Mismatched ABI cli_version fails closed at candidate sealing.
+    root2 = candidate_tree(tmp_path / "cli-mismatch")
+    rewrite_receipt(
+        root2,
+        "abi-x86_64-unknown-linux-gnu-3.12.json",
+        lambda payload: payload.update(cli_version="c3 0.1.9"),
+    )
+    assert rc.main(manifest_args(root2, root2 / "rc-manifest.json")) == 1
+    assert "cli_version" in capsys.readouterr().err
+
+    # Mismatched installed check version fails closed at candidate sealing.
+    root3 = candidate_tree(tmp_path / "check-mismatch")
+    rewrite_receipt(
+        root3,
+        "abi-x86_64-unknown-linux-gnu-3.12.json",
+        lambda payload: payload["checks"][0]["versions"].update({"c-two": "0.5.9"}),
+    )
+    assert rc.main(manifest_args(root3, root3 / "rc-manifest.json")) == 1
+    assert "installed c-two version" in capsys.readouterr().err
+
+    # Missing sdist-inspect.json project metadata fails closed at candidate sealing.
+    root4 = candidate_tree(tmp_path / "inspect-missing")
+    rewrite_receipt(
+        root4,
+        "sdist-inspect.json",
+        lambda payload: payload.pop("project", None),
+    )
+    assert rc.main(manifest_args(root4, root4 / "rc-manifest.json")) == 1
+    assert "sdist-inspect.json project" in capsys.readouterr().err

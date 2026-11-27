@@ -154,20 +154,17 @@ jobs:
           FASTDB_SOURCE_REV: ${{ steps.fastdb.outputs.source_rev }}
         run: |
           python - <<'PY'
-          import json, os, pathlib, re, tomllib
-          pyproject = tomllib.loads(
-              pathlib.Path("sdk/python/pyproject.toml").read_text(encoding="utf-8"))
-          cli_version = re.search(
-              r'^version = "(.+)"$',
-              pathlib.Path("cli/Cargo.toml").read_text(encoding="utf-8"),
-              re.MULTILINE).group(1)
+          import json, os, pathlib, sys
+          sys.path.insert(0, ".github/scripts")
+          import release_candidate
+          c_two_version, cli_version = release_candidate.read_repo_versions(pathlib.Path("."))
           source_sha = os.environ["GITHUB_SHA"]
           context = {
               "schema": "c-two.release-candidate.context.v2",
               "source_commit_sha": source_sha,
               "event": os.environ.get("GITHUB_EVENT_NAME", ""),
               "ref": os.environ.get("GITHUB_REF", ""),
-              "c_two_version": pyproject["project"]["version"],
+              "c_two_version": c_two_version,
               "c3_version": cli_version,
               "fastdb_version": os.environ["FASTDB_VERSION"],
               "fastdb_source_rev": os.environ["FASTDB_SOURCE_REV"],

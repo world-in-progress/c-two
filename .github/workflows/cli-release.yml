@@ -42,6 +42,8 @@ jobs:
       source_sha: ${{ steps.prepare.outputs.source_sha }}
       release_exists: ${{ steps.prepare.outputs.release_exists }}
       tag_exists: ${{ steps.prepare.outputs.tag_exists }}
+      prerelease: ${{ steps.prepare.outputs.prerelease }}
+      make_latest: ${{ steps.prepare.outputs.make_latest }}
     steps:
       # The default checkout is the current main code: the promotion trusts
       # the reviewed validators on main, never the candidate's input SHA.
@@ -80,6 +82,8 @@ jobs:
               output.write(f"source_sha={plan['source_sha']}\n")
               output.write(f"release_exists={str(release['release_exists']).lower()}\n")
               output.write(f"tag_exists={str(release['tag_exists']).lower()}\n")
+              output.write(f"prerelease={str(release['prerelease']).lower()}\n")
+              output.write(f"make_latest={str(release['make_latest']).lower()}\n")
           PY
 
       # The upload's least-common ancestor is the staging directory itself, so
@@ -157,6 +161,8 @@ jobs:
           TITLE: ${{ needs.prepare.outputs.title }}
           SOURCE_SHA: ${{ needs.prepare.outputs.source_sha }}
           TAG_EXISTS: ${{ needs.prepare.outputs.tag_exists }}
+          PRERELEASE: ${{ needs.prepare.outputs.prerelease }}
+          MAKE_LATEST: ${{ needs.prepare.outputs.make_latest }}
         run: |
           set -euo pipefail
           extra=()
@@ -164,6 +170,82 @@ jobs:
             extra+=(--verify-tag)
           else
             extra+=(--target "$SOURCE_SHA")
+          fi
+          LIVE_LATEST="$(python - <<'PY'
+          import json, os, re, subprocess, sys
+
+          repo = os.environ["REPO"]
+          tag = os.environ["TAG"]
+          prerelease = os.environ["PRERELEASE"] == "true"
+          planned_latest = os.environ["MAKE_LATEST"] == "true"
+
+          # GET /releases/tags/{tag} excludes drafts; check the full releases list
+          # with publish write authority so a draft carrying TAG always fails closed.
+          listed = subprocess.run(
+              ["gh", "api", "--paginate", f"repos/{repo}/releases?per_page=100"],
+              capture_output=True, text=True, check=True,
+          )
+          raw = listed.stdout or ""
+          decoder = json.JSONDecoder()
+          pos = 0
+          releases = []
+          while pos < len(raw):
+              while pos < len(raw) and raw[pos].isspace():
+                  pos += 1
+              if pos >= len(raw):
+                  break
+              page, pos = decoder.raw_decode(raw, pos)
+              if isinstance(page, list):
+                  releases.extend(page)
+              else:
+                  releases.append(page)
+          for rel in releases:
+              if isinstance(rel, dict) and rel.get("tag_name") == tag:
+                  sys.exit(
+                      f"error: release for {tag} already exists remotely "
+                      f"(draft={rel.get('draft')!r}, prerelease={rel.get('prerelease')!r}); "
+                      "refusing to create duplicate"
+                  )
+
+          if prerelease:
+              print("false")
+              raise SystemExit(0)
+
+          # Re-verify current remote Latest right before creating a stable release
+          # so re-running an older publish job cannot roll back Latest.
+          latest_proc = subprocess.run(
+              ["gh", "api", f"repos/{repo}/releases/latest"],
+              capture_output=True, text=True,
+          )
+          if latest_proc.returncode != 0:
+              combined = (latest_proc.stdout or "") + (latest_proc.stderr or "")
+              if "404" in combined or "Not Found" in combined:
+                  print("true" if planned_latest else "false")
+                  raise SystemExit(0)
+              sys.exit(f"error: failed to query remote latest release: {combined.strip()}")
+
+          latest = json.loads(latest_proc.stdout)
+          latest_tag = latest.get("tag_name", "")
+          stable_re = re.compile(
+              r"^c3-v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$", re.ASCII
+          )
+          cur_match = stable_re.fullmatch(tag)
+          lat_match = stable_re.fullmatch(latest_tag)
+          if not cur_match or not lat_match:
+              sys.exit(
+                  f"error: cannot compare stable tag {tag!r} against remote latest {latest_tag!r}"
+              )
+          cur_key = tuple(int(g) for g in cur_match.groups())
+          lat_key = tuple(int(g) for g in lat_match.groups())
+          print("true" if (planned_latest and cur_key >= lat_key) else "false")
+          PY
+          )"
+          if [ "$PRERELEASE" = "true" ]; then
+            extra+=(--prerelease --latest=false)
+          elif [ "$LIVE_LATEST" = "true" ]; then
+            extra+=(--latest)
+          else
+            extra+=(--latest=false)
           fi
           gh release create "$TAG" --repo "$REPO" --title "$TITLE" \
             --notes-file release-body.md "${extra[@]}"
