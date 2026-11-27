@@ -57,11 +57,12 @@ C-Two 升级 `c3 relay` 边缘传输并引入跨 NAT 加密组网，在 0.x 阶�
 ### 4. `c3 bridge` 盲跳板与 `iroh 1.5` 双通道 Mesh 9
 
 - **`c3 bridge`（`iroh-relay 1.5.0` `server` feature）：**
-  - 默认 `--bind 0.0.0.0:8443`、可选 `--quic-bind 0.0.0.0:7842`（可 `--no-quic` 关闭）、`--tls-cert/--tls-key` 或持久化自动自签证书；
-  - 默认强制私有准入，复用 `iroh-relay` 原生 `Authorization: Bearer`（`ClientBuilder::auth_token` / `ClientRequest::auth_token()`）与可选 `--allow-peer <ENDPOINT_ID>` 白名单，在 `AccessControl::on_connect`（101 与身份握手后、入转发表前）拒绝未授权节点。
+  - 默认 0 参数即可启动：`--bind`（默认 `0.0.0.0:8443`）、`--quic-bind`（默认 `0.0.0.0:7842`，传 `off` 关闭 QAD UDP）、`--tls-cert/--tls-key` 或在 `--state-dir`（默认 `~/.c3-bridge`）持久化自动自签证书；
+  - 默认强制私有准入，复用 `iroh-relay` 原生 `Authorization: Bearer`（`RelayConfig::with_auth_token` / `ClientRequest::auth_token()`）与 `--token`（未指定时自动生成持久化，Unix `0600` / Windows TokenUser ACL），在 `AccessControl::on_connect`（101 与身份握手后、入转发表前）拒绝未授权节点；启动打印可直接复用的 `--bridge` 模板串（含自签 `?pin=<64hex>` 与非默认 `&quic=` 参数）和 token。
 - **`c3 relay` 跨 NAT 组网（Mesh 8 → Mesh 9，`PROTOCOL_VERSION = 9`）：**
-  - 持久化 Ed25519 `SecretKey`（所有者独享权限），构造 `Endpoint::builder(presets::Minimal)` + `RelayMode::Custom(private_bridge_map)`（携带显式 QAD 端口或禁用标记）。未显式传 `--relay-id` 时由持久化 `EndpointId` 确定性派生稳定 `relay_id`，避免重启残留旧持有者触发虚假 `719`。
-  - **集群成员认证与跳板凭据彻底分离：** 支持 `--allow-mesh-peer <ENDPOINT_ID>`（在 `EndpointHooks::after_handshake` 直接校验）与 `--cluster-secret <SECRET>`（在独立预认证 ALPN `b"c2/mesh-auth/9"` 的端到端 QUIC TLS 1.3 内完成绑定双方 `EndpointId` 与随机 nonce 的 HMAC 互证，通过后再放行业务 ALPN）。
+  - 仅新增 3 个跨机参数并复用现有 `--seeds` 与 `--state-dir`：`--bridge <URL>`（支持标准 HTTPS URL 及非机密查询参数 `?pin=<64hex>`、`&quic=<port|off>`，底层通过 `CaTlsConfig::custom_server_cert_verifier` 复用叶证书 DER SHA-256 验签）、`--bridge-token <SECRET>`（与 URL 与集群密钥彻底隔离）、`--cluster-secret <SECRET>`；`--seeds` 统一支持 `http://...`（本机回环集群）与 `iroh://<endpoint_id>`（跨 NAT 集群，必要时允许 `@<ip:port>` 直连提示）。
+  - 持久化 Ed25519 `SecretKey` 于 `--state-dir`（`mesh-key.ed25519`，所有者独享权限），构造 `Endpoint::builder(presets::Minimal)` + `RelayMode::Custom(private_bridge_map)`（无 `--bridge` 时走 `RelayMode::Disabled`）。未显式传 `--relay-id` 时由持久化 `EndpointId` 确定性派生稳定 `relay_id`，避免重启残留旧持有者触发虚假 `719`。
+  - **集群成员互证与跳板凭据彻底分离：** 启用 `iroh` 集群时强制配置 `--cluster-secret`（fail-closed）；在独立预认证 ALPN `b"c2/mesh-auth/9"` 的端到端 QUIC TLS 1.3 内完成绑定双方 `EndpointId` 与随机 nonce 的 HMAC-SHA256 互证，通过后经 `EndpointHooks::after_handshake` 放行业务 ALPN（`c3 bridge` 全程不可见）。
   - **双 ALPN 隔离控制与数据通道：** 同端点对每个对端维护 `b"c2/mesh-ctrl/9"`（`/_peer/*`、`/_probe`、`DELETE`、`QueryOutcome`、`TopicConfirm`、`/health`）与 `b"c2/mesh-data/9"`（`/calls/{call,keyed,recover}`、`TopicSubscribe`），各自拥有独立 QUIC 连接级流控与并发流配额，消除大流饿死控制面。
   - **完整 `PeerAddress` 与恢复探测收紧：** 引入边界校验的 `PeerAddress`（`http_url: Option<String>` + `iroh: Option<IrohPeerAddr>`，至少其一），贯通 `PeerInfo`、`PeerSnapshot`、`RouteEntry`、`RelayJoin`、`RouteAnnounce`、`FullSyncRoute`、`DigestDiffEntry::Active`、`route_entry_digest_hash`（仅哈希各节点一致认同的公告字段）、心跳、离开、force-leave 与 CLI 展示；死亡探测须核对目标身份与显式 Mesh 9 接受的 join 响应（不把泛化 `/health` 或 `200 ignored` 当恢复，且恢复不合并 bootstrap 快照）。
 
