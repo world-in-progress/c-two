@@ -285,7 +285,7 @@ async fn dead_peer_probe_loop(state: Arc<RelayState>, cancel: CancellationToken)
                     state.relay_id(),
                     PeerMessage::RelayJoin {
                         relay_id: state.relay_id().to_string(),
-                        url: state.config().effective_advertise_url(),
+                        url: state.config().mesh_url(),
                     },
                 );
                 let join_url = peer_endpoint_url(&url, "/_peer/join");
@@ -345,7 +345,7 @@ async fn seed_retry_loop(state: Arc<RelayState>, cancel: CancellationToken) {
                     state.relay_id(),
                     PeerMessage::RelayJoin {
                         relay_id: state.relay_id().to_string(),
-                        url: state.config().effective_advertise_url(),
+                        url: state.config().mesh_url(),
                     },
                 );
                 if let Ok(resp) = client.post(&join_url).json(&envelope).send().await
@@ -360,7 +360,7 @@ async fn seed_retry_loop(state: Arc<RelayState>, cancel: CancellationToken) {
                         state.relay_id(),
                         PeerMessage::RelayJoin {
                             relay_id: state.relay_id().to_string(),
-                            url: state.config().effective_advertise_url(),
+                            url: state.config().mesh_url(),
                         },
                     );
                     state.disseminator().broadcast(announce, &peers);

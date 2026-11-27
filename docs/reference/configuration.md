@@ -22,9 +22,15 @@ The capacity variables apply independently to each active role domain. `M` is th
 | `C2_MAX_EXECUTION_WORKERS` | Host parallelism clamped to 4–64, with fallback parallelism 4 | Host's `max_execution_workers`. An explicit value must be at least 1 and may exceed 64. |
 | `C2_OUTCOME_MAX_ENTRIES` | 4096 | Host's `outcome_max_entries`, at least 1. Caps settled call outcomes across all registrations. |
 | `C2_OUTCOME_MAX_RETAINED_BYTES` | `min(64 MiB, server.M / 4)` | Host's `outcome_max_retained_bytes`, from 0 through `server.M`. Zero selects metadata-only retention. |
-| `C2_RELAY_BIND` | `0.0.0.0:8080` | `c3 relay --bind` / `-b` |
+| `C2_RELAY_BIND` | `127.0.0.1:8080` | `c3 relay --bind` / `-b` |
+| `C2_RELAY_EDGE_BIND` | Unset | `c3 relay --edge-bind` |
+| `C2_RELAY_TLS_CERT`, `C2_RELAY_TLS_KEY` | Unset | `--tls-cert`, `--tls-key` |
+| `C2_RELAY_TLS_AUTO` | `false` | `--tls-auto` |
+| `C2_RELAY_TLS_SAN` | Empty | `--tls-san` |
+| `C2_RELAY_STATE_DIR` | `~/.c3-relay` | `--state-dir` |
+| `C2_RELAY_INSECURE_PLAINTEXT` | `false` | `--insecure-plaintext` |
 | `C2_RELAY_ID` | Generated | `c3 relay --relay-id` |
-| `C2_RELAY_ADVERTISE_URL` | Derived from the actual bind address | `c3 relay --advertise-url` |
+| `C2_RELAY_ADVERTISE_URL` | Derived from the active listener and transport | `c3 relay --advertise-url` |
 | `C2_RELAY_SEEDS` | Empty | `c3 relay --seeds` / `-s`, comma-separated relay URLs |
 | `C2_RELAY_USE_PROXY` | `false` | Opt in to process HTTP proxy settings for relay traffic. Rust `HostOptions::with_relay_use_proxy` can override it. |
 
@@ -51,6 +57,8 @@ Set the native startup wait with `cc.set_server(startup_timeout=...)` in seconds
 ## Relay and c3
 
 A standalone relay resolves one `relay` domain at startup. Its memory, file spill and call slots cover business forwarding and its upstream IPC storage across physical connections and reconnects. `c3 relay --dry-run` validates and prints the effective `M`, `F` and `N` without listening. `--upstream` (`-u`) accepts a route and its upstream identity on the CLI only. [c3 relay](../../cli/README.md#relay)
+
+The control listener accepts loopback addresses only. The optional edge listener serves discovery and RPC. The edge defaults to persistent self-signed TLS on non-loopback addresses and plaintext on loopback. The explicit certificate and key must be supplied together. Explicit credentials, `--tls-auto` and `--insecure-plaintext` are mutually exclusive. The SAN and state directory settings apply to automatic TLS.
 
 ## Fixed transport constants
 

@@ -23,6 +23,13 @@ const EXECUTION_WORKERS: &str = "C2_MAX_EXECUTION_WORKERS";
 const OUTCOME_MAX_ENTRIES: &str = "C2_OUTCOME_MAX_ENTRIES";
 const OUTCOME_MAX_RETAINED_BYTES: &str = "C2_OUTCOME_MAX_RETAINED_BYTES";
 const RELAY_BIND: &str = "C2_RELAY_BIND";
+const RELAY_EDGE_BIND: &str = "C2_RELAY_EDGE_BIND";
+const RELAY_TLS_CERT: &str = "C2_RELAY_TLS_CERT";
+const RELAY_TLS_KEY: &str = "C2_RELAY_TLS_KEY";
+const RELAY_TLS_AUTO: &str = "C2_RELAY_TLS_AUTO";
+const RELAY_TLS_SAN: &str = "C2_RELAY_TLS_SAN";
+const RELAY_STATE_DIR: &str = "C2_RELAY_STATE_DIR";
+const RELAY_INSECURE_PLAINTEXT: &str = "C2_RELAY_INSECURE_PLAINTEXT";
 const RELAY_ID: &str = "C2_RELAY_ID";
 const RELAY_ADVERTISE_URL: &str = "C2_RELAY_ADVERTISE_URL";
 const RELAY_SEEDS: &str = "C2_RELAY_SEEDS";
@@ -31,7 +38,7 @@ const RELAY_USE_PROXY: &str = "C2_RELAY_USE_PROXY";
 const RELAY_CA_CERT: &str = "C2_RELAY_CA_CERT";
 const RELAY_CERT_SHA256: &str = "C2_RELAY_CERT_SHA256";
 
-const ENV_KEYS: [&str; 17] = [
+const ENV_KEYS: [&str; 24] = [
     ENV_FILE,
     RELAY_ANCHOR,
     IPC_ROOT,
@@ -43,6 +50,13 @@ const ENV_KEYS: [&str; 17] = [
     OUTCOME_MAX_ENTRIES,
     OUTCOME_MAX_RETAINED_BYTES,
     RELAY_BIND,
+    RELAY_EDGE_BIND,
+    RELAY_TLS_CERT,
+    RELAY_TLS_KEY,
+    RELAY_TLS_AUTO,
+    RELAY_TLS_SAN,
+    RELAY_STATE_DIR,
+    RELAY_INSECURE_PLAINTEXT,
     RELAY_ID,
     RELAY_ADVERTISE_URL,
     RELAY_SEEDS,
@@ -177,9 +191,51 @@ fn nonempty(value: &str) -> Option<&str> {
     (!value.is_empty()).then_some(value)
 }
 
+fn catalog_bool(
+    explicit: Option<bool>,
+    key: &str,
+    catalog: &EnvCatalog,
+) -> Result<bool, ConfigError> {
+    if let Some(value) = explicit {
+        return Ok(value);
+    }
+    match catalog.text(key)?.map(str::to_ascii_lowercase).as_deref() {
+        Some("1" | "true" | "yes") => Ok(true),
+        None | Some("0" | "false" | "no") => Ok(false),
+        _ => Err(ConfigError::new(format!(
+            "{key} must be a boolean (1/0, true/false, yes/no)"
+        ))),
+    }
+}
+
+fn catalog_path(
+    explicit: Option<PathBuf>,
+    key: &str,
+    catalog: &EnvCatalog,
+) -> Result<Option<PathBuf>, ConfigError> {
+    match explicit {
+        Some(path) => Ok(Some(path)),
+        None => catalog
+            .raw(key)?
+            .map(|path| {
+                nonempty(path)
+                    .map(PathBuf::from)
+                    .ok_or_else(|| ConfigError::new(format!("{key} must be a nonempty path")))
+            })
+            .transpose(),
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct RelayConfigOverrides {
     pub bind: Option<String>,
+    pub edge_bind: Option<String>,
+    pub tls_cert: Option<PathBuf>,
+    pub tls_key: Option<PathBuf>,
+    pub tls_auto: Option<bool>,
+    pub tls_san: Option<Vec<String>>,
+    pub state_dir: Option<PathBuf>,
+    pub insecure_plaintext: Option<bool>,
     pub relay_id: Option<String>,
     pub advertise_url: Option<String>,
     pub seeds: Option<Vec<String>>,
@@ -370,6 +426,24 @@ impl ConfigResolver {
         };
         let config = RelayConfig {
             bind,
+            edge_bind: text(overrides.edge_bind, RELAY_EDGE_BIND)?,
+            tls_cert: catalog_path(overrides.tls_cert, RELAY_TLS_CERT, catalog)?,
+            tls_key: catalog_path(overrides.tls_key, RELAY_TLS_KEY, catalog)?,
+            tls_auto: catalog_bool(overrides.tls_auto, RELAY_TLS_AUTO, catalog)?,
+            tls_san: match overrides.tls_san {
+                Some(names) => names,
+                None => catalog
+                    .text(RELAY_TLS_SAN)?
+                    .into_iter()
+                    .flat_map(|names| names.split(',').filter_map(nonempty).map(str::to_owned))
+                    .collect(),
+            },
+            state_dir: catalog_path(overrides.state_dir, RELAY_STATE_DIR, catalog)?,
+            insecure_plaintext: catalog_bool(
+                overrides.insecure_plaintext,
+                RELAY_INSECURE_PLAINTEXT,
+                catalog,
+            )?,
             relay_id,
             advertise_url,
             seeds,
@@ -428,22 +502,7 @@ impl ConfigResolver {
         use_proxy: Option<bool>,
         catalog: &EnvCatalog,
     ) -> Result<bool, ConfigError> {
-        Ok(match use_proxy {
-            Some(value) => value,
-            None => match catalog
-                .text(RELAY_USE_PROXY)?
-                .map(str::to_ascii_lowercase)
-                .as_deref()
-            {
-                Some("1" | "true" | "yes") => true,
-                None | Some("0" | "false" | "no") => false,
-                _ => {
-                    return Err(ConfigError::new(format!(
-                        "{RELAY_USE_PROXY} must be a boolean (1/0, true/false, yes/no)"
-                    )));
-                }
-            },
-        })
+        catalog_bool(use_proxy, RELAY_USE_PROXY, catalog)
     }
 
     /// Resolve the immutable local endpoint context from typed options and

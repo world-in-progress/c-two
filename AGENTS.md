@@ -91,7 +91,7 @@ uv run python examples/python/ipc_client.py <address>
 # Relay mesh example, three terminals (with shared CARGO_TARGET_DIR above, build c3 into it and add to PATH;
 # or run `python tools/dev/c3_tool.py --build --link` without CARGO_TARGET_DIR set)
 cargo build --manifest-path cli/Cargo.toml && export PATH="$CARGO_TARGET_DIR/debug:$PATH"
-c3 relay --bind 0.0.0.0:8300
+c3 relay --bind 127.0.0.1:8300
 uv run python examples/python/relay_mesh/resource.py
 uv run python examples/python/relay_mesh/client.py
 
@@ -100,7 +100,7 @@ uv sync --group examples
 
 # CLI tool
 c3 --version
-c3 relay --upstream grid=my_server@ipc://my_server --bind 0.0.0.0:8080
+c3 relay --upstream grid=my_server@ipc://my_server --bind 127.0.0.1:8080
 ```
 
 Windows ARM64 uses the same native source gates on `windows-11-arm`, including Rust/Python/Node interoperability and standard-user consumers. Release wheels cover Python 3.11–3.14 and 3.14t on ARM64; other platforms retain 3.10. Windows syntax-only 3.10 checks install/find `3.10-windows-x86_64-none`; runtime tests must use the native architecture.

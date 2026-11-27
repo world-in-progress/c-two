@@ -32,3 +32,7 @@ uuid = { version = "1", features = ["v4"] }
 axum = "0.8"
 c2-http = { version = "0.1.0", path = "../../transport/c2-http", features = ["relay", "test-support"] }
 tempfile = "3"
+bytes = "1"
+h2 = "0.4"
+http = "1"
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }

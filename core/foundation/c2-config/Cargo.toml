@@ -17,6 +17,7 @@ uuid = { version = "1", features = ["v4"] }
 libc = "0.2"
 sha2 = "0.11.0"
 hex = "0.4"
+url = "2"
 
 [target.'cfg(windows)'.dependencies]
 c2-local-security = { version = "0.1.0", path = "../c2-local-security" }

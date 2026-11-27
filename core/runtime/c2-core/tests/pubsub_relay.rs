@@ -183,6 +183,15 @@ impl Fixture {
         Self::with_topics(limits, &["state"])
     }
     fn with_topics(limits: c2_config::DomainLimits, names: &[&str]) -> Self {
+        Self::start(limits, names, false, HostOptions::default())
+    }
+
+    fn start(
+        limits: c2_config::DomainLimits,
+        names: &[&str],
+        edge: bool,
+        host_options: HostOptions,
+    ) -> Self {
         let root = tempfile::Builder::new()
             .prefix("c2-relay-topic-")
             .tempdir()
@@ -193,6 +202,10 @@ impl Fixture {
                 bind: "127.0.0.1:0".into(),
                 heartbeat_interval: Duration::ZERO,
                 domain_limits: limits,
+                edge_bind: edge.then(|| "127.0.0.1:0".into()),
+                tls_auto: edge,
+                state_dir: edge.then(|| root.path().join("tls")),
+
                 ..Default::default()
             },
             host_rt.local_endpoint_context().unwrap(),
@@ -200,7 +213,7 @@ impl Fixture {
         .unwrap();
         let relay_url = format!("http://{}", relay.local_addr());
         let host = host_rt
-            .host(HostOptions::default().with_relay_anchor_address(&relay_url))
+            .host(host_options.with_relay_anchor_address(&relay_url))
             .unwrap();
         let contract = release_names(names);
         let registration = host
@@ -1172,4 +1185,334 @@ fn empty_frames_still_charge_relay_history_memory() {
         sub.close_with_timeout(Some(Duration::from_secs(5)))
             .completed
     );
+}
+
+async fn h2_edge(
+    relay: &RelayServer,
+) -> (
+    h2::client::SendRequest<bytes::Bytes>,
+    tokio::task::JoinHandle<Result<(), h2::Error>>,
+) {
+    let trust = c2_config::RelayTlsTrust::CertSha256(relay.edge_cert_sha256().unwrap());
+    let mut config = c2_http::relay_tls_config(&trust).unwrap();
+    config.alpn_protocols = vec![b"h2".to_vec()];
+    let tcp = tokio::net::TcpStream::connect(relay.edge_local_addr().unwrap())
+        .await
+        .unwrap();
+    let tls = tokio_rustls::TlsConnector::from(Arc::new(config))
+        .connect("127.0.0.1".try_into().unwrap(), tcp)
+        .await
+        .unwrap();
+    assert_eq!(tls.get_ref().1.alpn_protocol(), Some(&b"h2"[..]));
+    let (sender, conn) = h2::client::Builder::new()
+        .initial_window_size(8192)
+        .initial_connection_window_size(256 * 1024)
+        .handshake(tls)
+        .await
+        .unwrap();
+    (sender, tokio::spawn(conn))
+}
+
+fn edge_request(relay: &RelayServer, method: &str, path: &str) -> http::request::Builder {
+    let expected = release().expected_route("topic-route").unwrap();
+    http::Request::builder()
+        .method(method)
+        .uri(format!("{}{path}", relay.advertise_url()))
+        .header("x-c2-expected-crm-ns", expected.crm_ns)
+        .header("x-c2-expected-crm-name", expected.crm_name)
+        .header("x-c2-expected-crm-ver", expected.crm_ver)
+        .header("x-c2-expected-abi-hash", expected.abi_hash)
+        .header("x-c2-expected-signature-hash", expected.signature_hash)
+}
+
+const EDGE_TOPIC_SUBSCRIBE: &str = "/_c2/topics/subscribe?route=topic-route&topic=state";
+
+fn edge_topic_request(relay: &RelayServer) -> http::Request<()> {
+    edge_request(relay, "POST", EDGE_TOPIC_SUBSCRIBE)
+        .header("accept", c2_http::topic_wire::MEDIA_TYPE)
+        .header("x-c2-topic-start", "next")
+        .header("x-c2-topic-on-lag", "skip")
+        .body(())
+        .unwrap()
+}
+
+struct H2TopicReader {
+    body: h2::RecvStream,
+    buffered: bytes::BytesMut,
+}
+
+impl H2TopicReader {
+    async fn read(&mut self, len: usize) -> bytes::BytesMut {
+        while self.buffered.len() < len {
+            let data = self.body.data().await.expect("topic ended").unwrap();
+            self.body
+                .flow_control()
+                .release_capacity(data.len())
+                .unwrap();
+            self.buffered.extend_from_slice(&data);
+        }
+        self.buffered.split_to(len)
+    }
+
+    async fn record(&mut self) -> (c2_http::topic_wire::RecordKind, bytes::BytesMut) {
+        use c2_http::topic_wire::{RECORD_HEADER_LEN, decode_header};
+
+        let header = self.read(RECORD_HEADER_LEN).await;
+        let (kind, len) = decode_header(header[..].try_into().unwrap()).unwrap();
+        (kind, self.read(len as usize).await)
+    }
+
+    async fn item(&mut self, seq: u64, expected_len: usize, expected_byte: u8) {
+        use c2_http::topic_wire::RecordKind;
+
+        let (kind, begin) = self.record().await;
+        assert_eq!(kind, RecordKind::ItemBegin);
+        assert_eq!(u64::from_le_bytes(begin[..8].try_into().unwrap()), seq);
+        assert_eq!(
+            u64::from_le_bytes(begin[8..].try_into().unwrap()),
+            expected_len as u64
+        );
+        let mut read = 0;
+        while read < expected_len {
+            let (kind, data) = self.record().await;
+            assert_eq!(kind, RecordKind::ItemData);
+            assert!(data.iter().all(|byte| *byte == expected_byte));
+            read += data.len();
+        }
+        assert_eq!(read, expected_len);
+    }
+}
+
+async fn h2_topic(
+    sender: &mut h2::client::SendRequest<bytes::Bytes>,
+    relay: &RelayServer,
+) -> H2TopicReader {
+    std::future::poll_fn(|cx| sender.poll_ready(cx))
+        .await
+        .unwrap();
+    let (response, _) = sender
+        .send_request(edge_topic_request(relay), true)
+        .unwrap();
+    let response = response.await.unwrap();
+    assert_eq!(response.status(), 200);
+    let mut reader = H2TopicReader {
+        body: response.into_body(),
+        buffered: Default::default(),
+    };
+    assert_eq!(
+        reader.record().await.0,
+        c2_http::topic_wire::RecordKind::Ready
+    );
+    reader
+}
+
+#[test]
+fn tls_h2_evicts_only_the_stalled_topic_stream() {
+    use c2_http::topic_wire::{RECORD_HEADER_LEN, RecordKind, decode_header};
+
+    let frame_size = 2 * 1024 * 1024;
+    let mut fixture = Fixture::start(
+        c2_config::DomainLimits {
+            memory_budget_bytes: frame_size as u64 + 64 * 1024,
+            file_spill_budget_bytes: 0,
+            max_outstanding_calls: 3,
+        },
+        &["state"],
+        true,
+        HostOptions::default(),
+    );
+    let publisher = fixture.registration.publisher("state").unwrap();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let relay = &fixture.relay;
+    runtime.block_on(async {
+        tokio::time::timeout(Duration::from_secs(15), async {
+            let (mut sender, connection) = h2_edge(relay).await;
+            let mut slow = h2_topic(&mut sender, relay).await;
+            let mut fast = h2_topic(&mut sender, relay).await;
+            assert_eq!(fixture.registration.active_subscribers(), 1);
+
+            publisher.publish(vec![1; frame_size]).unwrap();
+            fast.item(1, frame_size, 1).await;
+            let (kind, begin) = slow.record().await;
+            assert_eq!(kind, RecordKind::ItemBegin);
+            assert_eq!(u64::from_le_bytes(begin[..8].try_into().unwrap()), 1);
+            assert_eq!(
+                u64::from_le_bytes(begin[8..].try_into().unwrap()),
+                frame_size as u64
+            );
+            while relay.blocked_topic_subscribers_for_test() == 0 {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+
+            publisher.publish(vec![2; frame_size]).unwrap();
+            fast.item(2, frame_size, 2).await;
+
+            let mut partial = std::mem::take(&mut slow.buffered);
+            loop {
+                match slow.body.data().await {
+                    Some(Ok(bytes)) => partial.extend_from_slice(&bytes),
+                    Some(Err(error)) => {
+                        assert_eq!(error.reason(), Some(h2::Reason::CANCEL), "{error:?}");
+                        break;
+                    }
+                    None => panic!("stalled topic ended without RST_STREAM(CANCEL)"),
+                }
+            }
+            assert!(partial.len() < frame_size);
+            while partial.len() >= RECORD_HEADER_LEN {
+                let header = partial.split_to(RECORD_HEADER_LEN);
+                let (kind, len) = decode_header(header[..].try_into().unwrap()).unwrap();
+                assert_eq!(kind, RecordKind::ItemData);
+                let bytes = partial.split_to(partial.len().min(len as usize));
+                assert!(bytes.iter().all(|byte| *byte == 1));
+            }
+            if let Some(kind) = partial.first() {
+                assert_eq!(*kind, RecordKind::ItemData as u8);
+            }
+            assert_eq!(relay.domain_snapshot().operations.used_operations, 1);
+
+            publisher.publish(vec![3; 5]).unwrap();
+            fast.item(3, 5, 3).await;
+            drop((slow, fast, sender));
+            connection.abort();
+            let _ = connection.await;
+        })
+        .await
+        .expect("HTTP/2 slow stream eviction");
+    });
+    wait_until(|| fixture.registration.active_subscribers() == 0);
+    fixture.relay.stop().unwrap();
+    let drained = fixture.relay.domain_snapshot();
+    assert_eq!(drained.operations.used_operations, 0);
+    assert_eq!(drained.memory.used_bytes, 0);
+    assert_eq!(drained.file_spill.used_bytes, 0);
+}
+
+async fn h2_early_error(
+    sender: &mut h2::client::SendRequest<bytes::Bytes>,
+    request: http::Request<()>,
+    status: u16,
+    expected: c2_error::ErrorCode,
+) {
+    std::future::poll_fn(|cx| sender.poll_ready(cx))
+        .await
+        .unwrap();
+    let path = request.uri().path().to_owned();
+    let (response, mut upload) = sender.send_request(request, false).unwrap();
+    // A large forwarded request reaches IPC admission after its first
+    // chunk. Leave the rest of the advertised HTTP/2 upload open.
+    let prefix = if expected == c2_error::ErrorCode::AdmissionDenied {
+        bytes::Bytes::from(vec![42; c2_config::CHUNK_SIZE as usize])
+    } else {
+        bytes::Bytes::from_static(b"unexpected data")
+    };
+    upload.send_data(prefix, false).unwrap();
+    let timeout = Duration::from_secs(3);
+    let response = tokio::time::timeout(timeout, response)
+        .await
+        .unwrap_or_else(|_| panic!("timed out waiting for {status} response headers on {path}"))
+        .unwrap();
+    let actual_status = response.status();
+    let mut body = response.into_body();
+    let mut encoded = Vec::new();
+    while let Some(data) = tokio::time::timeout(timeout, body.data())
+        .await
+        .unwrap_or_else(|_| panic!("timed out reading {status} response on {path}"))
+    {
+        encoded.extend_from_slice(&data.unwrap());
+    }
+    assert_eq!(
+        actual_status,
+        status,
+        "{path}: {}",
+        String::from_utf8_lossy(&encoded)
+    );
+    let error = c2_http::decode_control_error(status, &encoded)
+        .unwrap_or_else(|| panic!("invalid error body: {}", String::from_utf8_lossy(&encoded)));
+    assert_eq!(error.code, expected);
+    assert_eq!(error.details["dispatch_phase"], "pre_dispatch");
+    let reset = tokio::time::timeout(timeout, std::future::poll_fn(|cx| upload.poll_reset(cx)))
+        .await
+        .unwrap_or_else(|_| panic!("no upload reset after {status} on {path}"));
+    assert_eq!(
+        reset.unwrap_or_else(|error| error.reason().unwrap()),
+        h2::Reason::NO_ERROR,
+        "{status} on {path}"
+    );
+}
+
+#[test]
+fn h2_sends_complete_early_errors_before_resetting_the_upload() {
+    use c2_core::{AdmissionContext, AdmissionDecision, AdmissionOperation};
+    use c2_error::ErrorCode;
+
+    let fixture = Fixture::start(
+        c2_config::DomainLimits {
+            // Force chunked IPC instead of filling a whole-request SHM block
+            // before sending OPEN to the Host's admission hook.
+            memory_budget_bytes: 1024 * 1024 + 2 * c2_config::CHUNK_SIZE,
+            file_spill_budget_bytes: 0,
+            max_outstanding_calls: 3,
+        },
+        &["state"],
+        true,
+        HostOptions::default()
+            .with_max_payload_size(1024 * 1024)
+            .with_admission_hook(Arc::new(|context: &AdmissionContext<'_>| {
+                if context.operation() == AdmissionOperation::Unary {
+                    AdmissionDecision::deny("relay upload denied")
+                } else {
+                    AdmissionDecision::allow()
+                }
+            })),
+    );
+    let relay = &fixture.relay;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let (mut sender, connection) = h2_edge(relay).await;
+            for (len, status, error) in [
+                (1024 * 1024 + 1, 413, ErrorCode::CallCapacityExceeded),
+                (1024 * 1024, 403, ErrorCode::AdmissionDenied),
+            ] {
+                let request = edge_request(
+                    relay,
+                    "POST",
+                    "/_c2/calls/call?route=topic-route&method=echo",
+                )
+                .header("content-length", len)
+                .body(())
+                .unwrap();
+                h2_early_error(&mut sender, request, status, error).await;
+            }
+            h2_early_error(
+                &mut sender,
+                edge_topic_request(relay),
+                400,
+                ErrorCode::ProtocolViolation,
+            )
+            .await;
+            let confirm = edge_request(
+                relay,
+                "POST",
+                "/_c2/topics/confirm?route=topic-route&topic=state",
+            )
+            .header("x-c2-relay-origin-only", "1")
+            .header("x-c2-expected-registration", "a".repeat(64))
+            .header("x-c2-topic-upstream-token", "b".repeat(32))
+            .body(())
+            .unwrap();
+            h2_early_error(&mut sender, confirm, 400, ErrorCode::ProtocolViolation).await;
+            connection.abort();
+            let _ = connection.await;
+        })
+        .await
+        .expect("relay held the response for an unfinished upload");
+    });
 }

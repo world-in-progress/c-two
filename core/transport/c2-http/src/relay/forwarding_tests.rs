@@ -22,7 +22,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{Notify, oneshot};
 use tokio::task::JoinHandle;
 
-use super::router::build_router;
+use super::router::build_local_router;
 use super::state::RelayState;
 use super::test_support::{NoopDisseminator, TEST_ABI_HASH, TEST_SIGNATURE_HASH};
 use super::types::RouteEntry;
@@ -550,7 +550,7 @@ mod early_rejection {
             let bytes = Arc::new(AtomicUsize::new(0));
             let counted_frames = frames.clone();
             let counted_bytes = bytes.clone();
-            let app = build_router(state.clone()).layer(axum::middleware::from_fn(
+            let app = build_local_router(state.clone()).layer(axum::middleware::from_fn(
                 move |request: Request<Body>, next: axum::middleware::Next| {
                     let (entered, release) = barrier.lock().take().unwrap();
                     let request = request.map(|body| {
@@ -737,7 +737,7 @@ mod early_rejection {
             })
         }));
         let result = AssertUnwindSafe(async {
-            let response = build_router(server.state.clone())
+            let response = build_local_router(server.state.clone())
                 .oneshot(
                     Request::builder()
                         .method("POST")
@@ -875,7 +875,7 @@ async fn capacity_rejection_case(kind: CapacityRequest) {
         let (stop, stopped) = oneshot::channel();
         let resolves = Arc::new(AtomicUsize::new(0));
         let posts = Arc::new(AtomicUsize::new(0));
-        let mut app = build_router(state.clone());
+        let mut app = build_local_router(state.clone());
         if kind == CapacityRequest::ControlledEager {
             let observed = resolves.clone();
             let observed_posts = posts.clone();
@@ -1342,7 +1342,7 @@ impl Fixture {
         let clients = state.clients.clone();
         let client_observer = tokio::spawn(async move { clients.run().await });
         let (http_stop, stop) = oneshot::channel();
-        let app = build_router(state.clone());
+        let app = build_local_router(state.clone());
         let http_task = tokio::spawn(async move {
             axum::serve(listener, app)
                 .with_graceful_shutdown(async {
@@ -2423,7 +2423,7 @@ async fn unary_body_last_bytes_reference_refunds_download_window() {
             }
         }
         let response = bounded(
-            build_router(fixture.state.clone())
+            build_local_router(fixture.state.clone())
                 .oneshot(request.body(axum::body::Body::from(vec![7; LEN])).unwrap()),
         )
         .await

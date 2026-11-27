@@ -425,3 +425,58 @@ fn relay_tls_requires_utf8() {
         );
     }
 }
+
+#[test]
+fn relay_server_resolves_edge_settings_and_rejects_conflicting_modes() {
+    use crate::RelayEdgeTlsMode;
+
+    let resolve =
+        |entries| ConfigResolver::resolve_relay_server(Default::default(), &catalog(entries));
+    let automatic = resolve(&[
+        (RELAY_EDGE_BIND, "[::]:8443"),
+        (RELAY_TLS_AUTO, "yes"),
+        (RELAY_TLS_SAN, "relay.example, 192.0.2.1"),
+        (RELAY_STATE_DIR, "edge-state"),
+    ])
+    .unwrap();
+    assert_eq!(
+        automatic.edge_tls_mode().unwrap(),
+        Some(RelayEdgeTlsMode::AutoSelfSigned)
+    );
+    assert_eq!(automatic.tls_san, ["relay.example", "192.0.2.1"]);
+    assert_eq!(automatic.state_dir, Some(PathBuf::from("edge-state")));
+    assert_eq!(automatic.effective_advertise_url(), "https://[::1]:8443");
+
+    let explicit = resolve(&[
+        (RELAY_EDGE_BIND, "localhost:8443"),
+        (RELAY_TLS_CERT, "cert.pem"),
+        (RELAY_TLS_KEY, "key.pem"),
+    ])
+    .unwrap();
+    assert_eq!(
+        explicit.edge_tls_mode().unwrap(),
+        Some(RelayEdgeTlsMode::ExplicitCert)
+    );
+    assert_eq!(explicit.tls_cert, Some(PathBuf::from("cert.pem")));
+    assert_eq!(explicit.tls_key, Some(PathBuf::from("key.pem")));
+
+    for options in [
+        &[(RELAY_BIND, "0.0.0.0:8080")][..],
+        &[(RELAY_TLS_AUTO, "true")][..],
+        &[(RELAY_INSECURE_PLAINTEXT, "yes")][..],
+        &[(RELAY_TLS_SAN, "relay.example")][..],
+        &[(RELAY_STATE_DIR, "edge-state")][..],
+        &[
+            (RELAY_EDGE_BIND, "localhost:8443"),
+            (RELAY_TLS_CERT, "cert.pem"),
+        ][..],
+        &[
+            (RELAY_EDGE_BIND, "localhost:8443"),
+            (RELAY_TLS_AUTO, "true"),
+            (RELAY_INSECURE_PLAINTEXT, "true"),
+        ][..],
+        &[(RELAY_ADVERTISE_URL, "http://0.0.0.0:8080")][..],
+    ] {
+        assert!(resolve(options).is_err(), "{options:?}");
+    }
+}

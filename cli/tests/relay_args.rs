@@ -17,6 +17,13 @@ fn relay_help_exposes_current_options() {
     let mut assertion = help.args(["relay", "--help"]).assert().success();
     for flag in [
         "--bind",
+        "--edge-bind",
+        "--tls-cert",
+        "--tls-key",
+        "--tls-auto",
+        "--tls-san",
+        "--state-dir",
+        "--insecure-plaintext",
         "--seeds",
         "--relay-id",
         "--advertise-url",
@@ -424,4 +431,48 @@ fn relay_windows_root_override_is_not_applicable() {
         .assert()
         .failure()
         .stderr(predicate::str::contains("not applicable"));
+}
+
+#[test]
+fn relay_dry_run_enforces_listener_and_tls_modes() {
+    isolated_relay_command()
+        .args(["relay", "--bind", "0.0.0.0:8080", "--dry-run"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("--edge-bind"));
+
+    for (address, flags, mode, url) in [
+        (
+            "0.0.0.0:8443",
+            &[][..],
+            "AutoSelfSigned",
+            "https://127.0.0.1:8443",
+        ),
+        (
+            "[::]:8443",
+            &["--insecure-plaintext"][..],
+            "Plaintext",
+            "http://[::1]:8443",
+        ),
+        (
+            "localhost:8443",
+            &[][..],
+            "Plaintext",
+            "http://127.0.0.1:8443",
+        ),
+        (
+            "127.0.0.1:8443",
+            &["--tls-auto", "--tls-san", "example.test,127.0.0.2"][..],
+            "AutoSelfSigned",
+            "https://127.0.0.1:8443",
+        ),
+    ] {
+        isolated_relay_command()
+            .args(["relay", "--edge-bind", address, "--dry-run"])
+            .args(flags)
+            .assert()
+            .success()
+            .stdout(predicate::str::contains(format!("edge_tls_mode={mode}")))
+            .stdout(predicate::str::contains(format!("advertise_url={url}")));
+    }
 }

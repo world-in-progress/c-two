@@ -18,9 +18,9 @@ use tokio::sync::{Notify, oneshot};
 use tokio_util::task::task_tracker::TaskTrackerToken;
 
 use super::conn_pool::UpstreamLease;
-use super::connection::ConnectionControl;
 use super::forwarding::StreamCancellation;
 use super::state::RelayState;
+use super::stream_control::ResponseStreamControl;
 use super::topic_remote::{
     HttpTopicUpstream, HubUpstreamRecord, RemoteConfirm, isolates_hub, open_remote_upstream,
 };
@@ -182,7 +182,7 @@ impl TopicHubTable {
                     .filter_map(Weak::upgrade)
                     .filter(|subscriber| {
                         subscriber
-                            .connection
+                            .stream_control
                             .as_ref()
                             .is_some_and(|conn| conn.is_blocked())
                     })
@@ -570,7 +570,7 @@ impl Drop for JoinGuard {
 struct Subscriber {
     _permit: OperationPermit,
     _tracked: TaskTrackerToken,
-    connection: Option<Arc<ConnectionControl>>,
+    stream_control: Option<Arc<ResponseStreamControl>>,
     origin_token: OnceLock<String>,
     detached: AtomicBool,
     selected: AtomicBool,
@@ -712,7 +712,7 @@ impl Hub {
         let blocked = state.subscribers.iter().find_map(|(&id, weak)| {
             let sub = weak.upgrade()?;
             let blocked = sub
-                .connection
+                .stream_control
                 .as_ref()
                 .is_some_and(|conn| conn.is_blocked());
             (blocked
@@ -726,42 +726,42 @@ impl Hub {
                 && (sub.frame_started.load(Ordering::Acquire)
                     || sub.inflight_chunks.load(Ordering::Acquire) != 0)
                 && sub
-                    .connection
+                    .stream_control
                     .as_ref()
                     .is_some_and(|conn| conn.is_blocked())
         });
         drop(state);
         if let Some((id, sub)) = blocked {
-            let Some(connection) = &sub.connection else {
+            let Some(stream_control) = &sub.stream_control else {
                 return false;
             };
             if shutdown.is_cancelled()
-                || !connection.is_blocked()
+                || !stream_control.is_blocked()
                 || (!sub.frame_started.load(Ordering::Acquire)
                     && sub.inflight_chunks.load(Ordering::Acquire) == 0)
                 || sub.evicted.swap(true, Ordering::AcqRel)
             {
                 return false;
             }
-            connection.abort();
+            stream_control.abort();
             sub.unsent.lock().clear();
             self.detach(id, &sub);
             sub.changed.notify_waiters();
             self.changed.notify_waiters();
             true
         } else if let Some(sub) = retired {
-            let Some(connection) = &sub.connection else {
+            let Some(stream_control) = &sub.stream_control else {
                 return false;
             };
             if shutdown.is_cancelled()
-                || !connection.is_blocked()
+                || !stream_control.is_blocked()
                 || (!sub.frame_started.load(Ordering::Acquire)
                     && sub.inflight_chunks.load(Ordering::Acquire) == 0)
                 || sub.evicted.swap(true, Ordering::AcqRel)
             {
                 return false;
             }
-            connection.abort();
+            stream_control.abort();
             sub.unsent.lock().clear();
             sub.changed.notify_waiters();
             self.changed.notify_waiters();
@@ -818,7 +818,7 @@ pub(crate) async fn subscribe(
     binding: RouteBinding,
     permit: OperationPermit,
     tracked: TaskTrackerToken,
-    connection: Option<Arc<ConnectionControl>>,
+    stream_control: Option<Arc<ResponseStreamControl>>,
     origin_only: bool,
 ) -> Result<Response, C2Error> {
     let key = HubKey {
@@ -840,7 +840,7 @@ pub(crate) async fn subscribe(
         metadata,
         permit,
         tracked,
-        connection,
+        stream_control,
         registration_header,
         move |hub, metadata, leader_result| {
             drive(
@@ -870,7 +870,7 @@ pub(crate) async fn subscribe_remote(
     metadata: CallMetadata,
     permit: OperationPermit,
     tracked: TaskTrackerToken,
-    connection: Option<Arc<ConnectionControl>>,
+    stream_control: Option<Arc<ResponseStreamControl>>,
 ) -> Result<Response, C2Error> {
     let key = HubKey {
         scope: HubScope::remote(&entry),
@@ -884,7 +884,7 @@ pub(crate) async fn subscribe_remote(
         metadata,
         permit,
         tracked,
-        connection,
+        stream_control,
         None,
         move |hub, metadata, leader_result| {
             drive_remote(
@@ -911,7 +911,7 @@ async fn attach<F, Fut>(
     metadata: CallMetadata,
     permit: OperationPermit,
     tracked: TaskTrackerToken,
-    connection: Option<Arc<ConnectionControl>>,
+    stream_control: Option<Arc<ResponseStreamControl>>,
     registration_header: Option<String>,
     launch: F,
 ) -> Result<Response, C2Error>
@@ -922,7 +922,7 @@ where
     let subscriber = Arc::new(Subscriber {
         _permit: permit,
         _tracked: tracked,
-        connection,
+        stream_control,
         origin_token: OnceLock::new(),
         detached: AtomicBool::new(false),
         selected: AtomicBool::new(false),
@@ -1032,7 +1032,7 @@ where
         let mut consumer_seen = false;
         loop {
             if body_done && monitor_sub.inflight_chunks.load(Ordering::Acquire) == 0 { break; }
-            if let Some(connection) = &monitor_sub.connection {
+            if let Some(stream_control) = &monitor_sub.stream_control {
                 tokio::select! {
                     cause = monitor_control.requested(), if !cancellation_seen => {
                         cancellation_seen = true;
@@ -1045,7 +1045,7 @@ where
                         monitor_hub.detach(id, &monitor_sub);
                     },
                     _ = monitor_done.cancelled(), if !body_done => body_done = true,
-                    _ = connection.changed.notified() => monitor_hub.changed.notify_waiters(),
+                    _ = stream_control.changed.notified() => monitor_hub.changed.notify_waiters(),
                     _ = monitor_sub.changed.notified() => {},
                 }
             } else {
@@ -1256,7 +1256,7 @@ impl BodyState {
                             let mut unsent = self.subscriber.unsent.lock();
                             if self.subscriber.evicted.load(Ordering::Acquire) {
                                 drop(unsent);
-                                return self.abort_incomplete("topic connection was evicted");
+                                return self.abort_incomplete("topic response stream was evicted");
                             }
                             self.front_offset += length;
                             if self.front_offset == front.len() {
@@ -1519,8 +1519,8 @@ impl BodyState {
         &mut self,
         message: impl Into<String>,
     ) -> Option<Result<Bytes, std::io::Error>> {
-        if let Some(connection) = &self.subscriber.connection {
-            connection.abort();
+        if let Some(stream_control) = &self.subscriber.stream_control {
+            stream_control.abort();
         }
         self.subscriber.unsent.lock().clear();
         self.selection_charge.take();
@@ -2202,7 +2202,7 @@ mod tests {
         let subscriber = Arc::new(Subscriber {
             _permit: permit,
             _tracked: tracked,
-            connection: None,
+            stream_control: None,
             origin_token: OnceLock::new(),
             detached: AtomicBool::new(false),
             selected: AtomicBool::new(false),
@@ -2532,7 +2532,7 @@ mod tests {
         let subscriber = Arc::new(Subscriber {
             _permit: permit,
             _tracked: tracked,
-            connection: None,
+            stream_control: None,
             origin_token: OnceLock::new(),
             detached: AtomicBool::new(false),
             selected: AtomicBool::new(false),
@@ -2575,7 +2575,7 @@ mod tests {
         let subscriber = Arc::new(Subscriber {
             _permit: permit,
             _tracked: tracked,
-            connection: None,
+            stream_control: None,
             origin_token: OnceLock::new(),
             detached: AtomicBool::new(false),
             selected: AtomicBool::new(false),
@@ -2620,7 +2620,7 @@ mod tests {
             Arc::new(Subscriber {
                 _permit: permit,
                 _tracked: tracked,
-                connection: None,
+                stream_control: None,
                 origin_token: OnceLock::new(),
                 detached: AtomicBool::new(false),
                 selected: AtomicBool::new(false),
@@ -2684,11 +2684,11 @@ mod tests {
         let table = TopicHubTable::default();
         let shutdown = tokio_util::sync::CancellationToken::new();
         let (permit, tracked) = domain.admit_subscription().unwrap();
-        let stalled_control = ConnectionControl::for_tests();
+        let stalled_control = Arc::<ResponseStreamControl>::default();
         let stalled = Arc::new(Subscriber {
             _permit: permit,
             _tracked: tracked,
-            connection: Some(stalled_control.clone()),
+            stream_control: Some(stalled_control.clone()),
             origin_token: OnceLock::new(),
             detached: AtomicBool::new(false),
             selected: AtomicBool::new(false),
@@ -2717,7 +2717,7 @@ mod tests {
         let healthy = Arc::new(Subscriber {
             _permit: permit,
             _tracked: tracked,
-            connection: None,
+            stream_control: None,
             origin_token: OnceLock::new(),
             detached: AtomicBool::new(false),
             selected: AtomicBool::new(false),
@@ -2770,7 +2770,7 @@ mod tests {
         Arc::new(Subscriber {
             _permit: permit,
             _tracked: tracked,
-            connection: None,
+            stream_control: None,
             origin_token: OnceLock::new(),
             detached: AtomicBool::new(false),
             selected: AtomicBool::new(false),

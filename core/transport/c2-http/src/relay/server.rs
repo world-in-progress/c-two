@@ -24,11 +24,22 @@ use crate::relay::gossip::{broadcast_route_announce, broadcast_route_withdraw};
 use crate::relay::peer::{PeerEnvelope, PeerMessage};
 use crate::relay::router;
 use crate::relay::state::{RegisterCommitResult, RelayState, UnregisterResult};
+use crate::relay::tls::EdgeTls;
+use crate::relay::transport::{HttpListener, ListenerSurface};
 use c2_config::{
     ConfigResolver, ConfigSources, DomainLimitsOverrides, EnvCatalog, LocalEndpointContext,
     LocalEndpointOptions, RelayConfig,
 };
 use c2_ipc::IpcClient;
+
+fn bind_listener(addr: SocketAddr) -> Result<TcpListener, String> {
+    let listener = TcpListener::bind(addr)
+        .map_err(|error| format!("Relay failed to start: Failed to bind {addr}: {error}"))?;
+    listener
+        .set_nonblocking(true)
+        .map_err(|error| format!("Failed to make relay listener nonblocking: {error}"))?;
+    Ok(listener)
+}
 
 const REGISTER_ATTESTATION_CONNECT_ATTEMPTS: usize = 3;
 const REGISTER_ATTESTATION_RETRY_DELAY: Duration = Duration::from_millis(20);
@@ -213,6 +224,8 @@ pub struct RelayShutdownReceipt {
 #[allow(dead_code)]
 pub struct RelayServer {
     local_addr: SocketAddr,
+    edge_addr: Option<SocketAddr>,
+    edge_cert_sha256: Option<[u8; 32]>,
     cmd_tx: Option<mpsc::Sender<Command>>,
     thread: Option<std::thread::JoinHandle<()>>,
     thread_stopped: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
@@ -225,6 +238,21 @@ impl RelayServer {
     /// The actual HTTP listener address, available after startup succeeds.
     pub fn local_addr(&self) -> SocketAddr {
         self.local_addr
+    }
+
+    /// The actual business-edge listener address, if configured.
+    pub fn edge_local_addr(&self) -> Option<SocketAddr> {
+        self.edge_addr
+    }
+
+    /// SHA-256 of the DER-encoded edge leaf certificate.
+    pub fn edge_cert_sha256(&self) -> Option<[u8; 32]> {
+        self.edge_cert_sha256
+    }
+
+    /// The configured or derived business data-plane URL.
+    pub fn advertise_url(&self) -> String {
+        self.state.config().effective_advertise_url()
     }
 
     #[cfg(test)]
@@ -377,16 +405,16 @@ impl RelayServer {
             .validate()
             .map_err(|e| format!("Invalid relay config: {e}"))?;
 
-        let addr: SocketAddr = config
-            .bind
-            .parse()
-            .map_err(|e| format!("Invalid bind address '{}': {e}", config.bind))?;
-        let listener = TcpListener::bind(addr)
-            .map_err(|error| format!("Relay failed to start: Failed to bind {addr}: {error}"))?;
-        let local_addr = listener
-            .local_addr()
-            .map_err(|error| format!("Failed to read relay listener address: {error}"))?;
+        let listener = bind_listener(config.local_bind_addr().expect("validated --bind"))?;
+        let local_addr = listener.local_addr().map_err(|error| error.to_string())?;
         config.bind = local_addr.to_string();
+        let edge_listener = config.edge_bind_addr().map(bind_listener).transpose()?;
+        let edge_addr = edge_listener
+            .as_ref()
+            .map(TcpListener::local_addr)
+            .transpose()
+            .map_err(|error| error.to_string())?;
+        config.edge_bind = edge_addr.map(|addr| addr.to_string());
         let effective_advertise_url = config.effective_advertise_url();
         if !crate::valid_relay_url(&effective_advertise_url) {
             return Err(format!(
@@ -394,9 +422,9 @@ impl RelayServer {
                 effective_advertise_url
             ));
         }
-        listener
-            .set_nonblocking(true)
-            .map_err(|error| format!("Failed to make relay listener nonblocking: {error}"))?;
+        let edge_tls = EdgeTls::load(&config)?;
+        let edge_cert_sha256 = edge_tls.as_ref().map(|tls| tls.leaf_sha256);
+        let edge = edge_listener.map(|listener| (listener, edge_tls.map(|tls| tls.acceptor)));
 
         let domain_budget = c2_mem::DomainBudget::from_limits(&config.domain_limits);
         let config = Arc::new(config);
@@ -431,6 +459,7 @@ impl RelayServer {
                 rt.block_on(async move {
                     Self::run(
                         listener,
+                        edge,
                         server_state,
                         cmd_rx,
                         ready_tx,
@@ -454,6 +483,8 @@ impl RelayServer {
 
         Ok(Self {
             local_addr,
+            edge_addr,
+            edge_cert_sha256,
             cmd_tx: Some(cmd_tx),
             thread: Some(thread),
             thread_stopped: std::sync::Mutex::new(thread_stopped),
@@ -571,18 +602,41 @@ impl RelayServer {
 
     async fn run(
         listener: TcpListener,
+        edge: Option<(TcpListener, Option<tokio_rustls::TlsAcceptor>)>,
         state: Arc<RelayState>,
         mut cmd_rx: mpsc::Receiver<Command>,
         ready_tx: oneshot::Sender<Result<(), String>>,
         cancel: CancellationToken,
         idle_timeout: Duration,
     ) {
-        let app = router::build_router(state.clone());
-
-        let listener = match tokio::net::TcpListener::from_std(listener) {
-            Ok(l) => l,
-            Err(e) => {
-                let _ = ready_tx.send(Err(format!("Failed to adopt relay listener: {e}")));
+        let memory_budget = state.config().domain_limits.memory_budget_bytes;
+        let listeners = (|| {
+            let mut listeners = vec![(
+                tokio::net::TcpListener::from_std(listener)?,
+                HttpListener {
+                    app: router::build_local_router(state.clone()),
+                    surface: ListenerSurface::LocalControl,
+                    tls: None,
+                    memory_budget,
+                },
+            )];
+            if let Some((listener, tls)) = edge {
+                listeners.push((
+                    tokio::net::TcpListener::from_std(listener)?,
+                    HttpListener {
+                        app: router::build_edge_router(state.clone()),
+                        surface: ListenerSurface::PublicEdge,
+                        tls,
+                        memory_budget,
+                    },
+                ));
+            }
+            Ok::<_, std::io::Error>(listeners)
+        })();
+        let listeners = match listeners {
+            Ok(listeners) => listeners,
+            Err(error) => {
+                let _ = ready_tx.send(Err(format!("Failed to adopt relay listener: {error}")));
                 return;
             }
         };
@@ -595,22 +649,18 @@ impl RelayServer {
         // Spawn background tasks (heartbeat, failure detection, anti-entropy, etc.)
         let bg_handles = spawn_background_tasks(state.clone(), cancel.clone());
 
-        let (http_stop, http_stopped) = oneshot::channel();
-        let server = axum::serve(
-            crate::relay::connection::RelayListener(listener),
-            app.into_make_service_with_connect_info::<crate::relay::connection::ConnectionInfo>(),
-        )
-        .with_graceful_shutdown(async {
-            let _ = http_stopped.await;
-        });
-        let mut server = tokio::spawn(std::future::IntoFuture::into_future(server));
+        let http_stop = CancellationToken::new();
+        let mut http_servers = tokio::task::JoinSet::new();
+        for (listener, driver) in listeners {
+            http_servers.spawn(driver.serve(listener, http_stop.clone()));
+        }
         let sweeper = Self::idle_sweeper(state.clone(), idle_timeout);
 
-        let http_finished = tokio::select! {
-            _ = &mut server => true,
-            _ = Self::command_loop(state.clone(), &mut cmd_rx) => false,
-            _ = sweeper => false,
-        };
+        tokio::select! {
+            _ = http_servers.join_next() => {}
+            _ = Self::command_loop(state.clone(), &mut cmd_rx) => {}
+            _ = sweeper => {}
+        }
 
         // Fence admission and observe native forwarding before the runtime can
         // destroy tasks/IPC futures. Waiter disappearance never counts as drain.
@@ -622,10 +672,8 @@ impl RelayServer {
         state.stop_upstream_controls().await;
         // The HTTP task keeps polling existing responses and token cancellation
         // while native forwarding drains. New business admission is closed.
-        let _ = http_stop.send(());
-        if !http_finished {
-            let _ = server.await;
-        }
+        http_stop.cancel();
+        http_servers.join_all().await;
 
         // Shutdown: broadcast leave, cancel background tasks
         let leave = PeerEnvelope::new(
@@ -1163,7 +1211,7 @@ mod tests {
     #[test]
     fn bound_address_nonzero_port_keeps_existing_advertise_derivation() {
         let (_root, context) = port_test_context();
-        for bind in ["127.0.0.1:0", "0.0.0.0:0"] {
+        for bind in ["127.0.0.1:0", "localhost:0"] {
             let mut relay = RelayServer::start_with_context(
                 RelayConfig {
                     bind: bind.into(),

@@ -23,7 +23,7 @@ use c2_server::{
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::{mpsc, oneshot};
 
-use super::router::build_router;
+use super::router::build_local_router;
 use super::state::{RegisterCommitResult, RelayState};
 use super::test_support::NoopDisseminator;
 use crate::stream_wire::{self, HttpStreamRecordKind, HttpStreamStatus};
@@ -688,7 +688,7 @@ impl Fixture {
         let armed = Arc::new(AtomicBool::new(false));
         let (pending_tx, pending) = mpsc::channel(4);
         let (http_stop, stop) = oneshot::channel();
-        let app = build_router(state.clone());
+        let app = build_local_router(state.clone());
         let listener = MeteredListener {
             inner: listener,
             armed: armed.clone(),
@@ -1703,7 +1703,7 @@ async fn stream_recycles_its_window_at_full_memory_and_body_drop_preserves_share
             .header("content-length", "8")
             .body(Body::from(input))
             .unwrap();
-        let response = bounded(build_router(fixture.state.clone()).oneshot(request))
+        let response = bounded(build_local_router(fixture.state.clone()).oneshot(request))
             .await
             .unwrap();
         assert_eq!(response.status(), 200);
@@ -1844,7 +1844,7 @@ async fn abandoned_budget_wait_stops_before_ipc_dispatch() {
         .header("content-length", "8")
         .body(Body::from(input))
         .unwrap();
-    let app = build_router(fixture.state.clone());
+    let app = build_local_router(fixture.state.clone());
     let pending = tokio::spawn(async move { app.oneshot(request).await });
     wait_for_admission(&fixture.state).await;
     assert_eq!(fixture.observed.opened.load(Ordering::SeqCst), 0);
@@ -1889,7 +1889,7 @@ async fn cancelled_stream_terminal_is_delivered_while_another_http_response_fill
             [2_u32.to_le_bytes(), 64_u32.to_le_bytes()].concat(),
         ))
         .unwrap();
-    let response = bounded(build_router(fixture.state.clone()).oneshot(stream_request))
+    let response = bounded(build_local_router(fixture.state.clone()).oneshot(stream_request))
         .await
         .unwrap();
     assert_eq!(response.status(), 200);
@@ -1951,7 +1951,7 @@ async fn cancelled_stream_terminal_is_delivered_while_another_http_response_fill
         .header("content-length", "4")
         .body(Body::from((32 * 1024_u32).to_le_bytes().to_vec()))
         .unwrap();
-    let unary_response = bounded(build_router(fixture.state.clone()).oneshot(unary_request))
+    let unary_response = bounded(build_local_router(fixture.state.clone()).oneshot(unary_request))
         .await
         .unwrap();
     assert_eq!(unary_response.status(), 200);
@@ -1978,7 +1978,7 @@ async fn cancelled_stream_terminal_is_delivered_while_another_http_response_fill
         .uri(format!("/_calls/{token}"))
         .body(Body::empty())
         .unwrap();
-    let cancelled = bounded(build_router(fixture.state.clone()).oneshot(cancel))
+    let cancelled = bounded(build_local_router(fixture.state.clone()).oneshot(cancel))
         .await
         .unwrap();
     assert_eq!(cancelled.status(), 204);
@@ -2046,7 +2046,7 @@ async fn abandoned_data_header_refunds_its_payload_before_blocked_cleanup() {
             [1_u32.to_le_bytes(), 8192_u32.to_le_bytes()].concat(),
         ))
         .unwrap();
-    let response = bounded(build_router(fixture.state.clone()).oneshot(request))
+    let response = bounded(build_local_router(fixture.state.clone()).oneshot(request))
         .await
         .unwrap();
     let mut body = response.into_body();
@@ -2141,7 +2141,7 @@ async fn abandoned_mid_poll_refunds_window_before_blocked_cleanup() {
             [2_u32.to_le_bytes(), 8192_u32.to_le_bytes()].concat(),
         ))
         .unwrap();
-    let response = bounded(build_router(fixture.state.clone()).oneshot(request))
+    let response = bounded(build_local_router(fixture.state.clone()).oneshot(request))
         .await
         .unwrap();
     let mut body = response.into_body();
@@ -2217,7 +2217,7 @@ async fn token_cancel_after_lifecycle_cancel_finishes_without_another_copy_windo
                 [1_u32.to_le_bytes(), (128 * 1024_u32).to_le_bytes()].concat(),
             ))
             .unwrap();
-        let response = bounded(build_router(fixture.state.clone()).oneshot(request))
+        let response = bounded(build_local_router(fixture.state.clone()).oneshot(request))
             .await
             .unwrap();
         let token = response.headers()["x-c2-call-token"]
@@ -2260,7 +2260,7 @@ async fn token_cancel_after_lifecycle_cancel_finishes_without_another_copy_windo
                 .uri(format!("/_calls/{token}"))
                 .body(Body::empty())
                 .unwrap();
-            let response = bounded(build_router(fixture.state.clone()).oneshot(cancel))
+            let response = bounded(build_local_router(fixture.state.clone()).oneshot(cancel))
                 .await
                 .unwrap();
             assert_eq!(response.status(), 204);
@@ -2487,7 +2487,7 @@ async fn stream_body_last_bytes_reference_refunds_b() {
                 [1u32.to_le_bytes(), (LEN as u32).to_le_bytes()].concat(),
             ))
             .unwrap();
-        let response = bounded(build_router(fixture.state.clone()).oneshot(request))
+        let response = bounded(build_local_router(fixture.state.clone()).oneshot(request))
             .await
             .unwrap();
         assert_eq!(response.status(), 200);

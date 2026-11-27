@@ -15,7 +15,7 @@ use super::peer::{
     DigestEntry, PROTOCOL_VERSION, PeerEnvelope, PeerMessage, ValidatedRouteStateEnvelope,
     validate_route_state_envelope,
 };
-use super::router::build_router;
+use super::router::build_local_router;
 use super::state::RelayState;
 use super::test_support::{TEST_ABI_HASH, TEST_SIGNATURE_HASH};
 use super::types::*;
@@ -100,7 +100,7 @@ fn assert_forgotten(state: &RelayState, id: &str) {
 }
 
 async fn post(state: Arc<RelayState>, path: &str, body: &str) -> (StatusCode, String) {
-    let response = build_router(state)
+    let response = build_local_router(state)
         .oneshot(
             Request::post(path)
                 .header("content-type", "application/json")
@@ -428,7 +428,7 @@ async fn force_leave_seed_rejoin_adopts_the_seeds_current_view() {
         }
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
-        let app = build_router(seed);
+        let app = build_local_router(seed);
         let http = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         let joiner = Arc::new(RelayState::new(
             Arc::new(RelayConfig {
@@ -552,7 +552,7 @@ impl MeshRelay {
         let clients = tokio::spawn(async move { domain.run().await });
         let cancel = tokio_util::sync::CancellationToken::new();
         let background = super::background::spawn_background_tasks(state.clone(), cancel.clone());
-        let app = build_router(state.clone());
+        let app = build_local_router(state.clone());
         let http = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         Self {
             state,
@@ -575,7 +575,7 @@ impl MeshRelay {
         let listener = tokio::net::TcpListener::bind(self.url.strip_prefix("http://").unwrap())
             .await
             .unwrap();
-        let app = build_router(self.state.clone());
+        let app = build_local_router(self.state.clone());
         self.http = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         self.cancel = tokio_util::sync::CancellationToken::new();
         self.background =

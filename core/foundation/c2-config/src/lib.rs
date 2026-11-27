@@ -43,7 +43,7 @@ pub use pool::{
     MIN_BUDDY_SEGMENT_BYTES, POOL_DECAY_SECONDS, PRIMARY_MAX_POOL_SEGMENTS, PoolConfig,
     REASSEMBLY_MAX_POOL_SEGMENTS, SPILL_THRESHOLD, default_spill_dir,
 };
-pub use relay::RelayConfig;
+pub use relay::{RelayConfig, RelayEdgeTlsMode};
 pub use resolver::{
     ConfigError, ConfigResolver, ConfigSources, EnvCatalog, EnvFilePolicy, EnvMap,
     RelayConfigOverrides, RelayTlsTrust, ResolvedRelayClientConfig, ResolvedServerConfig,

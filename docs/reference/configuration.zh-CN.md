@@ -22,9 +22,15 @@ Rust Core 按 **显式代码或 CLI 覆盖 > 进程环境变量 > `.env` > 默�
 | `C2_MAX_EXECUTION_WORKERS` | 主机并行度限制在 4–64，取不到时按 4 计算 | Host 的 `max_execution_workers`。显式值须至少为 1，可以超过 64。 |
 | `C2_OUTCOME_MAX_ENTRIES` | 4096 | Host 的 `outcome_max_entries`，至少为 1。限制所有注册中已结算的调用结局总条数。 |
 | `C2_OUTCOME_MAX_RETAINED_BYTES` | `min(64 MiB, server.M / 4)` | Host 的 `outcome_max_retained_bytes`，范围为 0 到 `server.M`。设为 0 时仅保留元数据。 |
-| `C2_RELAY_BIND` | `0.0.0.0:8080` | `c3 relay --bind` / `-b` |
+| `C2_RELAY_BIND` | `127.0.0.1:8080` | `c3 relay --bind` / `-b` |
+| `C2_RELAY_EDGE_BIND` | 未设置 | `c3 relay --edge-bind` |
+| `C2_RELAY_TLS_CERT`, `C2_RELAY_TLS_KEY` | 未设置 | `--tls-cert`, `--tls-key` |
+| `C2_RELAY_TLS_AUTO` | `false` | `--tls-auto` |
+| `C2_RELAY_TLS_SAN` | 空 | `--tls-san` |
+| `C2_RELAY_STATE_DIR` | `~/.c3-relay` | `--state-dir` |
+| `C2_RELAY_INSECURE_PLAINTEXT` | `false` | `--insecure-plaintext` |
 | `C2_RELAY_ID` | 自动生成 | `c3 relay --relay-id` |
-| `C2_RELAY_ADVERTISE_URL` | 由实际绑定地址推导 | `c3 relay --advertise-url` |
+| `C2_RELAY_ADVERTISE_URL` | 由实际监听地址和承载推导 | `c3 relay --advertise-url` |
 | `C2_RELAY_SEEDS` | 空 | `c3 relay --seeds` / `-s`，逗号分隔的 relay URL |
 | `C2_RELAY_USE_PROXY` | `false` | 允许 relay 流量使用进程 HTTP 代理设置。Rust `HostOptions::with_relay_use_proxy` 可以覆盖。 |
 
@@ -51,6 +57,8 @@ Python `cc.set_client` 与 `cc.set_server` 接受表中的三个容量字段。`
 ## Relay 与 c3
 
 独立 relay 启动时解析一个 `relay` 域。内存、文件溢出和调用槽覆盖业务转发及其上游 IPC 存储，跨物理连接和重连共用。`c3 relay --dry-run` 校验并显示有效的 `M`、`F`、`N`，不启动监听。`--upstream`（`-u`）仅通过 CLI 指定路由及上游身份。见 [c3 relay](../../cli/README.md#relay)。
+
+本机控制入口仅接受回环地址。可选的业务边缘入口接受发现和 RPC。边缘默认在非回环地址启用持久化自签 TLS，在回环地址使用明文。显式证书和私钥必须成对设置。显式证书、`--tls-auto` 和 `--insecure-plaintext` 互斥。自动证书的 SAN 和状态目录仅用于自动 TLS。
 
 ## 固定传输常量
 

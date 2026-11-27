@@ -1,18 +1,35 @@
 //! Relay server configuration.
 
+use std::net::{IpAddr, SocketAddr};
+use std::path::PathBuf;
 use std::time::Duration;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RelayEdgeTlsMode {
+    ExplicitCert,
+    AutoSelfSigned,
+    Plaintext,
+}
 
 /// Configuration for the relay server.
 #[derive(Debug, Clone)]
 pub struct RelayConfig {
     /// Capacity shared by this relay's data plane.
     pub domain_limits: crate::DomainLimits,
-    /// HTTP bind address (e.g. "0.0.0.0:8080").
+    /// Loopback control listen address.
     pub bind: String,
+    /// Optional business and discovery listener.
+    pub edge_bind: Option<String>,
+    pub tls_cert: Option<PathBuf>,
+    pub tls_key: Option<PathBuf>,
+    pub tls_auto: bool,
+    pub tls_san: Vec<String>,
+    pub state_dir: Option<PathBuf>,
+    pub insecure_plaintext: bool,
     /// Stable relay identifier. Default: "{hostname}_{pid}_{uuid8}".
     pub relay_id: String,
     /// Publicly reachable URL of this relay (e.g. "http://node1:8080").
-    /// Distinct from `bind` — bind may be 0.0.0.0 but advertise must be routable.
+    /// May name an external reverse proxy.
     pub advertise_url: String,
     /// Seed relay URLs for mesh bootstrap. Empty = standalone mode.
     pub seeds: Vec<String>,
@@ -32,7 +49,14 @@ impl Default for RelayConfig {
     fn default() -> Self {
         Self {
             domain_limits: crate::DomainLimits::default(),
-            bind: "0.0.0.0:8080".into(),
+            bind: "127.0.0.1:8080".into(),
+            edge_bind: None,
+            tls_cert: None,
+            tls_key: None,
+            tls_auto: false,
+            tls_san: Vec::new(),
+            state_dir: None,
+            insecure_plaintext: false,
             relay_id: Self::generate_relay_id(),
             advertise_url: String::new(),
             seeds: Vec::new(),
@@ -48,6 +72,32 @@ impl Default for RelayConfig {
 impl RelayConfig {
     pub fn validate(&self) -> Result<(), String> {
         crate::validate_relay_id(&self.relay_id)?;
+        if !listener_address(&self.bind).is_some_and(|addr| addr.ip().is_loopback()) {
+            return Err(
+                "--bind requires a loopback address and port; use --edge-bind for external traffic"
+                    .into(),
+            );
+        }
+        self.edge_tls_mode()?;
+        if !self.advertise_url.is_empty() {
+            let valid = url::Url::parse(&self.advertise_url)
+                .ok()
+                .is_some_and(|url| {
+                    matches!(url.scheme(), "http" | "https")
+                        && url.query().is_none()
+                        && url.fragment().is_none()
+                        && url.username().is_empty()
+                        && url.password().is_none()
+                        && url.host().is_some_and(|host| match host {
+                            url::Host::Ipv4(ip) => !ip.is_unspecified(),
+                            url::Host::Ipv6(ip) => !ip.is_unspecified(),
+                            url::Host::Domain(_) => true,
+                        })
+                });
+            if !valid {
+                return Err("advertise_url must be an http(s) URL with a dialable host".into());
+            }
+        }
         self.domain_limits
             .validate()
             .map_err(|error| error.to_string())
@@ -94,23 +144,98 @@ impl RelayConfig {
         format!("{host}{tail}")
     }
 
-    /// Derive advertise_url from bind if not explicitly set.
+    /// Resolve the edge transport after validating mutually exclusive options.
+    pub fn edge_tls_mode(&self) -> Result<Option<RelayEdgeTlsMode>, String> {
+        use RelayEdgeTlsMode::*;
+        let has_cert = self.tls_cert.is_some();
+        if has_cert != self.tls_key.is_some() {
+            return Err("--tls-cert and --tls-key must be set together".into());
+        }
+        if [has_cert, self.tls_auto, self.insecure_plaintext]
+            .into_iter()
+            .filter(|enabled| *enabled)
+            .count()
+            > 1
+        {
+            return Err(
+                "--tls-cert/--tls-key, --tls-auto and --insecure-plaintext are mutually exclusive"
+                    .into(),
+            );
+        }
+        let Some(bind) = &self.edge_bind else {
+            if has_cert
+                || self.tls_auto
+                || self.insecure_plaintext
+                || !self.tls_san.is_empty()
+                || self.state_dir.is_some()
+            {
+                return Err("edge TLS settings require --edge-bind".into());
+            }
+            return Ok(None);
+        };
+        let addr = listener_address(bind).ok_or("invalid --edge-bind address or port")?;
+        let mode = if has_cert {
+            ExplicitCert
+        } else if self.tls_auto || (!addr.ip().is_loopback() && !self.insecure_plaintext) {
+            AutoSelfSigned
+        } else {
+            Plaintext
+        };
+        Ok(Some(mode))
+    }
+
+    pub fn local_bind_addr(&self) -> Option<SocketAddr> {
+        listener_address(&self.bind)
+    }
+
+    pub fn edge_bind_addr(&self) -> Option<SocketAddr> {
+        self.edge_bind.as_deref().and_then(listener_address)
+    }
+
+    /// An explicit external URL can name the front of a reverse proxy.
     pub fn effective_advertise_url(&self) -> String {
         if !self.advertise_url.is_empty() {
             return self.advertise_url.clone();
         }
-        let bind = &self.bind;
-        if let Some((host, port)) = bind.rsplit_once(':') {
-            let host = if host == "0.0.0.0" || host == "::" {
-                "127.0.0.1"
+        let Some(mut addr) = self.edge_bind_addr() else {
+            return format!("http://{}", self.bind);
+        };
+        if addr.ip().is_unspecified() {
+            // A wildcard socket is reachable through the matching loopback.
+            addr.set_ip(if addr.is_ipv4() {
+                IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
             } else {
-                host
-            };
-            format!("http://{host}:{port}")
+                IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)
+            });
+        }
+        let scheme = match self.edge_tls_mode() {
+            Ok(Some(RelayEdgeTlsMode::ExplicitCert | RelayEdgeTlsMode::AutoSelfSigned)) => "https",
+            _ => "http",
+        };
+        format!("{scheme}://{addr}")
+    }
+
+    /// Mesh 8 control endpoints are served by the loopback listener.
+    pub fn mesh_url(&self) -> String {
+        if self.edge_bind.is_none() {
+            self.effective_advertise_url()
         } else {
-            format!("http://127.0.0.1:{bind}")
+            format!("http://{}", self.bind)
         }
     }
+}
+
+fn listener_address(value: &str) -> Option<SocketAddr> {
+    value.parse().ok().or_else(|| {
+        let (host, port) = value.rsplit_once(':')?;
+        if !host.eq_ignore_ascii_case("localhost") {
+            return None;
+        }
+        Some(SocketAddr::from((
+            [127, 0, 0, 1],
+            port.parse::<u16>().ok()?,
+        )))
+    })
 }
 
 #[cfg(test)]

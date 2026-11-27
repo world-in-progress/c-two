@@ -101,7 +101,7 @@ finally:
 
 `runtime = cc.Runtime()` 让应用分别拥有自己的 Python 配置、路由和原生会话。用 `runtime.set_*()` 配置后，可以调用 `runtime.start()` 等待空 Host 就绪，或用 `runtime.register()` 承载资源。模块函数继续使用默认 Runtime；`cc.serve()` 负责默认 Runtime 的进程信号处理，没有实例版。应用结束时调用 `runtime.shutdown()` 并检查结构化结果；若结果为 pending，再调用 shutdown 观察完成并换代。通过 `runtime.set_client()` 和 `runtime.set_server()` 分别配置该实例的两个角色域，通过 `runtime.memory_stats()` 和 `runtime.call_execution_snapshot()` 查看两侧（模块级 `cc.observe.*` 读取的是默认 Runtime）。见[独立 Runtime 示例](examples/python/independent_runtime.py)及 [Python API 指南](docs/reference/python-usage.zh-CN.md#独立的-python-runtime)。
 
-使用 relay 时，启动 `c3 relay --bind 0.0.0.0:8300`，在两端设置 `cc.set_relay_anchor('http://relay-host:8300')`，再按名称连接。Relay 独立运行；显式 IPC 地址直接连接端点。
+使用 relay 时，启动 `c3 relay --bind 127.0.0.1:8300`，在两端设置 `cc.set_relay_anchor('http://127.0.0.1:8300')`，再按名称连接。Relay 独立运行。远程客户端通过 `--edge-bind` 开放的 HTTPS 地址连接，并配置客户端证书信任。资源通过回环地址注册。显式 IPC 地址直接连接端点。[Relay CLI](cli/README.md#relay)
 
 ## 示例与文档
 

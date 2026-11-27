@@ -98,19 +98,25 @@ Color output follows common terminal conventions (checked in priority order):
 Start a relay:
 
 ```bash
-c3 relay --bind 0.0.0.0:8080
+c3 relay --bind 127.0.0.1:8080
 ```
 
-Relay HTTP and mesh endpoints are not public-facing APIs. Bind to `0.0.0.0` only inside a trusted deployment boundary, and restrict access with private networking, firewall rules, Kubernetes NetworkPolicy, service mesh policy, or ingress authentication.
+The loopback listener serves Host registration, administration, local Mesh 8 peers, discovery and RPC. Add `--edge-bind` for external clients or a reverse proxy. The edge listener serves discovery and RPC without exposing local IPC addresses or server instance identity, even on a loopback bind.
 
 Useful options:
 
 | Option | Environment | Default | Purpose |
 |---|---|---:|---|
-| `--bind`, `-b` | `C2_RELAY_BIND` | `0.0.0.0:8080` | HTTP listen address. Port `0` takes a free port; the `C-Two relay listening at` line prints the bound address. |
+| `--bind`, `-b` | `C2_RELAY_BIND` | `127.0.0.1:8080` | Loopback HTTP control address. Port `0` selects a free port. |
+| `--edge-bind` | `C2_RELAY_EDGE_BIND` | unset | Optional business and discovery listen address. A non-loopback address defaults to TLS. |
+| `--tls-cert`, `--tls-key` | `C2_RELAY_TLS_CERT`, `C2_RELAY_TLS_KEY` | unset | Edge PEM certificate chain and private key. Supply both. |
+| `--tls-auto` | `C2_RELAY_TLS_AUTO` | false | Select a persistent self-signed certificate, including on loopback. |
+| `--tls-san` | `C2_RELAY_TLS_SAN` | empty | Comma-separated additional DNS names and IP addresses for automatic TLS. |
+| `--state-dir` | `C2_RELAY_STATE_DIR` | `~/.c3-relay` | Private directory for the generated edge certificate and key. Create its parent before startup. |
+| `--insecure-plaintext` | `C2_RELAY_INSECURE_PLAINTEXT` | false | Explicitly allow a non-loopback plaintext edge. |
 | `--seeds`, `-s` | `C2_RELAY_SEEDS` | empty | Comma-separated seed relay URLs for mesh mode. |
 | `--relay-id` | `C2_RELAY_ID` | generated | Stable relay identifier for the mesh protocol. |
-| `--advertise-url` | `C2_RELAY_ADVERTISE_URL` | derived from the bound address | Public URL other relays should use to reach this relay. |
+| `--advertise-url` | `C2_RELAY_ADVERTISE_URL` | derived from the bound address | Public URL clients use for this relay, including a reverse proxy URL. |
 | `--ipc-root` | `C2_IPC_ROOT` | `/tmp/c2-v3-<uidhex>` (Unix) | Final owner-controlled endpoint directory; custom directories are application-provisioned, and `0755` is accepted when other identities cannot modify them. Not applicable on Windows, where upstream IPC uses TokenUser-scoped Named Pipes. |
 | `--memory-budget-bytes` | `C2_MEMORY_BUDGET_BYTES` | 16 GiB | Memory for the relay's business forwarding and upstream IPC storage. Zero closes new forwarding admission. |
 | `--file-spill-budget-bytes` | `C2_FILE_SPILL_BUDGET_BYTES` | 16 GiB | Temporary file-backed reassembly capacity. Zero disables file spill. |
@@ -121,11 +127,16 @@ Examples:
 
 ```bash
 c3 relay --bind 127.0.0.1:8080
-c3 relay --bind 0.0.0.0:8080 --upstream grid=server@ipc://server
-c3 relay --relay-id relay-a --advertise-url http://relay-a:8080 --seeds http://relay-b:8080,http://relay-c:8080
+c3 relay --bind 127.0.0.1:8080 --upstream grid=server@ipc://server
+c3 relay --edge-bind 0.0.0.0:8443 --advertise-url https://relay.example.org:8443
+c3 relay --bind 127.0.0.1:8081 --relay-id relay-b --seeds http://127.0.0.1:8080
 ```
 
-Use `--dry-run` to validate and print the resolved configuration and effective relay domain budgets and slot limit without starting the server. It exits right after config resolution and does not bind the listen socket (port `0` still prints as `0`), run startup checks on `--advertise-url`, or register `--upstream` entries.
+Loopback edge listeners default to plaintext for a same-host reverse proxy. Cleartext listeners support HTTP/1.1 and HTTP/2 prior knowledge. TLS listeners negotiate `h2` or `http/1.1` with ALPN. Select an explicit certificate and key, an automatically generated identity, or plaintext. The relay prints the bound addresses and the dialable edge URL. Give it `--advertise-url` for a public hostname or IP when binding a wildcard. Without that setting, a wildcard produces a same-family loopback URL.
+
+Automatic TLS generates `edge-cert.pem` and `edge-key.pem` in the state directory. The directory and generated files use Unix modes `0700` and `0600` or a protected Windows DACL for the current TokenUser. Each relay needing a distinct identity uses a separate state directory. The leaf certificate includes the advertised host, configured SANs, the non-wildcard edge IP and loopback names and addresses. Subsequent starts reuse the files and print the same leaf DER fingerprint. Configure clients with `C2_RELAY_CERT_SHA256=sha256:<hex>` for a pinned identity or `C2_RELAY_CA_CERT` for a custom PEM trust root. Configure Host registration with the loopback URL.
+
+Use `--dry-run` to validate and print the resolved listener and TLS options, budgets and slot limit. It keeps configured ports, including `0`, and exits before opening listeners, loading or generating certificates, or registering upstreams.
 
 ```bash
 c3 relay --bind 127.0.0.1:9999 --memory-budget-bytes 134217728 --dry-run

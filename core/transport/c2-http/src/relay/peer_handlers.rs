@@ -24,7 +24,7 @@ fn current_full_sync_envelope(state: &RelayState) -> FullSyncEnvelope {
     {
         snapshot.peers.push(PeerSnapshot {
             relay_id: state.relay_id().to_string(),
-            url: state.config().effective_advertise_url(),
+            url: state.config().mesh_url(),
             route_count: state.local_route_count(),
             status: PeerStatus::Alive,
         });

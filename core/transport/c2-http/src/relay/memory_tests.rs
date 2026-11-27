@@ -3,7 +3,7 @@
 //! The first five tests cover RelayState -> IpcClient -> LocalStream -> Server,
 //! not HTTP. Connections perform real identity/contract/token handshakes; no
 //! injected pools, synthetic reservations, or acquire bypass.
-//! The last test uses an actual TCP listener and build_router, including an
+//! The last test uses an actual TCP listener and build_local_router, including an
 //! incomplete HTTP Content-Length upload and a later complete HTTP call.
 //! IPC endpoints have unique owner incarnations. Reply reassembly is copied
 //! into a local Vec before a public call returns; budget peaks and refunds
@@ -31,7 +31,7 @@ use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 
 use super::conn_pool::{CachedClient, UpstreamLease};
-use super::router::build_router;
+use super::router::build_local_router;
 use super::state::{RegisterCommitResult, RelayState};
 use super::test_support::{NoopDisseminator, TEST_ABI_HASH, TEST_SIGNATURE_HASH};
 use super::types::RouteEntry;
@@ -727,7 +727,7 @@ async fn actual_http_incomplete_upload_and_completed_call_refund_after_idle_clos
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let (stop_tx, stop_rx) = oneshot::channel();
-    let app = build_router(state.clone());
+    let app = build_local_router(state.clone());
     let mut http_task = tokio::spawn(async move {
         axum::serve(listener, app)
             .with_graceful_shutdown(async {

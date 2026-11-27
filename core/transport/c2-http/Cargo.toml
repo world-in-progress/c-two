@@ -12,6 +12,17 @@ default = []
 test-support = []
 relay = [
     "dep:axum",
+    "dep:c2-local-security",
+    "dep:h2",
+    "dep:hyper",
+    "dep:hyper-util",
+    "dep:http",
+    "dep:http-body-util",
+    "dep:rcgen",
+    "dep:rustls-pki-types",
+    "dep:tokio-rustls",
+    "dep:tower",
+    "dep:url",
     "dep:http-body",
     "dep:tower-http",
     "dep:c2-ipc",
@@ -49,15 +60,26 @@ c2-ipc = { version = "0.1.0", path = "../c2-ipc", optional = true }
 tracing = { version = "0.1", optional = true }
 hex = { version = "0.4", optional = true }
 getrandom = { version = "0.4", optional = true }
+h2 = { version = "0.4", optional = true }
+http = { version = "1", optional = true }
+rcgen = { version = "0.14", default-features = false, features = ["ring", "pem"], optional = true }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"], optional = true }
+tower = { version = "0.5", features = ["util"], optional = true }
+hyper = { version = "1", features = ["server", "http1"], optional = true }
+hyper-util = { version = "0.1", features = ["tokio"], optional = true }
+http-body-util = { version = "0.1", optional = true }
+rustls-pki-types = { version = "1", optional = true }
+url = { version = "2", optional = true }
+c2-local-security = { version = "0.1.0", path = "../../foundation/c2-local-security", optional = true }
 
 [dev-dependencies]
 h2 = "0.4"
 http = "1"
 rcgen = { version = "0.14", default-features = false, features = ["ring", "pem"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+tower = { version = "0.5", features = ["util"] }
 tempfile = "3"
 c2-local = { version = "0.1.0", path = "../c2-local" }
 c2-ipc = { version = "0.1.0", path = "../c2-ipc", features = ["test-support"] }
 c2-mem = { version = "0.1.0", path = "../../foundation/c2-mem" }
 c2-server = { version = "0.1.0", path = "../c2-server" }
-tower = { version = "0.5", features = ["util"] }

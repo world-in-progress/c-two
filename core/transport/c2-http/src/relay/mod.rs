@@ -51,8 +51,9 @@ pub(crate) mod client_lifecycle;
 #[cfg(test)]
 mod client_lifecycle_tests;
 pub(crate) mod conn_pool;
-pub(crate) mod connection;
 pub(crate) mod disseminator;
+#[cfg(test)]
+mod edge_tests;
 #[cfg(test)]
 mod force_leave_tests;
 pub(crate) mod forwarding;
@@ -69,13 +70,16 @@ pub(crate) mod route_table;
 pub(crate) mod router;
 pub mod server;
 pub(crate) mod state;
+pub(crate) mod stream_control;
 #[cfg(test)]
 mod stream_tests;
 pub(crate) mod streaming;
 #[cfg(test)]
 pub(crate) mod test_support;
+mod tls;
 pub(crate) mod topic_hub;
 pub(crate) mod topic_remote;
+mod transport;
 pub(crate) mod types;
 pub(crate) mod upstream_control;
 pub(crate) mod url;

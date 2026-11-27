@@ -656,7 +656,7 @@ mod tests {
             let state = crate::relay::test_support::test_state_for_client();
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let addr = listener.local_addr().unwrap();
-            let app = crate::relay::router::build_router(state);
+            let app = crate::relay::router::build_local_router(state);
             let server = tokio::spawn(async move {
                 axum::serve(
                     listener,

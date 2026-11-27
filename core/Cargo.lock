@@ -178,6 +178,7 @@ dependencies = [
  "libc",
  "sha2",
  "tempfile",
+ "url",
  "uuid",
 ]
 
@@ -196,6 +197,7 @@ name = "c2-core"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "bytes",
  "c2-config",
  "c2-contract",
  "c2-error",
@@ -207,11 +209,14 @@ dependencies = [
  "c2-wire",
  "futures-util",
  "getrandom 0.4.3",
+ "h2",
+ "http",
  "parking_lot",
  "serde_json",
  "subtle",
  "tempfile",
  "tokio",
+ "tokio-rustls",
  "uuid",
 ]
 
@@ -234,6 +239,7 @@ dependencies = [
  "c2-error",
  "c2-ipc",
  "c2-local",
+ "c2-local-security",
  "c2-mem",
  "c2-server",
  "c2-wire",
@@ -243,11 +249,15 @@ dependencies = [
  "hex",
  "http",
  "http-body",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
  "parking_lot",
  "percent-encoding",
  "rcgen",
  "reqwest",
  "rustls",
+ "rustls-pki-types",
  "serde",
  "serde_json",
  "sha2",
@@ -259,6 +269,7 @@ dependencies = [
  "tower",
  "tower-http 0.7.1",
  "tracing",
+ "url",
  "webpki-roots",
 ]
 
@@ -302,7 +313,9 @@ dependencies = [
 name = "c2-local-security"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "sha2",
+ "tempfile",
  "windows-sys 0.61.2",
 ]
 

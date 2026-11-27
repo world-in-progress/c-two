@@ -385,6 +385,123 @@ impl Drop for LocalSecurityAttributes {
     }
 }
 
+fn path_wide(path: &std::path::Path) -> io::Result<Vec<u16>> {
+    use std::os::windows::ffi::OsStrExt;
+
+    // std canonicalization supplies a verbatim absolute path for an existing
+    // parent. Keep the final name intact when creating the filesystem object.
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."));
+    let name = path.file_name().ok_or(io::ErrorKind::InvalidInput)?;
+    let absolute = std::fs::canonicalize(parent)?.join(name);
+    let mut wide: Vec<u16> = absolute.as_os_str().encode_wide().collect();
+    if wide.contains(&0) {
+        return Err(io::ErrorKind::InvalidInput.into());
+    }
+    wide.push(0);
+    Ok(wide)
+}
+
+pub(super) fn create_owner_directory(path: &std::path::Path) -> io::Result<()> {
+    use windows_sys::Win32::Storage::FileSystem::CreateDirectoryW;
+
+    let path = path_wide(path)?;
+    let mut attributes = LocalSecurityAttributes::new()?;
+    // SAFETY: the path is NUL-terminated and both arguments live through the call.
+    if unsafe { CreateDirectoryW(path.as_ptr(), attributes.as_mut_ptr()) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+pub(super) fn create_owner_file(path: &std::path::Path) -> io::Result<std::fs::File> {
+    use windows_sys::Win32::Foundation::{GENERIC_WRITE, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::Storage::FileSystem::{CREATE_NEW, CreateFileW, FILE_ATTRIBUTE_NORMAL};
+
+    let path = path_wide(path)?;
+    let mut attributes = LocalSecurityAttributes::new()?;
+    // SAFETY: the arguments live through the call and the returned handle is owned.
+    let handle = unsafe {
+        CreateFileW(
+            path.as_ptr(),
+            GENERIC_WRITE,
+            0,
+            attributes.as_mut_ptr(),
+            CREATE_NEW,
+            FILE_ATTRIBUTE_NORMAL,
+            ptr::null_mut(),
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(unsafe { std::fs::File::from_raw_handle(handle) })
+}
+
+pub(super) fn verify_owner_path(path: &std::path::Path) -> io::Result<()> {
+    use windows_sys::Win32::Security::Authorization::GetNamedSecurityInfoW;
+    use windows_sys::Win32::Security::{
+        ACCESS_ALLOWED_ACE, ACE_HEADER, GetAce, GetSecurityDescriptorControl, SE_DACL_PROTECTED,
+    };
+
+    let path = path_wide(path)?;
+    let sid = current_user_sid()?;
+    let mut owner = ptr::null_mut();
+    let mut dacl = ptr::null_mut();
+    let mut descriptor = ptr::null_mut();
+
+    // SAFETY: the path and output pointers are valid for the duration of the
+    // call. All returned security structures are owned by descriptor.
+    let status = unsafe {
+        GetNamedSecurityInfoW(
+            path.as_ptr(),
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+            &mut owner,
+            ptr::null_mut(),
+            &mut dacl,
+            ptr::null_mut(),
+            &mut descriptor,
+        )
+    };
+    if status != 0 {
+        return Err(io::Error::from_raw_os_error(status as i32));
+    }
+    let result = unsafe {
+        let mut control = 0;
+        let mut revision = 0;
+        let mut ace = ptr::null_mut();
+        let matches = !owner.is_null()
+            && !dacl.is_null()
+            && (*dacl).AceCount == 1
+            && GetSecurityDescriptorControl(descriptor, &mut control, &mut revision) != 0
+            && control & SE_DACL_PROTECTED != 0
+            && GetAce(dacl, 0, &mut ace) != 0
+            && (*ace.cast::<ACE_HEADER>()).AceType == 0
+            && (*ace.cast::<ACE_HEADER>()).AceFlags == 0;
+        if matches {
+            let ace = &*ace.cast::<ACCESS_ALLOWED_ACE>();
+            sid_to_string(owner).and_then(|owner_sid| {
+                Ok(owner_sid == sid
+                    && sid_to_string(ptr::addr_of!(ace.SidStart).cast_mut().cast())? == sid)
+            })
+        } else {
+            Ok(false)
+        }
+    };
+    unsafe { LocalFree(descriptor) };
+    if result? {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "expected a protected TokenUser-only DACL",
+        ))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

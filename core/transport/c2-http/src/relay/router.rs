@@ -1,8 +1,8 @@
 //! Axum router for the multi-upstream relay server.
 
 use std::collections::BTreeMap;
+#[cfg(test)]
 use std::convert::Infallible;
-use std::future::Future;
 use std::io::Write;
 use std::net::SocketAddr;
 use std::pin::Pin;
@@ -13,11 +13,7 @@ use std::time::Duration;
 use axum::{
     Json, Router,
     body::{Body, Bytes, HttpBody},
-    extract::{
-        ConnectInfo, DefaultBodyLimit, Extension, FromRequest, FromRequestParts, Path, Query,
-        Request, State,
-    },
-    http::request::Parts,
+    extract::{ConnectInfo, DefaultBodyLimit, Extension, FromRequest, Path, Query, Request, State},
     http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Response},
     routing::{delete, get, post},
@@ -50,6 +46,9 @@ use c2_ipc::IpcClient;
 use c2_mem::BudgetedBuffer;
 use c2_mem::{DomainBudget, MemoryReservation, PayloadBufferError};
 use tokio_util::sync::CancellationToken;
+
+use super::stream_control::ResponseStreamControl;
+use super::transport::{ListenerSurface, TransportKind};
 
 pub(super) const OUTCOME_QUERY_TIMEOUT: Duration = Duration::from_secs(5);
 const CONTROL_BODY_LIMIT_BYTES: usize = 64 * 1024;
@@ -100,50 +99,6 @@ impl IntoResponse for ResponseFailure {
 }
 
 type ResponseResult<T> = Result<T, ResponseFailure>;
-
-struct OptionalConnectInfo(Option<SocketAddr>);
-struct OptionalTopicConnection(Option<Arc<crate::relay::connection::ConnectionControl>>);
-
-impl<S> FromRequestParts<S> for OptionalTopicConnection
-where
-    S: Send + Sync,
-{
-    type Rejection = Infallible;
-    fn from_request_parts(
-        parts: &mut Parts,
-        _state: &S,
-    ) -> impl Future<Output = Result<Self, Self::Rejection>> + Send {
-        let control = parts
-            .extensions
-            .get::<ConnectInfo<crate::relay::connection::ConnectionInfo>>()
-            .map(|ConnectInfo(info)| info.control.clone());
-        std::future::ready(Ok(Self(control)))
-    }
-}
-
-impl<S> FromRequestParts<S> for OptionalConnectInfo
-where
-    S: Send + Sync,
-{
-    type Rejection = Infallible;
-
-    fn from_request_parts(
-        parts: &mut Parts,
-        _state: &S,
-    ) -> impl Future<Output = Result<Self, Self::Rejection>> + Send {
-        let remote_addr = parts
-            .extensions
-            .get::<ConnectInfo<SocketAddr>>()
-            .map(|ConnectInfo(addr)| *addr)
-            .or_else(|| {
-                parts
-                    .extensions
-                    .get::<ConnectInfo<crate::relay::connection::ConnectionInfo>>()
-                    .map(|ConnectInfo(info)| info.address)
-            });
-        std::future::ready(Ok(Self(remote_addr)))
-    }
-}
 
 fn duplicate_route_response(
     state: &RelayState,
@@ -759,21 +714,13 @@ fn validate_expected_crm_for_route(
     }
 }
 
-/// Build the relay axum router with control-plane and data-plane endpoints.
-pub fn build_router(state: Arc<RelayState>) -> Router {
+pub(crate) fn build_local_router(state: Arc<RelayState>) -> Router {
     let control_router = Router::new()
         .route("/_register", post(handle_register))
         .route("/_unregister", post(handle_unregister))
         .route("/_admin/unregister", post(handle_admin_unregister))
         .route("/_admin/force-leave", post(handle_admin_force_leave))
-        .route("/_routes", get(handle_list_routes))
-        .route("/_resolve", get(handle_resolve_query))
-        .route("/_resolve/{*name}", get(handle_resolve))
-        .route("/_probe", get(handle_probe_query))
-        .route("/_probe/{*name}", get(handle_probe))
-        .route(OUTCOME_PATH, get(query_call_handler))
         .route("/_peers", get(handle_peers))
-        .route("/_calls/{token}", delete(cancel_stream_call))
         .route("/_peer/announce", post(peer_handlers::handle_peer_announce))
         .route("/_peer/join", post(peer_handlers::handle_peer_join))
         .route("/_peer/sync", get(peer_handlers::handle_peer_sync))
@@ -787,9 +734,30 @@ pub fn build_router(state: Arc<RelayState>) -> Router {
             post(peer_handlers::handle_peer_force_leave),
         )
         .route("/_peer/digest", post(peer_handlers::handle_peer_digest))
-        .route("/health", get(handle_health))
         .layer(DefaultBodyLimit::max(CONTROL_BODY_LIMIT_BYTES));
 
+    finish_router(
+        control_router.merge(business_router()),
+        state,
+        ListenerSurface::LocalControl,
+    )
+}
+
+pub(super) fn build_edge_router(state: Arc<RelayState>) -> Router {
+    finish_router(business_router(), state, ListenerSurface::PublicEdge)
+}
+
+fn business_router() -> Router<Arc<RelayState>> {
+    let discovery = Router::new()
+        .route("/_routes", get(handle_list_routes))
+        .route("/_resolve", get(handle_resolve_query))
+        .route("/_resolve/{*name}", get(handle_resolve))
+        .route("/_probe", get(handle_probe_query))
+        .route("/_probe/{*name}", get(handle_probe))
+        .route(OUTCOME_PATH, get(query_call_handler))
+        .route("/_calls/{token}", delete(cancel_stream_call))
+        .route("/health", get(handle_health))
+        .layer(DefaultBodyLimit::max(CONTROL_BODY_LIMIT_BYTES));
     let data_router = Router::new()
         .route(KEYED_PATH, post(keyed_call_handler))
         .route(RECOVER_PATH, post(recover_call_handler))
@@ -798,10 +766,17 @@ pub fn build_router(state: Arc<RelayState>) -> Router {
         .route(TOPIC_CONFIRM_PATH, post(topic_confirm_handler))
         .layer(DefaultBodyLimit::disable());
 
-    Router::new()
-        .merge(control_router)
-        .merge(data_router)
+    discovery.merge(data_router)
+}
+
+fn finish_router(
+    router: Router<Arc<RelayState>>,
+    state: Arc<RelayState>,
+    surface: ListenerSurface,
+) -> Router {
+    router
         .with_state(state)
+        .layer(Extension(surface))
         .layer(axum::middleware::from_fn(finish_unread_body_rejection))
 }
 
@@ -817,8 +792,10 @@ async fn topic_handler(
         route: route_name,
         topic: topic_name,
     }): Query<TopicQuery>,
-    OptionalTopicConnection(connection): OptionalTopicConnection,
+    control: Option<Extension<Arc<ResponseStreamControl>>>,
+    transport: Option<Extension<TransportKind>>,
     headers: HeaderMap,
+    body: Body,
 ) -> Response {
     let expected = match expected_crm_from_headers(&route_name, &headers) {
         Ok(expected) => expected,
@@ -877,6 +854,10 @@ async fn topic_handler(
             );
         }
     };
+    if let Err(error) = validate_topic_body(transport, body).await {
+        return topic_error_response(error);
+    }
+    let stream_control = control.map(|Extension(control)| control);
     let resolved = match state.resolve_entry_matching(&expected) {
         Ok(route) => route,
         Err(error) => return route_resolution_error_response(&route_name, error),
@@ -911,7 +892,15 @@ async fn topic_handler(
             Err(error) => return forwarding_capacity_response(&route_name, error.to_string()),
         };
         return match require_send(super::topic_hub::subscribe_remote(
-            state, entry, expected, topic_name, options, metadata, permit, tracked, connection,
+            state,
+            entry,
+            expected,
+            topic_name,
+            options,
+            metadata,
+            permit,
+            tracked,
+            stream_control,
         ))
         .await
         {
@@ -967,7 +956,7 @@ async fn topic_handler(
         binding,
         permit,
         tracked,
-        connection,
+        stream_control,
         origin_only,
     ))
     .await
@@ -975,6 +964,26 @@ async fn topic_handler(
         Ok(response) => response,
         Err(error) => topic_error_response(error),
     }
+}
+
+async fn validate_topic_body(
+    transport: Option<Extension<TransportKind>>,
+    mut body: Body,
+) -> Result<(), c2_error::C2Error> {
+    if matches!(transport, Some(Extension(TransportKind::Http2))) {
+        while let Some(frame) = http_body_util::BodyExt::frame(&mut body).await {
+            match frame {
+                Ok(frame) if frame.data_ref().is_none_or(Bytes::is_empty) => {}
+                _ => {
+                    return Err(c2_error::C2Error::new(
+                        c2_error::ErrorCode::ProtocolViolation,
+                        "topic request body must be empty",
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 fn topic_error_response(mut error: c2_error::C2Error) -> Response {
@@ -1022,7 +1031,9 @@ async fn topic_confirm_handler(
         route: route_name,
         topic: topic_name,
     }): Query<TopicQuery>,
+    transport: Option<Extension<TransportKind>>,
     headers: HeaderMap,
+    body: Body,
 ) -> Response {
     use super::topic_hub::closed_confirmation;
     use super::topic_remote::{
@@ -1072,6 +1083,9 @@ async fn topic_confirm_handler(
             "invalid topic confirmation upstream token",
         ));
     };
+    if let Err(error) = validate_topic_body(transport, body).await {
+        return topic_error_response(error);
+    }
     let Some(route) = state.local_route(&route_name) else {
         return topic_error_response(closed_confirmation());
     };
@@ -1169,6 +1183,9 @@ async fn finish_unread_body_rejection(
     let length = DeclaredBodyLength(content_length_from_headers(request.headers()));
     let expect = request.headers().contains_key(header::EXPECT);
     request.extensions_mut().insert(length);
+    if request.extensions().get::<TransportKind>() == Some(&TransportKind::Http2) {
+        return next.run(request).await;
+    }
     let (parts, body) = request.into_parts();
     let unread = Arc::new(parking_lot::Mutex::new(Some(body)));
     let body = Body::new(UnreadRequestBody {
@@ -1911,19 +1928,28 @@ async fn handle_resolve(
     Path(name): Path<String>,
     Query(query): Query<ResolveQuery>,
     State(state): State<Arc<RelayState>>,
-    OptionalConnectInfo(remote_addr): OptionalConnectInfo,
+    remote_addr: Option<Extension<ConnectInfo<SocketAddr>>>,
+    Extension(surface): Extension<ListenerSurface>,
     headers: HeaderMap,
 ) -> Response {
-    resolve_route(name, query, state, remote_addr, headers)
+    resolve_route(name, query, state, remote_addr, surface, headers)
 }
 
 async fn handle_resolve_query(
     Query(query): Query<FixedResolveQuery>,
     State(state): State<Arc<RelayState>>,
-    OptionalConnectInfo(remote_addr): OptionalConnectInfo,
+    remote_addr: Option<Extension<ConnectInfo<SocketAddr>>>,
+    Extension(surface): Extension<ListenerSurface>,
     headers: HeaderMap,
 ) -> Response {
-    resolve_route(query.route, query.contract, state, remote_addr, headers)
+    resolve_route(
+        query.route,
+        query.contract,
+        state,
+        remote_addr,
+        surface,
+        headers,
+    )
 }
 
 #[derive(serde::Deserialize)]
@@ -1937,7 +1963,8 @@ fn resolve_route(
     name: String,
     query: ResolveQuery,
     state: Arc<RelayState>,
-    remote_addr: Option<SocketAddr>,
+    remote_addr: Option<Extension<ConnectInfo<SocketAddr>>>,
+    surface: ListenerSurface,
     headers: HeaderMap,
 ) -> Response {
     #[cfg(feature = "test-support")]
@@ -1962,8 +1989,9 @@ fn resolve_route(
         Some(namespace) => namespace == state.endpoint_context().namespace_id(),
         None => state.is_default_endpoint_namespace(),
     };
-    let expose_ipc_address =
-        remote_addr.is_some_and(|addr| addr.ip().is_loopback()) && compatible_namespace;
+    let expose_ipc_address = surface == ListenerSurface::LocalControl
+        && remote_addr.is_some_and(|Extension(ConnectInfo(addr))| addr.ip().is_loopback())
+        && compatible_namespace;
     let expected_crm = match (
         &query.crm_ns,
         &query.crm_name,
@@ -2003,19 +2031,26 @@ fn resolve_route(
                 .into_response();
         }
     };
-    let mut routes = match state.resolve_matching(&expected_crm) {
-        Ok(Some(route)) => vec![route],
+    let mut route = match state.resolve_entry_matching(&expected_crm) {
+        Ok(Some(entry)) => {
+            let mut route = entry.to_route_info();
+            if surface == ListenerSurface::LocalControl
+                && entry.locality == super::types::Locality::Local
+                && state.config().edge_bind.is_some()
+            {
+                route.relay_url = state.config().mesh_url();
+            }
+            route
+        }
         Ok(None) => return resource_not_found_response(&name),
         Err(error) => return route_resolution_error_response(&name, error),
     };
     if !expose_ipc_address {
-        for route in &mut routes {
-            route.ipc_address = None;
-            route.server_id = None;
-            route.server_instance_id = None;
-        }
+        route.ipc_address = None;
+        route.server_id = None;
+        route.server_instance_id = None;
     }
-    with_local_namespace_response(&state, Json(routes).into_response())
+    with_local_namespace_response(&state, Json([route]).into_response())
 }
 
 /// `GET /_peers` — list known peer relays.
@@ -3990,7 +4025,7 @@ mod tests {
         request
             .extensions_mut()
             .insert(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 1234))));
-        build_router(state).oneshot(request).await.unwrap()
+        build_local_router(state).oneshot(request).await.unwrap()
     }
 
     // This runs on Windows too: the default namespace is the current user SID,
@@ -4073,7 +4108,7 @@ mod tests {
             ("f".repeat(64), StatusCode::CONFLICT),
             ("bad".into(), StatusCode::BAD_REQUEST),
         ] {
-            let response = build_router(state.clone())
+            let response = build_local_router(state.clone())
                 .oneshot(
                     Request::builder()
                         .method("POST")
@@ -4092,7 +4127,7 @@ mod tests {
                 Some("grid-uid")
             );
         }
-        let response = build_router(state.clone())
+        let response = build_local_router(state.clone())
             .oneshot(
                 Request::builder()
                     .method("POST")
@@ -4124,7 +4159,7 @@ mod tests {
         let root = crate::relay::test_support::EndpointTestRoot::new();
         let state = namespace_test_state(root.context());
         install_namespace_test_route(&state);
-        let response = build_router(state.clone())
+        let response = build_local_router(state.clone())
             .oneshot(
                 Request::builder()
                     .method("POST")
@@ -4162,7 +4197,7 @@ mod tests {
     async fn probe_namespace_metadata_is_frozen_even_when_route_is_absent() {
         let context = c2_config::LocalEndpointContext::default_for_platform().unwrap();
         let state = namespace_test_state(context.clone());
-        let response = build_router(state)
+        let response = build_local_router(state)
             .oneshot(
                 Request::builder()
                     .uri("/_probe/grid")
@@ -4193,7 +4228,7 @@ mod tests {
         )
         .await;
         let state = namespace_test_state(context.clone());
-        let response = build_router(state.clone()).oneshot(Request::builder()
+        let response = build_local_router(state.clone()).oneshot(Request::builder()
             .method("POST").uri("/_register").header("content-type", "application/json")
             .header(LOCAL_ENDPOINT_NAMESPACE_HEADER, context.namespace_id())
             .body(Body::from(serde_json::json!({
@@ -4274,7 +4309,7 @@ mod tests {
                 Arc::new(crate::relay::test_support::NoopDisseminator),
                 context.clone(),
             ));
-            let app = build_router(state.clone());
+            let app = build_local_router(state.clone());
             relay_tasks.push(tokio::spawn(async move {
                 axum::serve(
                     listener,
@@ -4548,7 +4583,7 @@ mod tests {
         server_id: &str,
         address: &str,
     ) -> StatusCode {
-        let app = build_router(state);
+        let app = build_local_router(state);
         let response = app
             .oneshot(
                 Request::builder()
@@ -4566,7 +4601,7 @@ mod tests {
     }
 
     async fn post_register_json(state: Arc<RelayState>, body: serde_json::Value) -> StatusCode {
-        let app = build_router(state);
+        let app = build_local_router(state);
         let response = app
             .oneshot(
                 Request::builder()
@@ -4592,7 +4627,7 @@ mod tests {
         crm_name: &str,
         crm_ver: &str,
     ) -> StatusCode {
-        let app = build_router(state);
+        let app = build_local_router(state);
         let response = app
             .oneshot(
                 Request::builder()
@@ -4631,7 +4666,7 @@ mod tests {
         crm: (&str, &str, &str),
     ) -> StatusCode {
         let (crm_ns, crm_name, crm_ver) = crm;
-        let app = build_router(state);
+        let app = build_local_router(state);
         let response = app
             .oneshot(
                 Request::builder()
@@ -4688,7 +4723,7 @@ mod tests {
     }
 
     async fn post_unregister(state: Arc<RelayState>, name: &str, server_id: &str) -> StatusCode {
-        let app = build_router(state);
+        let app = build_local_router(state);
         let response = app
             .oneshot(
                 Request::builder()
@@ -4738,7 +4773,7 @@ mod tests {
 
     #[tokio::test]
     async fn retired_business_paths_return_bare_not_found() {
-        let app = build_router(test_state());
+        let app = build_local_router(test_state());
         for uri in [
             "/grid/ping",
             "/grid/_topics/state",
@@ -4765,7 +4800,7 @@ mod tests {
 
     #[tokio::test]
     async fn duplicate_call_metadata_is_rejected_on_every_call_endpoint() {
-        let app = build_router(test_state());
+        let app = build_local_router(test_state());
         for (verb, path, accept) in [
             (
                 "POST",
@@ -4822,7 +4857,7 @@ mod tests {
 
     #[tokio::test]
     async fn outcome_endpoints_check_actual_body_and_one_legal_call_id() {
-        let app = build_router(test_state());
+        let app = build_local_router(test_state());
         for (verb, path) in [
             ("POST", format!("{KEYED_PATH}?route=grid&method=ping")),
             ("POST", format!("{RECOVER_PATH}?route=grid&method=ping")),
@@ -4905,7 +4940,7 @@ mod tests {
             post_register(state.clone(), "grid", server_id, &address).await,
             StatusCode::CREATED
         );
-        let app = build_router(state.clone());
+        let app = build_local_router(state.clone());
         let send = |verb: &'static str,
                     path: &'static str,
                     route: &'static str,
@@ -4987,7 +5022,7 @@ mod tests {
     }
 
     async fn post_call(state: Arc<RelayState>, name: &str, method: &str) -> StatusCode {
-        let app = build_router(state);
+        let app = build_local_router(state);
         let response = app
             .oneshot(
                 add_expected_echo_headers(
@@ -5011,7 +5046,7 @@ mod tests {
         name: &str,
         method: &str,
     ) -> (StatusCode, Vec<u8>) {
-        let app = build_router(state);
+        let app = build_local_router(state);
         let response = app
             .oneshot(
                 add_expected_echo_headers(
@@ -5038,7 +5073,7 @@ mod tests {
         crm_name: &str,
         crm_ver: &str,
     ) -> StatusCode {
-        let app = build_router(state);
+        let app = build_local_router(state);
         let response = app
             .oneshot(
                 add_expected_crm_tag_headers(
@@ -5061,7 +5096,7 @@ mod tests {
     }
 
     async fn get_probe(state: Arc<RelayState>, name: &str) -> StatusCode {
-        let app = build_router(state);
+        let app = build_local_router(state);
         let response = app
             .oneshot(
                 add_expected_echo_headers(
@@ -5080,7 +5115,7 @@ mod tests {
     }
 
     async fn get_probe_response(state: Arc<RelayState>, name: &str) -> (StatusCode, Vec<u8>) {
-        let app = build_router(state);
+        let app = build_local_router(state);
         let response = app
             .oneshot(
                 add_expected_echo_headers(
@@ -5099,7 +5134,7 @@ mod tests {
     }
 
     async fn get_resolve_without_query(state: Arc<RelayState>, name: &str) -> StatusCode {
-        let app = build_router(state);
+        let app = build_local_router(state);
         let mut request = Request::builder()
             .method("GET")
             .uri(format!("/_resolve/{name}"))
@@ -5122,7 +5157,7 @@ mod tests {
         crm_name: &str,
         crm_ver: &str,
     ) -> StatusCode {
-        let app = build_router(state);
+        let app = build_local_router(state);
         let mut request = Request::builder()
             .method("GET")
             .uri(format!(
@@ -5141,7 +5176,7 @@ mod tests {
     }
 
     async fn get_resolve_with_query(state: Arc<RelayState>, name: &str, query: &str) -> StatusCode {
-        let app = build_router(state);
+        let app = build_local_router(state);
         let mut request = Request::builder()
             .method("GET")
             .uri(format!("/_resolve/{name}?{query}"))
@@ -5158,7 +5193,7 @@ mod tests {
     }
 
     async fn get_resolve_uri(state: Arc<RelayState>, uri: &str) -> StatusCode {
-        let app = build_router(state);
+        let app = build_local_router(state);
         let mut request = Request::builder()
             .method("GET")
             .uri(uri)
@@ -5280,7 +5315,7 @@ mod tests {
     #[tokio::test]
     async fn relay_data_plane_requires_expected_contract_headers() {
         let state = test_state();
-        let app = build_router(state);
+        let app = build_local_router(state);
         let response = app
             .oneshot(
                 Request::builder()
@@ -5305,7 +5340,7 @@ mod tests {
     #[tokio::test]
     async fn relay_probe_requires_expected_contract_headers() {
         let state = test_state();
-        let app = build_router(state);
+        let app = build_local_router(state);
         let response = app
             .oneshot(
                 Request::builder()
@@ -5340,7 +5375,7 @@ mod tests {
             StatusCode::CREATED,
         );
 
-        let app = build_router(state);
+        let app = build_local_router(state);
         let response = app
             .oneshot(
                 add_expected_echo_headers(Request::builder().method("GET").uri("/_probe/grid"))
@@ -5372,7 +5407,7 @@ mod tests {
             StatusCode::CREATED,
         );
 
-        let app = build_router(state);
+        let app = build_local_router(state);
         let response = app
             .oneshot(
                 add_expected_echo_headers(
@@ -5410,7 +5445,7 @@ mod tests {
         );
         let current_route = state.local_route("grid").expect("route registered");
 
-        let app = build_router(state);
+        let app = build_local_router(state);
         let response = app
             .oneshot(
                 add_expected_echo_headers(
@@ -5436,7 +5471,7 @@ mod tests {
     #[tokio::test]
     async fn data_plane_rejects_partial_expected_hash_headers_before_acquire() {
         let state = test_state();
-        let app = build_router(state);
+        let app = build_local_router(state);
         let response = app
             .oneshot(
                 Request::builder()
@@ -5467,7 +5502,7 @@ mod tests {
         name: &str,
         remote_addr: SocketAddr,
     ) -> (StatusCode, Vec<RouteInfo>) {
-        let app = build_router(state);
+        let app = build_local_router(state);
         let mut request = Request::builder()
             .method("GET")
             .uri(format!(
@@ -5564,7 +5599,7 @@ mod tests {
         let state = test_state();
         let too_long = "a".repeat(c2_contract::MAX_WIRE_TEXT_BYTES + 1);
         for server_instance_id in ["../bad", too_long.as_str()] {
-            let app = build_router(state.clone());
+            let app = build_local_router(state.clone());
             let response = app
                 .oneshot(
                     Request::builder()
@@ -6059,7 +6094,7 @@ mod tests {
     #[tokio::test]
     async fn oversized_control_plane_body_is_rejected() {
         let state = test_state();
-        let app = build_router(state);
+        let app = build_local_router(state);
         let oversized = serde_json::json!({
             "name": "grid",
             "server_id": "server-grid",
@@ -6105,7 +6140,7 @@ mod tests {
                 registered_at: 1000.0,
             }));
         });
-        let app = build_router(state);
+        let app = build_local_router(state);
         let stream = futures::stream::once(async {
             panic!("oversized relay request body should not be polled");
             #[allow(unreachable_code)]
@@ -6161,7 +6196,7 @@ mod tests {
                 registered_at: 1000.0,
             }));
         });
-        let app = build_router(state);
+        let app = build_local_router(state);
         for values in [
             vec![axum::http::HeaderValue::from_static("5"); 2],
             vec![axum::http::HeaderValue::from_static("not-a-number")],
@@ -6212,7 +6247,7 @@ mod tests {
             Ok::<Bytes, std::io::Error>(Bytes::from(vec![b'b'; 32 * 1024])),
             Ok::<Bytes, std::io::Error>(Bytes::from_static(b"c")),
         ]);
-        let app = build_router(state);
+        let app = build_local_router(state);
         let response = app
             .oneshot(
                 add_expected_echo_headers(
@@ -6252,7 +6287,7 @@ mod tests {
         let payload = vec![b'x'; c2_config::CHUNK_SIZE as usize + 1];
         let content_length = payload.len().to_string();
         let route = state.local_route("grid");
-        let app = build_router(state.clone());
+        let app = build_local_router(state.clone());
         let response = app
             .oneshot(
                 add_expected_echo_headers(
@@ -6364,7 +6399,7 @@ mod tests {
             StatusCode::CREATED
         );
 
-        let app = build_router(state);
+        let app = build_local_router(state);
         let response = app
             .oneshot(
                 Request::builder()
@@ -6590,7 +6625,7 @@ mod tests {
                     Bytes::from_static(b"data"),
                 )]))
             };
-            let response = build_router(state.clone())
+            let response = build_local_router(state.clone())
                 .oneshot(request.body(body).unwrap())
                 .await
                 .unwrap();
@@ -6996,7 +7031,7 @@ mod tests {
         assert_eq!(probe_json["code"], 701);
         assert!(probe_json["details"].get("dispatch_phase").is_none());
 
-        let resolve_resp = build_router(state.clone())
+        let resolve_resp = build_local_router(state.clone())
             .oneshot(
                 Request::builder()
                     .method("GET")
@@ -7081,7 +7116,7 @@ mod tests {
                 .is_none()
         );
 
-        let topic = build_router(state.clone())
+        let topic = build_local_router(state.clone())
             .oneshot(
                 add_expected_echo_headers(
                     Request::builder()
@@ -7103,7 +7138,7 @@ mod tests {
         assert_eq!(topic["code"], 719);
         assert_eq!(topic["details"]["dispatch_phase"], "pre_dispatch");
 
-        let conflict_resolve = build_router(state)
+        let conflict_resolve = build_local_router(state)
             .oneshot(
                 Request::builder()
                     .method("GET")
@@ -7250,7 +7285,7 @@ mod tests {
             .body(Body::empty())
             .unwrap()
         };
-        let first = build_router(state.clone())
+        let first = build_local_router(state.clone())
             .oneshot(subscribe("first"))
             .await
             .unwrap();
@@ -7263,7 +7298,7 @@ mod tests {
         assert!(!cancelled.is_cancelled());
 
         let (status, refused) = response_json(
-            build_router(state)
+            build_local_router(state)
                 .oneshot(subscribe("late"))
                 .await
                 .unwrap(),
@@ -7296,7 +7331,7 @@ mod tests {
     #[tokio::test]
     async fn origin_only_topic_request_for_a_remote_route_is_refused_pre_dispatch() {
         let state = state_with_live_peer_route("remote-grid", "http://127.0.0.1:18083");
-        let topic = build_router(state.clone())
+        let topic = build_local_router(state.clone())
             .oneshot(
                 add_expected_echo_headers(
                     Request::builder()
@@ -7324,7 +7359,7 @@ mod tests {
             "the refusal must name loop prevention: {json}"
         );
         // An invalid origin header value is a plain protocol violation.
-        let topic = build_router(state)
+        let topic = build_local_router(state)
             .oneshot(
                 add_expected_echo_headers(
                     Request::builder()
@@ -7363,7 +7398,10 @@ mod tests {
                 .header("content-length", "0")
                 .body(Body::empty())
                 .unwrap();
-            let response = build_router(state.clone()).oneshot(request).await.unwrap();
+            let response = build_local_router(state.clone())
+                .oneshot(request)
+                .await
+                .unwrap();
             let (status, json) = response_json(response).await;
             assert_eq!(status, StatusCode::BAD_REQUEST);
             assert_eq!(json["code"], 713);
@@ -7416,7 +7454,7 @@ mod tests {
             ("local-grid", &"0".repeat(64)),
             ("local-grid", fingerprint.as_str()),
         ] {
-            let response = build_router(state.clone())
+            let response = build_local_router(state.clone())
                 .oneshot(request(route, registration, &["1"]))
                 .await
                 .unwrap();
@@ -7426,7 +7464,7 @@ mod tests {
             assert_eq!(json["details"]["dispatch_phase"], "pre_dispatch");
         }
         for origin in [&[][..], &["1", "1"][..]] {
-            let response = build_router(state.clone())
+            let response = build_local_router(state.clone())
                 .oneshot(request("local-grid", &fingerprint, origin))
                 .await
                 .unwrap();
@@ -7445,7 +7483,7 @@ mod tests {
                     .unwrap(),
             )
             .unwrap();
-        let response = build_router(state.clone())
+        let response = build_local_router(state.clone())
             .oneshot(request("local-grid", &fingerprint, &["1", "1"]))
             .await
             .unwrap();
@@ -7774,7 +7812,7 @@ mod tests {
         );
         state.evict_connection("grid");
 
-        let app = build_router(state.clone());
+        let app = build_local_router(state.clone());
         let mut tasks = Vec::new();
         for _ in 0..16 {
             let app = app.clone();
@@ -7901,7 +7939,7 @@ mod tests {
         state.reconnect("builder", stale_client.into_shared());
         register_echo_route(&server, "builder").await;
 
-        let app = build_router(state.clone());
+        let app = build_local_router(state.clone());
         let response = app
             .oneshot(
                 add_expected_echo_headers(
@@ -8058,7 +8096,7 @@ mod tests {
         for accept in ["application/octet-stream", crate::stream_wire::MEDIA_TYPE] {
             // The preceding refusal evicted the closed carrier.
             state.reconnect("grid", stale_data_client.clone());
-            let response = build_router(state.clone())
+            let response = build_local_router(state.clone())
                 .oneshot(
                     add_expected_echo_headers(
                         Request::builder()
@@ -8237,7 +8275,7 @@ mod tests {
         state: Arc<RelayState>,
         scope: &crate::client::RelayRegistrationScope,
     ) -> StatusCode {
-        let response = build_router(state)
+        let response = build_local_router(state)
             .oneshot(
                 Request::builder()
                     .method("POST")
@@ -8322,7 +8360,7 @@ mod tests {
 
     #[tokio::test]
     async fn ordinary_registration_withdrawal_refuses_name_only_body() {
-        let response = build_router(test_state())
+        let response = build_local_router(test_state())
             .oneshot(
                 Request::builder()
                     .method("POST")

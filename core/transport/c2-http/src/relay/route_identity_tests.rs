@@ -10,7 +10,7 @@ use axum::{
 };
 use tower::ServiceExt;
 
-use super::{authority::RouteAuthority, router::build_router, test_support::*, types::*};
+use super::{authority::RouteAuthority, router::build_local_router, test_support::*, types::*};
 
 fn entry(owner: &str, locality: Locality) -> RouteEntry {
     RouteEntry {
@@ -70,7 +70,7 @@ fn relay_leave_and_delayed_announcement_never_leave_an_orphan_registration() {
                         relay_id: "relay-peer".into(),
                     },
                 );
-                build_router(leaving_state)
+                build_local_router(leaving_state)
                     .oneshot(
                         Request::post("/_peer/leave")
                             .header("content-type", "application/json")
@@ -104,7 +104,7 @@ fn relay_leave_and_delayed_announcement_never_leave_an_orphan_registration() {
         },
     );
     let response = runtime.block_on(
-        build_router(state.clone()).oneshot(
+        build_local_router(state.clone()).oneshot(
             Request::post("/_peer/announce")
                 .header("content-type", "application/json")
                 .body(Body::from(serde_json::to_vec(&announce).unwrap()))
@@ -129,7 +129,7 @@ fn relay_leave_and_delayed_announcement_never_leave_an_orphan_registration() {
     }));
     let listing = catch_unwind(AssertUnwindSafe(|| {
         runtime.block_on(
-            build_router(state.clone())
+            build_local_router(state.clone())
                 .oneshot(Request::get("/_routes").body(Body::empty()).unwrap()),
         )
     }));
@@ -162,7 +162,7 @@ async fn resolve(state: Arc<super::state::RelayState>) -> (u16, serde_json::Valu
     let uri = format!(
         "/_resolve/grid?crm_ns=test.echo&crm_name=Echo&crm_ver=0.1.0&abi_hash={TEST_ABI_HASH}&signature_hash={TEST_SIGNATURE_HASH}"
     );
-    let response = build_router(state)
+    let response = build_local_router(state)
         .oneshot(Request::get(uri).body(Body::empty()).unwrap())
         .await
         .unwrap();
@@ -408,7 +408,7 @@ async fn conflict_precedes_contract_filter_and_only_marks_live_rows() {
     });
     let (status, body) = resolve(state.clone()).await;
     assert_eq!((status, body["code"].as_u64()), (409, Some(719)));
-    let response = build_router(state.clone())
+    let response = build_local_router(state.clone())
         .oneshot(Request::get("/_routes").body(Body::empty()).unwrap())
         .await
         .unwrap();
@@ -422,7 +422,7 @@ async fn conflict_precedes_contract_filter_and_only_marks_live_rows() {
             .all(|row| row["conflict"] == true)
     );
     state.with_route_table_mut(|table| table.set_peer_status("relay-peer", PeerStatus::Dead));
-    let response = build_router(state)
+    let response = build_local_router(state)
         .oneshot(Request::get("/_routes").body(Body::empty()).unwrap())
         .await
         .unwrap();
