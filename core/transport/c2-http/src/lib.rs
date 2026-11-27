@@ -17,6 +17,10 @@ pub mod stream_wire;
 pub mod topic_wire;
 
 #[cfg(feature = "relay")]
+pub mod bridge;
+#[cfg(feature = "relay")]
+mod private_state;
+#[cfg(feature = "relay")]
 pub mod relay;
 
 mod tls;

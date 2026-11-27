@@ -21,6 +21,7 @@ use crate::relay::authority::{
 };
 use crate::relay::background::spawn_background_tasks;
 use crate::relay::gossip::{broadcast_route_announce, broadcast_route_withdraw};
+use crate::relay::iroh_transport::IrohMeshTransport;
 use crate::relay::peer::{PeerEnvelope, PeerMessage};
 use crate::relay::router;
 use crate::relay::state::{RegisterCommitResult, RelayState, UnregisterResult};
@@ -28,7 +29,7 @@ use crate::relay::tls::EdgeTls;
 use crate::relay::transport::{HttpListener, ListenerSurface};
 use c2_config::{
     ConfigResolver, ConfigSources, DomainLimitsOverrides, EnvCatalog, LocalEndpointContext,
-    LocalEndpointOptions, RelayConfig,
+    LocalEndpointOptions, RelayBridgeSpec, RelayConfig,
 };
 use c2_ipc::IpcClient;
 
@@ -226,6 +227,7 @@ pub struct RelayServer {
     local_addr: SocketAddr,
     edge_addr: Option<SocketAddr>,
     edge_cert_sha256: Option<[u8; 32]>,
+    iroh: Option<Arc<IrohMeshTransport>>,
     cmd_tx: Option<mpsc::Sender<Command>>,
     thread: Option<std::thread::JoinHandle<()>>,
     thread_stopped: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
@@ -248,6 +250,20 @@ impl RelayServer {
     /// SHA-256 of the DER-encoded edge leaf certificate.
     pub fn edge_cert_sha256(&self) -> Option<[u8; 32]> {
         self.edge_cert_sha256
+    }
+
+    /// Stable identity of the encrypted mesh endpoint.
+    pub fn iroh_endpoint_id(&self) -> Option<iroh::EndpointId> {
+        self.iroh_transport().map(IrohMeshTransport::endpoint_id)
+    }
+
+    /// Current address hints for the encrypted mesh endpoint.
+    pub fn iroh_endpoint_addr(&self) -> Option<iroh::EndpointAddr> {
+        self.iroh_transport().map(IrohMeshTransport::endpoint_addr)
+    }
+
+    pub fn iroh_transport(&self) -> Option<&IrohMeshTransport> {
+        self.iroh.as_deref()
     }
 
     /// The configured or derived business data-plane URL.
@@ -316,7 +332,9 @@ impl RelayServer {
 
     #[cfg(feature = "test-support")]
     #[doc(hidden)]
-    pub fn pause_next_topic_confirm_for_test(&self) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
+    pub fn pause_next_topic_confirm_for_test(
+        &self,
+    ) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
         let (entered_tx, entered_rx) = oneshot::channel();
         let (release_tx, release_rx) = oneshot::channel();
         assert!(
@@ -401,8 +419,8 @@ impl RelayServer {
         context: LocalEndpointContext,
         idle_timeout: Duration,
     ) -> Result<Self, String> {
-        config
-            .validate()
+        let bridge = config
+            .validate_with_bridge_spec()
             .map_err(|e| format!("Invalid relay config: {e}"))?;
 
         let listener = bind_listener(config.local_bind_addr().expect("validated --bind"))?;
@@ -426,6 +444,15 @@ impl RelayServer {
         let edge_cert_sha256 = edge_tls.as_ref().map(|tls| tls.leaf_sha256);
         let edge = edge_listener.map(|listener| (listener, edge_tls.map(|tls| tls.acceptor)));
 
+        let mesh_key = config
+            .iroh_enabled()
+            .then(|| IrohMeshTransport::load_identity(&config))
+            .transpose()?;
+        if let Some(key) = &mesh_key
+            && !config.relay_id_explicit
+        {
+            config.relay_id = RelayConfig::derive_iroh_relay_id(key.public().as_bytes());
+        }
         let domain_budget = c2_mem::DomainBudget::from_limits(&config.domain_limits);
         let config = Arc::new(config);
         let disseminator: Arc<dyn crate::relay::disseminator::Disseminator> = Arc::new(
@@ -440,7 +467,8 @@ impl RelayServer {
         ));
 
         let (cmd_tx, cmd_rx) = mpsc::channel::<Command>(64);
-        let (ready_tx, ready_rx) = oneshot::channel::<Result<(), String>>();
+        let (ready_tx, ready_rx) =
+            oneshot::channel::<Result<Option<Arc<IrohMeshTransport>>, String>>();
         let (thread_done, thread_stopped) = std::sync::mpsc::channel();
 
         let server_state = state.clone();
@@ -462,7 +490,7 @@ impl RelayServer {
                         edge,
                         server_state,
                         cmd_rx,
-                        ready_tx,
+                        (ready_tx, mesh_key.map(|key| (key, bridge))),
                         cancel_clone,
                         idle_timeout,
                     )
@@ -476,15 +504,19 @@ impl RelayServer {
             .blocking_recv()
             .map_err(|_| "Relay thread exited before ready".to_string())
             .and_then(|result| result.map_err(|e| format!("Relay failed to start: {e}")));
-        if let Err(error) = readiness {
-            let _ = thread.join();
-            return Err(error);
-        }
+        let iroh = match readiness {
+            Ok(iroh) => iroh,
+            Err(error) => {
+                let _ = thread.join();
+                return Err(error);
+            }
+        };
 
         Ok(Self {
             local_addr,
             edge_addr,
             edge_cert_sha256,
+            iroh,
             cmd_tx: Some(cmd_tx),
             thread: Some(thread),
             thread_stopped: std::sync::Mutex::new(thread_stopped),
@@ -605,7 +637,10 @@ impl RelayServer {
         edge: Option<(TcpListener, Option<tokio_rustls::TlsAcceptor>)>,
         state: Arc<RelayState>,
         mut cmd_rx: mpsc::Receiver<Command>,
-        ready_tx: oneshot::Sender<Result<(), String>>,
+        (ready_tx, mesh): (
+            oneshot::Sender<Result<Option<Arc<IrohMeshTransport>>, String>>,
+            Option<(iroh::SecretKey, Option<RelayBridgeSpec>)>,
+        ),
         cancel: CancellationToken,
         idle_timeout: Duration,
     ) {
@@ -641,10 +676,22 @@ impl RelayServer {
             }
         };
 
+        let iroh = match mesh {
+            Some((key, bridge)) => match IrohMeshTransport::bind(state.config(), key, bridge).await
+            {
+                Ok(transport) => Some(Arc::new(transport)),
+                Err(error) => {
+                    let _ =
+                        ready_tx.send(Err(format!("Failed to bind iroh mesh endpoint: {error}")));
+                    return;
+                }
+            },
+            None => None,
+        };
         // Native cleanup observation must exist before readiness or commands.
         let clients = state.clients.clone();
         let client_observer = tokio::spawn(async move { clients.run().await });
-        let _ = ready_tx.send(Ok(()));
+        let _ = ready_tx.send(Ok(iroh.clone()));
 
         // Spawn background tasks (heartbeat, failure detection, anti-entropy, etc.)
         let bg_handles = spawn_background_tasks(state.clone(), cancel.clone());
@@ -653,6 +700,11 @@ impl RelayServer {
         let mut http_servers = tokio::task::JoinSet::new();
         for (listener, driver) in listeners {
             http_servers.spawn(driver.serve(listener, http_stop.clone()));
+        }
+        if let Some(iroh) = iroh {
+            let app = router::build_mesh_router(state.clone());
+            let stop = http_stop.clone();
+            http_servers.spawn(async move { iroh.serve(app, stop).await });
         }
         let sweeper = Self::idle_sweeper(state.clone(), idle_timeout);
 

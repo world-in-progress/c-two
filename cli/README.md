@@ -13,6 +13,7 @@ This guide covers the native c3 interface. Configuration is documented in the [c
 `c3` owns product-level runtime commands:
 
 - `c3 relay` starts the HTTP relay used for cross-machine discovery.
+- `c3 bridge` starts a private rendezvous and encrypted packet forwarding server for iroh relay peers.
 - `c3 registry list-routes` lists route names registered with a relay.
 - `c3 registry peers` lists peer relays known by a mesh relay.
 - `c3 registry force-leave` makes a mesh relay forget an unreachable relay.
@@ -79,7 +80,7 @@ The output contains C-Two contract/release/composition metadata, the target-spec
 
 ## Configuration
 
-Relay startup and `--dry-run` use the same Rust configuration resolver and capture the environment catalog once per invocation. Set `C2_ENV_FILE` to load a different file from the default `.env` in the current directory, or set it to an empty string to disable file loading.
+Relay and bridge startup and `--dry-run` use the same Rust configuration resolver and capture the environment catalog once per invocation. Set `C2_ENV_FILE` to load a different file from the default `.env` in the current directory, or set it to an empty string to disable file loading.
 
 ```bash
 C2_ENV_FILE=relay.env c3 relay --dry-run
@@ -112,10 +113,13 @@ Useful options:
 | `--tls-cert`, `--tls-key` | `C2_RELAY_TLS_CERT`, `C2_RELAY_TLS_KEY` | unset | Edge PEM certificate chain and private key. Supply both. |
 | `--tls-auto` | `C2_RELAY_TLS_AUTO` | false | Select a persistent self-signed certificate, including on loopback. |
 | `--tls-san` | `C2_RELAY_TLS_SAN` | empty | Comma-separated additional DNS names and IP addresses for automatic TLS. |
-| `--state-dir` | `C2_RELAY_STATE_DIR` | `~/.c3-relay` | Private directory for the generated edge certificate and key. Create its parent before startup. |
+| `--state-dir` | `C2_RELAY_STATE_DIR` | `~/.c3-relay` | Private directory for generated edge TLS credentials and the mesh endpoint key. Create its parent before startup. |
 | `--insecure-plaintext` | `C2_RELAY_INSECURE_PLAINTEXT` | false | Explicitly allow a non-loopback plaintext edge. |
-| `--seeds`, `-s` | `C2_RELAY_SEEDS` | empty | Comma-separated seed relay URLs for mesh mode. |
-| `--relay-id` | `C2_RELAY_ID` | generated | Stable relay identifier for the mesh protocol. |
+| `--seeds`, `-s` | `C2_RELAY_SEEDS` | empty | Comma-separated HTTP URLs or iroh seed addresses. |
+| `--bridge` | `C2_RELAY_BRIDGE` | unset | Private HTTPS bridge URL with optional certificate pin and QUIC address discovery port. |
+| `--bridge-token` | `C2_RELAY_BRIDGE_TOKEN` | unset | Required with a bridge. Printable ASCII without whitespace. |
+| `--cluster-secret` | `C2_RELAY_CLUSTER_SECRET` | unset | Shared secret for iroh peer authentication. Required with a bridge or iroh seed and distinct from the bridge token. |
+| `--relay-id` | `C2_RELAY_ID` | generated | Stable relay identifier. With iroh enabled, the default derives from the persistent endpoint key. |
 | `--advertise-url` | `C2_RELAY_ADVERTISE_URL` | derived from the bound address | Public URL clients use for this relay, including a reverse proxy URL. |
 | `--ipc-root` | `C2_IPC_ROOT` | `/tmp/c2-v3-<uidhex>` (Unix) | Final owner-controlled endpoint directory; custom directories are application-provisioned, and `0755` is accepted when other identities cannot modify them. Not applicable on Windows, where upstream IPC uses TokenUser-scoped Named Pipes. |
 | `--memory-budget-bytes` | `C2_MEMORY_BUDGET_BYTES` | 16 GiB | Memory for the relay's business forwarding and upstream IPC storage. Zero closes new forwarding admission. |
@@ -155,6 +159,24 @@ The relay evicts unreferenced upstream IPC connections after 60 seconds without 
 When running normally, `c3 relay` installs a Ctrl+C handler and stops the relay cleanly on interrupt.
 
 `c3 relay` also serves resource-owned topic subscriptions ([ADR 0005](../docs/decisions/0005-publish-subscribe.md)). Each local route's declared topics become available at `POST /_c2/topics/subscribe?route=<pct>&topic=<pct>` with `application/vnd.c-two.topic-stream;version=2`. The relay opens one shared upstream IPC subscription per registration and topic and fans out a single budgeted copy to all downstream HTTP subscribers, including across two-tier cross-relay hops. Ctrl+C ends forwarded subscriptions with `CallCancelled` naming relay shutdown after the frame each subscriber already selected. See [relay topic forwarding](../docs/reference/contracts-and-routing.md#relay-topic-forwarding).
+
+## Bridge
+
+Run `c3 bridge` on a reachable machine to give relay endpoints a common place to discover addresses and forward encrypted packets when a direct link is unavailable. It accepts authenticated bridge clients over HTTPS and offers QUIC address discovery over UDP. It holds the bridge token and TLS identity.
+
+| Option | Environment | Default |
+|---|---|---|
+| `--bind` | `C2_BRIDGE_BIND` | `0.0.0.0:8443` |
+| `--quic-bind` | `C2_BRIDGE_QUIC_BIND` | `0.0.0.0:7842`, set `off` to disable |
+| `--tls-cert`, `--tls-key` | `C2_BRIDGE_TLS_CERT`, `C2_BRIDGE_TLS_KEY` | Generated self-signed identity. Supply both for an explicit PEM chain and key. |
+| `--state-dir` | `C2_BRIDGE_STATE_DIR` | `~/.c3-bridge` |
+| `--token` | `C2_BRIDGE_TOKEN` | Generated and persisted; an explicit token must be printable ASCII without whitespace |
+
+Start the bridge, copy the printed `--bridge` URL, replace `<HOST>` with a reachable address when present, and share its token with relay operators. A generated bridge identity uses `bridge-cert.pem` and `bridge-key.pem`. The generated token is stored in `bridge-token` as 64 lowercase hex digits. The owner-only directory and files persist across restarts. Supply `--dry-run` to resolve settings without opening sockets or generating files. Dry-run prints `token=explicit` or `token=auto`. Ctrl+C stops the server.
+
+A relay uses `--bridge 'https://host:8443?pin=<64-lower-hex>&quic=off'` with the bridge token. Omit `pin` for a publicly trusted certificate. The default address discovery port is 7842. Set `quic=<port>` for another port or `quic=off` to disable it. Keep the cluster secret on the relays so they can authenticate each other end to end. Relay dry-run reports both credentials as set or unset.
+
+Relay startup stores `mesh-key.ed25519` in its private state directory and prints an `iroh://<endpoint-id>` seed. A direct seed without a bridge requires `@<ip:port>`. The endpoint serves authenticated control and data requests on separate QUIC connections. The current Mesh 8 route table still bootstraps and exchanges routes over HTTP seeds. Mesh 8 peer messages over iroh must use the sender ID derived from the endpoint key.
 
 ## Local endpoint maintenance
 

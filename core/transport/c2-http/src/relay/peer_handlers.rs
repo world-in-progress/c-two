@@ -2,7 +2,14 @@
 
 use std::sync::Arc;
 
-use axum::{Json, extract::State, http::StatusCode, response::IntoResponse};
+use axum::{
+    Json,
+    extract::{FromRequest, Request, State},
+    http::StatusCode,
+    response::{IntoResponse, Response},
+};
+
+use super::iroh_transport::AuthenticatedIrohPeer;
 
 use crate::relay::authority::RouteAuthority;
 use crate::relay::peer::{
@@ -11,6 +18,29 @@ use crate::relay::peer::{
 };
 use crate::relay::state::RelayState;
 use crate::relay::types::*;
+
+/// Bind the Mesh 8 sender label to its authenticated transport identity.
+pub(super) struct PeerRequest(pub(super) PeerEnvelope);
+
+impl<S: Send + Sync> FromRequest<S> for PeerRequest {
+    type Rejection = Response;
+
+    async fn from_request(request: Request, state: &S) -> Result<Self, Self::Rejection> {
+        let peer = request.extensions().get::<AuthenticatedIrohPeer>().copied();
+        let Json(envelope) = Json::<PeerEnvelope>::from_request(request, state)
+            .await
+            .map_err(IntoResponse::into_response)?;
+        // Mesh 8 has no endpoint identity field for configured relay aliases.
+        // Over iroh it can only prove the label derived from the endpoint key.
+        if let Some(peer) = peer
+            && envelope.sender_relay_id
+                != c2_config::RelayConfig::derive_iroh_relay_id(peer.endpoint_id.as_bytes())
+        {
+            return Err(StatusCode::FORBIDDEN.into_response());
+        }
+        Ok(Self(envelope))
+    }
+}
 
 fn current_full_sync_envelope(state: &RelayState) -> FullSyncEnvelope {
     let mut snapshot = state.full_snapshot();
@@ -63,9 +93,9 @@ fn valid_peer_relay_url(url: &str) -> bool {
 }
 
 /// POST /_peer/announce — receive RouteAnnounce or RouteWithdraw
-pub async fn handle_peer_announce(
+pub(super) async fn handle_peer_announce(
     State(state): State<Arc<RelayState>>,
-    Json(envelope): Json<PeerEnvelope>,
+    PeerRequest(envelope): PeerRequest,
 ) -> impl IntoResponse {
     if !check_protocol_version(&envelope) {
         return StatusCode::OK;
@@ -139,9 +169,9 @@ pub async fn handle_peer_announce(
 }
 
 /// POST /_peer/join — a new relay wants to join
-pub async fn handle_peer_join(
+pub(super) async fn handle_peer_join(
     State(state): State<Arc<RelayState>>,
-    Json(envelope): Json<PeerEnvelope>,
+    PeerRequest(envelope): PeerRequest,
 ) -> impl IntoResponse {
     if !check_protocol_version(&envelope) {
         return (
@@ -184,14 +214,14 @@ pub async fn handle_peer_join(
 }
 
 /// GET /_peer/sync — return full route table + peer list
-pub async fn handle_peer_sync(State(state): State<Arc<RelayState>>) -> impl IntoResponse {
+pub(super) async fn handle_peer_sync(State(state): State<Arc<RelayState>>) -> impl IntoResponse {
     Json(current_full_sync_envelope(&state))
 }
 
 /// POST /_peer/heartbeat — periodic liveness check
-pub async fn handle_peer_heartbeat(
+pub(super) async fn handle_peer_heartbeat(
     State(state): State<Arc<RelayState>>,
-    Json(envelope): Json<PeerEnvelope>,
+    PeerRequest(envelope): PeerRequest,
 ) -> impl IntoResponse {
     if !check_protocol_version(&envelope) {
         return StatusCode::OK;
@@ -222,9 +252,9 @@ pub async fn handle_peer_heartbeat(
 }
 
 /// POST /_peer/leave — graceful departure
-pub async fn handle_peer_leave(
+pub(super) async fn handle_peer_leave(
     State(state): State<Arc<RelayState>>,
-    Json(envelope): Json<PeerEnvelope>,
+    PeerRequest(envelope): PeerRequest,
 ) -> impl IntoResponse {
     if !check_protocol_version(&envelope) {
         return StatusCode::OK;
@@ -249,9 +279,9 @@ pub async fn handle_peer_leave(
 }
 
 /// POST /_peer/force-leave — a deployer declaration forwarded by a live peer
-pub async fn handle_peer_force_leave(
+pub(super) async fn handle_peer_force_leave(
     State(state): State<Arc<RelayState>>,
-    Json(envelope): Json<PeerEnvelope>,
+    PeerRequest(envelope): PeerRequest,
 ) -> impl IntoResponse {
     let Ok(ValidatedRouteStateEnvelope::Message(envelope)) =
         validate_route_state_envelope(envelope, None)
@@ -267,9 +297,9 @@ pub async fn handle_peer_force_leave(
 }
 
 /// POST /_peer/digest — anti-entropy digest exchange
-pub async fn handle_peer_digest(
+pub(super) async fn handle_peer_digest(
     State(state): State<Arc<RelayState>>,
-    Json(envelope): Json<PeerEnvelope>,
+    PeerRequest(envelope): PeerRequest,
 ) -> impl IntoResponse {
     if !check_protocol_version(&envelope) {
         return StatusCode::OK.into_response();
@@ -471,7 +501,7 @@ mod tests {
             },
         );
 
-        let response = handle_peer_announce(State(state.clone()), Json(envelope))
+        let response = handle_peer_announce(State(state.clone()), PeerRequest(envelope))
             .await
             .into_response();
 
@@ -500,7 +530,7 @@ mod tests {
             },
         );
 
-        let response = handle_peer_announce(State(state.clone()), Json(envelope))
+        let response = handle_peer_announce(State(state.clone()), PeerRequest(envelope))
             .await
             .into_response();
 
@@ -530,7 +560,7 @@ mod tests {
             },
         );
 
-        let response = handle_peer_announce(State(state.clone()), Json(envelope))
+        let response = handle_peer_announce(State(state.clone()), PeerRequest(envelope))
             .await
             .into_response();
 
@@ -572,7 +602,7 @@ mod tests {
                 },
             );
 
-            let response = handle_peer_announce(State(state.clone()), Json(envelope))
+            let response = handle_peer_announce(State(state.clone()), PeerRequest(envelope))
                 .await
                 .into_response();
 
@@ -605,7 +635,7 @@ mod tests {
             },
         );
 
-        let response = handle_peer_announce(State(state.clone()), Json(envelope))
+        let response = handle_peer_announce(State(state.clone()), PeerRequest(envelope))
             .await
             .into_response();
 
@@ -637,7 +667,7 @@ mod tests {
             },
         );
 
-        let response = handle_peer_announce(State(state.clone()), Json(envelope))
+        let response = handle_peer_announce(State(state.clone()), PeerRequest(envelope))
             .await
             .into_response();
 
@@ -658,7 +688,7 @@ mod tests {
                 },
             );
             envelope.protocol_version = protocol_version;
-            let response = handle_peer_join(State(state.clone()), Json(envelope))
+            let response = handle_peer_join(State(state.clone()), PeerRequest(envelope))
                 .await
                 .into_response();
             assert_eq!(response.status(), StatusCode::OK);
@@ -681,7 +711,7 @@ mod tests {
             },
         );
 
-        let response = handle_peer_join(State(state.clone()), Json(envelope))
+        let response = handle_peer_join(State(state.clone()), PeerRequest(envelope))
             .await
             .into_response();
 
@@ -734,7 +764,7 @@ mod tests {
             },
         );
 
-        let response = handle_peer_join(State(state.clone()), Json(envelope))
+        let response = handle_peer_join(State(state.clone()), PeerRequest(envelope))
             .await
             .into_response();
 
@@ -756,7 +786,7 @@ mod tests {
             },
         );
 
-        let response = handle_peer_heartbeat(State(state.clone()), Json(envelope))
+        let response = handle_peer_heartbeat(State(state.clone()), PeerRequest(envelope))
             .await
             .into_response();
 
@@ -782,7 +812,7 @@ mod tests {
             },
         );
 
-        let response = handle_peer_heartbeat(State(state.clone()), Json(envelope))
+        let response = handle_peer_heartbeat(State(state.clone()), PeerRequest(envelope))
             .await
             .into_response();
 
@@ -829,7 +859,7 @@ mod tests {
         );
         envelope.protocol_version = crate::relay::peer::PROTOCOL_VERSION - 1;
 
-        let response = handle_peer_leave(State(state.clone()), Json(envelope))
+        let response = handle_peer_leave(State(state.clone()), PeerRequest(envelope))
             .await
             .into_response();
 
@@ -873,7 +903,7 @@ mod tests {
         );
         envelope.protocol_version = crate::relay::peer::PROTOCOL_VERSION - 1;
 
-        let response = handle_peer_announce(State(state.clone()), Json(envelope))
+        let response = handle_peer_announce(State(state.clone()), PeerRequest(envelope))
             .await
             .into_response();
 
@@ -900,7 +930,7 @@ mod tests {
         );
         envelope.protocol_version = crate::relay::peer::PROTOCOL_VERSION - 1;
 
-        let response = handle_peer_digest(State(state.clone()), Json(envelope))
+        let response = handle_peer_digest(State(state.clone()), PeerRequest(envelope))
             .await
             .into_response();
 
@@ -941,7 +971,7 @@ mod tests {
         );
         envelope.protocol_version = crate::relay::peer::PROTOCOL_VERSION - 1;
 
-        let response = handle_peer_digest(State(state.clone()), Json(envelope))
+        let response = handle_peer_digest(State(state.clone()), PeerRequest(envelope))
             .await
             .into_response();
 
@@ -984,7 +1014,7 @@ mod tests {
             },
         );
 
-        let response = handle_peer_announce(State(state.clone()), Json(envelope))
+        let response = handle_peer_announce(State(state.clone()), PeerRequest(envelope))
             .await
             .into_response();
 
@@ -1003,7 +1033,7 @@ mod tests {
             },
         );
 
-        let response = handle_peer_join(State(state.clone()), Json(envelope))
+        let response = handle_peer_join(State(state.clone()), PeerRequest(envelope))
             .await
             .into_response();
 
@@ -1026,7 +1056,7 @@ mod tests {
                 },
             );
 
-            let response = handle_peer_join(State(state.clone()), Json(envelope))
+            let response = handle_peer_join(State(state.clone()), PeerRequest(envelope))
                 .await
                 .into_response();
             let status = response.status();
@@ -1066,7 +1096,7 @@ mod tests {
                     ],
                 },
             );
-            let response = handle_peer_digest(State(state.clone()), Json(envelope))
+            let response = handle_peer_digest(State(state.clone()), PeerRequest(envelope))
                 .await
                 .into_response();
             assert_eq!(response.status(), StatusCode::OK);
@@ -1091,7 +1121,7 @@ mod tests {
             },
         );
 
-        let response = handle_peer_digest(State(state.clone()), Json(envelope))
+        let response = handle_peer_digest(State(state.clone()), PeerRequest(envelope))
             .await
             .into_response();
 
@@ -1118,7 +1148,7 @@ mod tests {
             },
         );
 
-        let response = handle_peer_digest(State(state.clone()), Json(envelope))
+        let response = handle_peer_digest(State(state.clone()), PeerRequest(envelope))
             .await
             .into_response();
 
@@ -1175,7 +1205,7 @@ mod tests {
         );
         let envelope = PeerEnvelope::new("relay-b", PeerMessage::DigestExchange { digest: vec![] });
 
-        let response = handle_peer_digest(State(state), Json(envelope))
+        let response = handle_peer_digest(State(state), PeerRequest(envelope))
             .await
             .into_response();
         let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
@@ -1212,7 +1242,7 @@ mod tests {
             },
         );
 
-        let response = handle_peer_digest(State(state.clone()), Json(envelope))
+        let response = handle_peer_digest(State(state.clone()), PeerRequest(envelope))
             .await
             .into_response();
         let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
@@ -1251,7 +1281,7 @@ mod tests {
             },
         );
 
-        let response = handle_peer_digest(State(state.clone()), Json(envelope))
+        let response = handle_peer_digest(State(state.clone()), PeerRequest(envelope))
             .await
             .into_response();
 
@@ -1293,13 +1323,13 @@ mod tests {
 
         // Other peer endpoints must acknowledge and ignore a valid digest diff.
         for response in [
-            handle_peer_announce(State(state.clone()), Json(envelope.clone()))
+            handle_peer_announce(State(state.clone()), PeerRequest(envelope.clone()))
                 .await
                 .into_response(),
-            handle_peer_heartbeat(State(state.clone()), Json(envelope.clone()))
+            handle_peer_heartbeat(State(state.clone()), PeerRequest(envelope.clone()))
                 .await
                 .into_response(),
-            handle_peer_leave(State(state.clone()), Json(envelope.clone()))
+            handle_peer_leave(State(state.clone()), PeerRequest(envelope.clone()))
                 .await
                 .into_response(),
         ] {
@@ -1308,7 +1338,7 @@ mod tests {
             assert_eq!(tombstone_count(&state), 0);
         }
 
-        let response = handle_peer_digest(State(state.clone()), Json(envelope))
+        let response = handle_peer_digest(State(state.clone()), PeerRequest(envelope))
             .await
             .into_response();
 

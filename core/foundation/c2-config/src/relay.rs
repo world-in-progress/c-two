@@ -1,5 +1,7 @@
 //! Relay server configuration.
 
+use crate::{IrohSeedAddr, RelayBridgeSpec, bridge::valid_token};
+use std::fmt;
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::time::Duration;
@@ -12,7 +14,7 @@ pub enum RelayEdgeTlsMode {
 }
 
 /// Configuration for the relay server.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct RelayConfig {
     /// Capacity shared by this relay's data plane.
     pub domain_limits: crate::DomainLimits,
@@ -28,6 +30,11 @@ pub struct RelayConfig {
     pub insecure_plaintext: bool,
     /// Stable relay identifier. Default: "{hostname}_{pid}_{uuid8}".
     pub relay_id: String,
+    /// A configured identity takes precedence over the persistent endpoint identity.
+    pub relay_id_explicit: bool,
+    pub bridge: Option<String>,
+    pub bridge_token: Option<String>,
+    pub cluster_secret: Option<String>,
     /// Publicly reachable URL of this relay (e.g. "http://node1:8080").
     /// May name an external reverse proxy.
     pub advertise_url: String,
@@ -58,6 +65,10 @@ impl Default for RelayConfig {
             state_dir: None,
             insecure_plaintext: false,
             relay_id: Self::generate_relay_id(),
+            relay_id_explicit: false,
+            bridge: None,
+            bridge_token: None,
+            cluster_secret: None,
             advertise_url: String::new(),
             seeds: Vec::new(),
             heartbeat_interval: Duration::from_secs(5),
@@ -69,8 +80,71 @@ impl Default for RelayConfig {
     }
 }
 
+impl fmt::Debug for RelayConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RelayConfig")
+            .field("bind", &self.bind)
+            .field("edge_bind", &self.edge_bind)
+            .field("relay_id", &self.relay_id)
+            .field("advertise_url", &self.advertise_url)
+            .field("seeds", &self.seeds)
+            .field("iroh_enabled", &self.iroh_enabled())
+            .finish_non_exhaustive()
+    }
+}
+
 impl RelayConfig {
+    pub fn iroh_enabled(&self) -> bool {
+        self.bridge.is_some()
+            || self.cluster_secret.is_some()
+            || self.seeds.iter().any(|seed| seed.starts_with("iroh://"))
+    }
+
+    pub fn derive_iroh_relay_id(endpoint_id: &[u8; 32]) -> String {
+        format!("iroh-{}", hex::encode(&endpoint_id[..8]))
+    }
+
+    fn validate_iroh(&self) -> Result<Option<RelayBridgeSpec>, String> {
+        let bridge = self
+            .bridge
+            .as_deref()
+            .map(RelayBridgeSpec::parse)
+            .transpose()?;
+        if bridge.is_some() {
+            if !self.bridge_token.as_deref().is_some_and(valid_token) {
+                return Err(
+                    "--bridge requires --bridge-token with printable ASCII and no whitespace"
+                        .into(),
+                );
+            }
+        } else if self.bridge_token.is_some() {
+            return Err("--bridge-token requires --bridge".into());
+        }
+        if self.iroh_enabled()
+            && self
+                .cluster_secret
+                .as_deref()
+                .is_none_or(|s| s.trim().is_empty())
+        {
+            return Err("iroh requires a nonempty --cluster-secret".into());
+        }
+        if self.bridge_token.is_some() && self.bridge_token == self.cluster_secret {
+            return Err("--cluster-secret and --bridge-token must differ".into());
+        }
+        for seed in self.seeds.iter().filter(|seed| seed.starts_with("iroh://")) {
+            if IrohSeedAddr::parse(seed)?.direct_addr.is_none() && self.bridge.is_none() {
+                return Err("iroh seeds without --bridge require a direct @<SocketAddr>".into());
+            }
+        }
+        Ok(bridge)
+    }
+
     pub fn validate(&self) -> Result<(), String> {
+        self.validate_with_bridge_spec().map(|_| ())
+    }
+
+    /// Validate startup settings and retain the parsed bridge URL for the endpoint.
+    pub fn validate_with_bridge_spec(&self) -> Result<Option<RelayBridgeSpec>, String> {
         crate::validate_relay_id(&self.relay_id)?;
         if !listener_address(&self.bind).is_some_and(|addr| addr.ip().is_loopback()) {
             return Err(
@@ -78,6 +152,7 @@ impl RelayConfig {
                     .into(),
             );
         }
+        let bridge = self.validate_iroh()?;
         self.edge_tls_mode()?;
         if !self.advertise_url.is_empty() {
             let valid = url::Url::parse(&self.advertise_url)
@@ -100,7 +175,8 @@ impl RelayConfig {
         }
         self.domain_limits
             .validate()
-            .map_err(|error| error.to_string())
+            .map_err(|error| error.to_string())?;
+        Ok(bridge)
     }
 
     pub fn generate_relay_id() -> String {
@@ -167,7 +243,7 @@ impl RelayConfig {
                 || self.tls_auto
                 || self.insecure_plaintext
                 || !self.tls_san.is_empty()
-                || self.state_dir.is_some()
+                || (self.state_dir.is_some() && !self.iroh_enabled())
             {
                 return Err("edge TLS settings require --edge-bind".into());
             }

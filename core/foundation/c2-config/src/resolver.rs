@@ -6,7 +6,7 @@ use std::str::FromStr;
 use std::time::{Duration, Instant};
 
 use crate::{
-    ConfigField, DEFAULT_FILE_SPILL_BUDGET_BYTES, DEFAULT_MEMORY_BUDGET_BYTES,
+    BridgeConfig, ConfigField, DEFAULT_FILE_SPILL_BUDGET_BYTES, DEFAULT_MEMORY_BUDGET_BYTES,
     DEFAULT_SERVER_STARTUP_TIMEOUT, DomainLimits, DomainLimitsOverrides, DomainLimitsPatch,
     LocalEndpointContext, LocalEndpointOptions, RelayConfig, ServerIpcConfig, deadline_after,
     default_max_outstanding_calls, validate_server_id,
@@ -38,7 +38,17 @@ const RELAY_USE_PROXY: &str = "C2_RELAY_USE_PROXY";
 const RELAY_CA_CERT: &str = "C2_RELAY_CA_CERT";
 const RELAY_CERT_SHA256: &str = "C2_RELAY_CERT_SHA256";
 
-const ENV_KEYS: [&str; 24] = [
+const RELAY_BRIDGE: &str = "C2_RELAY_BRIDGE";
+const RELAY_BRIDGE_TOKEN: &str = "C2_RELAY_BRIDGE_TOKEN";
+const RELAY_CLUSTER_SECRET: &str = "C2_RELAY_CLUSTER_SECRET";
+const BRIDGE_BIND: &str = "C2_BRIDGE_BIND";
+const BRIDGE_QUIC_BIND: &str = "C2_BRIDGE_QUIC_BIND";
+const BRIDGE_TLS_CERT: &str = "C2_BRIDGE_TLS_CERT";
+const BRIDGE_TLS_KEY: &str = "C2_BRIDGE_TLS_KEY";
+const BRIDGE_STATE_DIR: &str = "C2_BRIDGE_STATE_DIR";
+const BRIDGE_TOKEN: &str = "C2_BRIDGE_TOKEN";
+
+const ENV_KEYS: &[&str] = &[
     ENV_FILE,
     RELAY_ANCHOR,
     IPC_ROOT,
@@ -63,6 +73,15 @@ const ENV_KEYS: [&str; 24] = [
     RELAY_USE_PROXY,
     RELAY_CA_CERT,
     RELAY_CERT_SHA256,
+    RELAY_BRIDGE,
+    RELAY_BRIDGE_TOKEN,
+    RELAY_CLUSTER_SECRET,
+    BRIDGE_BIND,
+    BRIDGE_QUIC_BIND,
+    BRIDGE_TLS_CERT,
+    BRIDGE_TLS_KEY,
+    BRIDGE_STATE_DIR,
+    BRIDGE_TOKEN,
 ];
 
 pub type EnvMap = BTreeMap<String, OsString>;
@@ -92,7 +111,8 @@ impl ConfigSources {
         Self {
             env_file: EnvFilePolicy::FromC2EnvFile,
             process_env: ENV_KEYS
-                .into_iter()
+                .iter()
+                .copied()
                 .filter_map(|key| std::env::var_os(key).map(|value| (key.into(), value)))
                 .collect(),
         }
@@ -125,8 +145,14 @@ impl EnvCatalog {
                 Ok(iter) => {
                     for item in iter {
                         let (key, value) = item.map_err(|error| {
+                            let reason = match error {
+                                dotenvy::Error::LineParse(_, index) => {
+                                    format!("invalid entry at offset {index}")
+                                }
+                                error => error.to_string(),
+                            };
                             ConfigError::new(format!(
-                                "failed to parse env file {}: {error}",
+                                "failed to parse env file {}: {reason}",
                                 path.display()
                             ))
                         })?;
@@ -186,6 +212,17 @@ impl EnvCatalog {
     }
 }
 
+fn override_raw(
+    explicit: Option<String>,
+    key: &str,
+    catalog: &EnvCatalog,
+) -> Result<Option<String>, ConfigError> {
+    match explicit {
+        Some(value) => Ok(Some(value)),
+        None => Ok(catalog.raw(key)?.map(str::to_owned)),
+    }
+}
+
 fn nonempty(value: &str) -> Option<&str> {
     let value = value.trim();
     (!value.is_empty()).then_some(value)
@@ -226,7 +263,17 @@ fn catalog_path(
     }
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
+pub struct BridgeConfigOverrides {
+    pub bind: Option<String>,
+    pub quic_bind: Option<String>,
+    pub tls_cert: Option<PathBuf>,
+    pub tls_key: Option<PathBuf>,
+    pub state_dir: Option<PathBuf>,
+    pub token: Option<String>,
+}
+
+#[derive(Clone, Default)]
 pub struct RelayConfigOverrides {
     pub bind: Option<String>,
     pub edge_bind: Option<String>,
@@ -237,10 +284,25 @@ pub struct RelayConfigOverrides {
     pub state_dir: Option<PathBuf>,
     pub insecure_plaintext: Option<bool>,
     pub relay_id: Option<String>,
+    pub bridge: Option<String>,
+    pub bridge_token: Option<String>,
+    pub cluster_secret: Option<String>,
     pub advertise_url: Option<String>,
     pub seeds: Option<Vec<String>>,
     pub use_proxy: Option<bool>,
     pub domain_limits: DomainLimitsOverrides,
+}
+
+impl fmt::Debug for RelayConfigOverrides {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RelayConfigOverrides")
+            .field("bind", &self.bind)
+            .field("edge_bind", &self.edge_bind)
+            .field("relay_id", &self.relay_id)
+            .field("bridge_token_set", &self.bridge_token.is_some())
+            .field("cluster_secret_set", &self.cluster_secret.is_some())
+            .finish_non_exhaustive()
+    }
 }
 
 /// Trust policy for a relay HTTPS connection.
@@ -404,6 +466,25 @@ impl ConfigResolver {
         })
     }
 
+    pub fn resolve_bridge(
+        overrides: BridgeConfigOverrides,
+        catalog: &EnvCatalog,
+    ) -> Result<BridgeConfig, ConfigError> {
+        let defaults = BridgeConfig::default();
+        let config = BridgeConfig {
+            bind: override_raw(overrides.bind, BRIDGE_BIND, catalog)?.unwrap_or(defaults.bind),
+            quic_bind: override_raw(overrides.quic_bind, BRIDGE_QUIC_BIND, catalog)?
+                .or(defaults.quic_bind)
+                .filter(|value| !value.eq_ignore_ascii_case("off")),
+            tls_cert: catalog_path(overrides.tls_cert, BRIDGE_TLS_CERT, catalog)?,
+            tls_key: catalog_path(overrides.tls_key, BRIDGE_TLS_KEY, catalog)?,
+            state_dir: catalog_path(overrides.state_dir, BRIDGE_STATE_DIR, catalog)?,
+            token: override_raw(overrides.token, BRIDGE_TOKEN, catalog)?,
+        };
+        config.validate().map_err(ConfigError::new)?;
+        Ok(config)
+    }
+
     pub fn resolve_relay_server(
         overrides: RelayConfigOverrides,
         catalog: &EnvCatalog,
@@ -414,7 +495,7 @@ impl ConfigResolver {
         };
         let defaults = RelayConfig::default();
         let bind = text(overrides.bind, RELAY_BIND)?.unwrap_or(defaults.bind);
-        let relay_id = text(overrides.relay_id, RELAY_ID)?.unwrap_or(defaults.relay_id);
+        let relay_id = text(overrides.relay_id, RELAY_ID)?;
         let advertise_url = text(overrides.advertise_url, RELAY_ADVERTISE_URL)?.unwrap_or_default();
         let seeds = match overrides.seeds {
             Some(seeds) => seeds,
@@ -444,7 +525,11 @@ impl ConfigResolver {
                 RELAY_INSECURE_PLAINTEXT,
                 catalog,
             )?,
-            relay_id,
+            relay_id_explicit: relay_id.is_some(),
+            relay_id: relay_id.unwrap_or(defaults.relay_id),
+            bridge: override_raw(overrides.bridge, RELAY_BRIDGE, catalog)?,
+            bridge_token: override_raw(overrides.bridge_token, RELAY_BRIDGE_TOKEN, catalog)?,
+            cluster_secret: override_raw(overrides.cluster_secret, RELAY_CLUSTER_SECRET, catalog)?,
             advertise_url,
             seeds,
             use_proxy: Self::resolve_relay_use_proxy(overrides.use_proxy, catalog)?,

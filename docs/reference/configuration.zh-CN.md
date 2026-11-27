@@ -31,7 +31,15 @@ Rust Core 按 **显式代码或 CLI 覆盖 > 进程环境变量 > `.env` > 默�
 | `C2_RELAY_INSECURE_PLAINTEXT` | `false` | `--insecure-plaintext` |
 | `C2_RELAY_ID` | 自动生成 | `c3 relay --relay-id` |
 | `C2_RELAY_ADVERTISE_URL` | 由实际监听地址和承载推导 | `c3 relay --advertise-url` |
-| `C2_RELAY_SEEDS` | 空 | `c3 relay --seeds` / `-s`，逗号分隔的 relay URL |
+| `C2_RELAY_SEEDS` | 空 | `c3 relay --seeds` / `-s`，逗号分隔的 HTTP URL 或 iroh seed 地址 |
+| `C2_RELAY_BRIDGE` | 未设置 | `c3 relay --bridge`，私有 HTTPS 跳板 URL |
+| `C2_RELAY_BRIDGE_TOKEN` | 未设置 | `c3 relay --bridge-token`，使用跳板时必填 |
+| `C2_RELAY_CLUSTER_SECRET` | 未设置 | `c3 relay --cluster-secret`，启用 iroh 时必填 |
+| `C2_BRIDGE_BIND` | `0.0.0.0:8443` | `c3 bridge --bind`，HTTPS 监听地址 |
+| `C2_BRIDGE_QUIC_BIND` | `0.0.0.0:7842` | `c3 bridge --quic-bind`，设为 `off` 关闭 QUIC 地址发现 |
+| `C2_BRIDGE_TLS_CERT`, `C2_BRIDGE_TLS_KEY` | 自动生成自签证书 | `c3 bridge --tls-cert`、`--tls-key`，显式证书和私钥必须成对提供 |
+| `C2_BRIDGE_STATE_DIR` | `~/.c3-bridge` | `c3 bridge --state-dir` |
+| `C2_BRIDGE_TOKEN` | 自动生成并持久化 | `c3 bridge --token`，可打印且无空白的 ASCII |
 | `C2_RELAY_USE_PROXY` | `false` | 允许 relay 流量使用进程 HTTP 代理设置。Rust `HostOptions::with_relay_use_proxy` 可以覆盖。 |
 
 `M == 0` 时，该域拒绝正字节内存预约及全部新业务调用，包括空调用与空流。同时显式配置正数 `N` 会报配置错误。`M > 0` 时，显式 `N`（含 0）优先于推导值。关闭业务准入后，拒绝、释放和关闭排空仍可继续。见[内存策略](memory-policy.md)。
@@ -58,7 +66,11 @@ Python `cc.set_client` 与 `cc.set_server` 接受表中的三个容量字段。`
 
 独立 relay 启动时解析一个 `relay` 域。内存、文件溢出和调用槽覆盖业务转发及其上游 IPC 存储，跨物理连接和重连共用。`c3 relay --dry-run` 校验并显示有效的 `M`、`F`、`N`，不启动监听。`--upstream`（`-u`）仅通过 CLI 指定路由及上游身份。见 [c3 relay](../../cli/README.md#relay)。
 
-本机控制入口仅接受回环地址。可选的业务边缘入口接受发现和 RPC。边缘默认在非回环地址启用持久化自签 TLS，在回环地址使用明文。显式证书和私钥必须成对设置。显式证书、`--tls-auto` 和 `--insecure-plaintext` 互斥。自动证书的 SAN 和状态目录仅用于自动 TLS。
+本机控制入口仅接受回环地址。可选的业务边缘入口接受发现和 RPC。边缘默认在非回环地址启用持久化自签 TLS，在回环地址使用明文。显式证书和私钥必须成对设置。显式证书、`--tls-auto` 和 `--insecure-plaintext` 互斥。SAN 用于自动证书。状态目录保存自动证书和 iroh 端点私钥。
+
+`c3 bridge` 通过 HTTPS 提供节点会合与密文转发，默认在 UDP 7842 提供 QUIC 地址发现。它在私有状态目录中保存自签证书 `bridge-cert.pem`、私钥 `bridge-key.pem` 和自动生成的 `bridge-token`。跳板 token 仅用于准入，集群密钥只用于 relay 端点间互证，二者必须不同。启动输出包含可复制的跳板 URL 和 token。Dry-run 仅显示凭据的设置状态，且不创建文件或监听套接字。见 [c3 bridge](../../cli/README.md#bridge)。
+
+跳板 URL 形如 `https://host:8443?pin=<64-lower-hex>&quic=off`。自动生成的证书使用叶证书 DER 的 SHA-256 指纹校验，省略 `pin` 时按 WebPKI 验证。省略 `quic` 时采用 7842，或填写其他端口或 `off`。配置跳板、集群密钥或 `iroh://` seed 会启用 iroh。无跳板的 seed 必须附加 `@<ip:port>`。Relay 在 `~/.c3-relay` 或指定状态目录下持久化 `mesh-key.ed25519`，未显式指定 relay ID 时从端点身份派生。通过 iroh 的控制请求与数据请求使用独立的 QUIC 连接。当前 Mesh 8 路由表仍经 HTTP seed 引导和交换路由。Mesh 8 的 iroh 节点消息须使用从端点身份派生的发送方 ID。
 
 ## 固定传输常量
 

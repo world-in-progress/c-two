@@ -480,3 +480,110 @@ fn relay_server_resolves_edge_settings_and_rejects_conflicting_modes() {
         assert!(resolve(options).is_err(), "{options:?}");
     }
 }
+
+#[test]
+fn bridge_overrides_resolve_and_reject_invalid_credentials_or_listeners() {
+    let variables = catalog(&[
+        (BRIDGE_BIND, "127.0.0.1:9443"),
+        (BRIDGE_QUIC_BIND, "OfF"),
+        (BRIDGE_TOKEN, "secret-token"),
+    ]);
+    let config = ConfigResolver::resolve_bridge(
+        BridgeConfigOverrides {
+            bind: Some("127.0.0.1:0".into()),
+            ..Default::default()
+        },
+        &variables,
+    )
+    .unwrap();
+    assert_eq!(config.bind, "127.0.0.1:0");
+    assert_eq!(config.quic_bind, None);
+    assert_eq!(config.token.as_deref(), Some("secret-token"));
+    assert!(!format!("{config:?}").contains("secret-token"));
+
+    for (key, value) in [
+        (BRIDGE_BIND, "127.0.0.1:65536"),
+        (BRIDGE_QUIC_BIND, "127.0.0.1:65536"),
+        (BRIDGE_TLS_CERT, "only-cert.pem"),
+        (BRIDGE_TLS_KEY, "only-key.pem"),
+        (BRIDGE_TOKEN, ""),
+        (BRIDGE_TOKEN, "secret token"),
+        (BRIDGE_TOKEN, "secret\n"),
+    ] {
+        assert!(
+            ConfigResolver::resolve_bridge(Default::default(), &catalog(&[(key, value)])).is_err(),
+            "{key}"
+        );
+    }
+}
+
+#[test]
+fn iroh_relay_resolver_keeps_cluster_and_bridge_credentials_separate() {
+    let bridge = "https://bridge.example.org?quic=off";
+    fn resolve(vars: &[(&str, &str)]) -> Result<RelayConfig, ConfigError> {
+        ConfigResolver::resolve_relay_server(Default::default(), &catalog(vars))
+    }
+    for vars in [
+        &[(RELAY_BRIDGE, bridge)][..],
+        &[(RELAY_BRIDGE_TOKEN, "bridge-only")],
+        &[(RELAY_BRIDGE, bridge), (RELAY_BRIDGE_TOKEN, "bridge-only")],
+        &[
+            (RELAY_BRIDGE, bridge),
+            (RELAY_BRIDGE_TOKEN, "same"),
+            (RELAY_CLUSTER_SECRET, "same"),
+        ],
+        &[
+            (RELAY_BRIDGE, bridge),
+            (RELAY_BRIDGE_TOKEN, " bad "),
+            (RELAY_CLUSTER_SECRET, "secret"),
+        ],
+        &[(RELAY_CLUSTER_SECRET, "")],
+    ] {
+        assert!(resolve(vars).is_err());
+    }
+    let seed = format!("iroh://{}", "ab".repeat(32));
+    assert!(
+        resolve(&[
+            (RELAY_SEEDS, &seed),
+            (RELAY_CLUSTER_SECRET, "private-cluster")
+        ])
+        .is_err()
+    );
+    let direct = format!("{seed}@127.0.0.1:9443");
+    let config = resolve(&[
+        (RELAY_SEEDS, &direct),
+        (RELAY_CLUSTER_SECRET, "private-cluster"),
+        (RELAY_STATE_DIR, "state"),
+    ])
+    .unwrap();
+    assert!(config.iroh_enabled());
+    assert!(!config.relay_id_explicit);
+    let config = resolve(&[
+        (RELAY_BRIDGE, bridge),
+        (RELAY_BRIDGE_TOKEN, "bridge-only"),
+        (RELAY_CLUSTER_SECRET, "private-cluster"),
+        (RELAY_SEEDS, &seed),
+        (RELAY_ID, "explicit"),
+    ])
+    .unwrap();
+    assert!(config.relay_id_explicit);
+    let debug = format!("{config:?}");
+    assert!(!debug.contains("bridge-only"));
+    assert!(!debug.contains("private-cluster"));
+    assert!(crate::validate_relay_id(&RelayConfig::derive_iroh_relay_id(&[0x12; 32])).is_ok());
+}
+
+#[test]
+fn malformed_env_entries_do_not_echo_mesh_secrets() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("relay.env");
+    std::fs::write(&path, "C2_RELAY_CLUSTER_SECRET=private-secret unexpected\n").unwrap();
+    let error = EnvCatalog::load(ConfigSources {
+        env_file: EnvFilePolicy::Path(path),
+        process_env: EnvMap::new(),
+    })
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("failed to parse env file"));
+    assert!(!error.contains("private-secret"));
+}

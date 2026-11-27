@@ -15,6 +15,7 @@ use http::{Request, Response, Version};
 use http_body::Frame;
 use http_body_util::BodyExt;
 use hyper_util::rt::{TokioIo, TokioTimer};
+use iroh::endpoint::{RecvStream, SendStream, VarInt};
 use parking_lot::Mutex;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
@@ -23,6 +24,7 @@ use tokio_rustls::TlsAcceptor;
 use tokio_util::sync::CancellationToken;
 use tower::ServiceExt;
 
+use super::iroh_transport::AuthenticatedIrohPeer;
 use super::stream_control::ResponseStreamControl;
 
 const H2_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
@@ -32,12 +34,14 @@ const H2_FRAME_BYTES: usize = 16 * 1024;
 pub(super) enum ListenerSurface {
     LocalControl,
     PublicEdge,
+    IrohMesh,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum TransportKind {
     Http1,
     Http2,
+    IrohHttp1,
 }
 
 #[derive(Clone)]
@@ -519,6 +523,142 @@ impl<T: AsyncWrite + Unpin> AsyncWrite for H1TransportStream<T> {
         let result = Pin::new(&mut self.inner).poll_write_vectored(cx, bufs);
         self.set_blocked(result.is_pending());
         result
+    }
+}
+
+const ERROR_STREAM_EVICTED: VarInt = VarInt::from_u32(1);
+
+/// A single HTTP exchange owns both halves of one QUIC stream.
+pub(super) struct IrohQuicBiStream {
+    send: SendStream,
+    recv: RecvStream,
+    control: Option<Arc<ResponseStreamControl>>,
+    send_finished: bool,
+}
+
+impl IrohQuicBiStream {
+    pub(super) fn new(
+        send: SendStream,
+        recv: RecvStream,
+        control: Option<Arc<ResponseStreamControl>>,
+    ) -> Self {
+        Self {
+            send,
+            recv,
+            control,
+            send_finished: false,
+        }
+    }
+
+    pub(super) async fn serve(
+        send: SendStream,
+        recv: RecvStream,
+        app: Router,
+        peer: AuthenticatedIrohPeer,
+    ) {
+        let control = Arc::<ResponseStreamControl>::default();
+        let mut io = Self::new(send, recv, Some(control.clone()));
+        let run = {
+            let request_control = control.clone();
+            let service =
+                hyper::service::service_fn(move |request: Request<hyper::body::Incoming>| {
+                    let mut request = request.map(Body::new);
+                    let extensions = request.extensions_mut();
+                    extensions.insert(peer);
+                    extensions.insert(ListenerSurface::IrohMesh);
+                    extensions.insert(TransportKind::IrohHttp1);
+                    extensions.insert(request_control.clone());
+                    app.clone().oneshot(request)
+                });
+            // Response production may be asleep waiting on a Body. Wake and
+            // reset the send half even if Hyper is not polling socket writes.
+            tokio::select! {
+                biased;
+                _ = control.aborted() => None,
+                result = hyper::server::conn::http1::Builder::new()
+                    .half_close(true)
+                    .keep_alive(false)
+                    .serve_connection(TokioIo::new(&mut io), service) => Some(result),
+            }
+        };
+        match run {
+            None => {
+                io.evict();
+            }
+            Some(Ok(())) => {
+                let _ = io.finish_send();
+            }
+            Some(Err(error)) => {
+                tracing::debug!(%error, "iroh HTTP stream ended");
+            }
+        }
+        // Send the response FIN before stopping any unread request bytes.
+        let _ = io.recv.stop(VarInt::from_u32(0));
+    }
+
+    fn evict(&mut self) -> io::Error {
+        let _ = self.send.reset(ERROR_STREAM_EVICTED);
+        io::Error::new(
+            io::ErrorKind::ConnectionAborted,
+            "relay response stream evicted",
+        )
+    }
+
+    fn finish_send(&mut self) -> io::Result<()> {
+        if !self.send_finished {
+            self.send.finish()?;
+            self.send_finished = true;
+        }
+        Ok(())
+    }
+
+    fn poll_send<T>(
+        &mut self,
+        cx: &mut Context<'_>,
+        poll: impl FnOnce(Pin<&mut SendStream>, &mut Context<'_>) -> Poll<io::Result<T>>,
+    ) -> Poll<io::Result<T>> {
+        if let Some(control) = self.control.as_ref() {
+            control.register_abort_waker(cx.waker());
+            if control.is_aborted() {
+                return Poll::Ready(Err(self.evict()));
+            }
+        }
+        let result = poll(Pin::new(&mut self.send), cx);
+        if let Some(control) = self.control.as_ref() {
+            control.set_blocked(result.is_pending());
+            if result.is_ready() {
+                control.clear_abort_waker();
+            }
+        }
+        result
+    }
+}
+
+impl AsyncRead for IrohQuicBiStream {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buffer: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        AsyncRead::poll_read(Pin::new(&mut self.recv), cx, buffer)
+    }
+}
+
+impl AsyncWrite for IrohQuicBiStream {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bytes: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        self.poll_send(cx, |stream, cx| AsyncWrite::poll_write(stream, cx, bytes))
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.poll_send(cx, AsyncWrite::poll_flush)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(self.finish_send())
     }
 }
 

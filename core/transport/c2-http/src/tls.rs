@@ -13,48 +13,56 @@ use crate::client::HttpError;
 
 /// Build the shared TLS configuration for asynchronous and blocking relay clients.
 pub fn relay_tls_config(trust: &RelayTlsTrust) -> Result<ClientConfig, HttpError> {
-    let provider = rustls::crypto::ring::default_provider();
-    let algorithms = provider.signature_verification_algorithms;
-    let builder = ClientConfig::builder_with_provider(Arc::new(provider))
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let verifier = relay_server_cert_verifier(trust, provider.clone())?;
+    let mut config = ClientConfig::builder_with_provider(provider)
         .with_safe_default_protocol_versions()
-        .expect("ring supports the default TLS versions");
-    let mut config = match trust {
-        RelayTlsTrust::SystemDefault => builder
-            .with_root_certificates(RootCertStore {
-                roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
-            })
-            .with_no_client_auth(),
+        .expect("ring supports the default TLS versions")
+        .dangerous()
+        .with_custom_certificate_verifier(verifier)
+        .with_no_client_auth();
+    config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+    Ok(config)
+}
+
+pub(crate) fn relay_server_cert_verifier(
+    trust: &RelayTlsTrust,
+    provider: Arc<rustls::crypto::CryptoProvider>,
+) -> Result<Arc<dyn ServerCertVerifier>, HttpError> {
+    let roots = match trust {
+        RelayTlsTrust::SystemDefault => RootCertStore {
+            roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
+        },
         RelayTlsTrust::CustomCaCert(path) => {
-            let ca_error = |error| {
+            let ca_error = |error: &dyn std::fmt::Display| {
                 HttpError::InvalidInput(format!(
                     "invalid relay CA file {}: {error}",
                     path.display()
                 ))
             };
             let mut roots = RootCertStore::empty();
-            let certs =
-                CertificateDer::pem_file_iter(path).map_err(|error| ca_error(error.to_string()))?;
-            for cert in certs {
-                let cert = cert.map_err(|error| ca_error(error.to_string()))?;
+            for cert in CertificateDer::pem_file_iter(path).map_err(|error| ca_error(&error))? {
                 roots
-                    .add(cert)
-                    .map_err(|error| ca_error(error.to_string()))?;
+                    .add(cert.map_err(|error| ca_error(&error))?)
+                    .map_err(|error| ca_error(&error))?;
             }
             if roots.is_empty() {
-                return Err(ca_error("no PEM certificates found".to_owned()));
+                return Err(ca_error(&"no PEM certificates found"));
             }
-            builder.with_root_certificates(roots).with_no_client_auth()
+            roots
         }
-        RelayTlsTrust::CertSha256(digest) => builder
-            .dangerous()
-            .with_custom_certificate_verifier(Arc::new(LeafDerPinVerifier {
+        RelayTlsTrust::CertSha256(digest) => {
+            return Ok(Arc::new(LeafDerPinVerifier {
                 digest: *digest,
-                algorithms,
-            }))
-            .with_no_client_auth(),
+                algorithms: provider.signature_verification_algorithms,
+            }));
+        }
     };
-    config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
-    Ok(config)
+    let verifier =
+        rustls::client::WebPkiServerVerifier::builder_with_provider(Arc::new(roots), provider)
+            .build()
+            .map_err(|error| HttpError::InvalidInput(error.to_string()))?;
+    Ok(verifier)
 }
 
 /// Build an HTTP client with the resolved relay trust and proxy policy.

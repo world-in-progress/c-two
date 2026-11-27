@@ -153,7 +153,7 @@ fn relay_leave_and_delayed_announcement_never_leave_an_orphan_registration() {
     // An announcement that reaches the owner check after departure is ignored.
     runtime.block_on(super::peer_handlers::handle_peer_announce(
         axum::extract::State(state.clone()),
-        axum::Json(announce),
+        super::peer_handlers::PeerRequest(announce),
     ));
     assert!(state.list_routes().is_empty());
 }
@@ -207,7 +207,7 @@ async fn alive_heartbeat_and_metadata_writes_do_not_compare_conflicts() {
     state.with_route_table(|table| table.take_conflict_comparisons());
     super::peer_handlers::handle_peer_heartbeat(
         axum::extract::State(state.clone()),
-        axum::Json(PeerEnvelope::new(
+        super::peer_handlers::PeerRequest(PeerEnvelope::new(
             "relay-peer",
             PeerMessage::Heartbeat {
                 relay_id: "relay-peer".into(),

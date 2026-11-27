@@ -721,6 +721,16 @@ pub(crate) fn build_local_router(state: Arc<RelayState>) -> Router {
         .route("/_admin/unregister", post(handle_admin_unregister))
         .route("/_admin/force-leave", post(handle_admin_force_leave))
         .route("/_peers", get(handle_peers))
+        .layer(DefaultBodyLimit::max(CONTROL_BODY_LIMIT_BYTES));
+    finish_router(
+        control_router.merge(peer_router()).merge(business_router()),
+        state,
+        ListenerSurface::LocalControl,
+    )
+}
+
+fn peer_router() -> Router<Arc<RelayState>> {
+    Router::new()
         .route("/_peer/announce", post(peer_handlers::handle_peer_announce))
         .route("/_peer/join", post(peer_handlers::handle_peer_join))
         .route("/_peer/sync", get(peer_handlers::handle_peer_sync))
@@ -734,24 +744,32 @@ pub(crate) fn build_local_router(state: Arc<RelayState>) -> Router {
             post(peer_handlers::handle_peer_force_leave),
         )
         .route("/_peer/digest", post(peer_handlers::handle_peer_digest))
-        .layer(DefaultBodyLimit::max(CONTROL_BODY_LIMIT_BYTES));
-
-    finish_router(
-        control_router.merge(business_router()),
-        state,
-        ListenerSurface::LocalControl,
-    )
+        .layer(DefaultBodyLimit::max(CONTROL_BODY_LIMIT_BYTES))
 }
 
 pub(super) fn build_edge_router(state: Arc<RelayState>) -> Router {
     finish_router(business_router(), state, ListenerSurface::PublicEdge)
 }
 
+pub(super) fn build_mesh_router(state: Arc<RelayState>) -> Router {
+    finish_router(
+        peer_router().merge(origin_router()),
+        state,
+        ListenerSurface::IrohMesh,
+    )
+}
+
 fn business_router() -> Router<Arc<RelayState>> {
-    let discovery = Router::new()
+    Router::new()
         .route("/_routes", get(handle_list_routes))
         .route("/_resolve", get(handle_resolve_query))
         .route("/_resolve/{*name}", get(handle_resolve))
+        .layer(DefaultBodyLimit::max(CONTROL_BODY_LIMIT_BYTES))
+        .merge(origin_router())
+}
+
+fn origin_router() -> Router<Arc<RelayState>> {
+    let control = Router::new()
         .route("/_probe", get(handle_probe_query))
         .route("/_probe/{*name}", get(handle_probe))
         .route(OUTCOME_PATH, get(query_call_handler))
@@ -766,7 +784,7 @@ fn business_router() -> Router<Arc<RelayState>> {
         .route(TOPIC_CONFIRM_PATH, post(topic_confirm_handler))
         .layer(DefaultBodyLimit::disable());
 
-    discovery.merge(data_router)
+    control.merge(data_router)
 }
 
 fn finish_router(
@@ -1183,7 +1201,21 @@ async fn finish_unread_body_rejection(
     let length = DeclaredBodyLength(content_length_from_headers(request.headers()));
     let expect = request.headers().contains_key(header::EXPECT);
     request.extensions_mut().insert(length);
-    if request.extensions().get::<TransportKind>() == Some(&TransportKind::Http2) {
+    if request.extensions().get::<ListenerSurface>() == Some(&ListenerSurface::IrohMesh)
+        && matches!(
+            request.uri().path(),
+            TOPIC_SUBSCRIBE_PATH | TOPIC_CONFIRM_PATH
+        )
+    {
+        request.headers_mut().insert(
+            super::topic_remote::ORIGIN_ONLY_HEADER,
+            http::HeaderValue::from_static("1"),
+        );
+    }
+    if matches!(
+        request.extensions().get::<TransportKind>(),
+        Some(TransportKind::Http2 | TransportKind::IrohHttp1)
+    ) {
         return next.run(request).await;
     }
     let (parts, body) = request.into_parts();

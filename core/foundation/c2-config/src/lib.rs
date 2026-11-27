@@ -1,5 +1,6 @@
 //! Shared configuration and transport policy for C-Two.
 
+mod bridge;
 mod call;
 mod connect_options;
 mod domain;
@@ -12,6 +13,7 @@ mod relay;
 mod resolver;
 mod timeout;
 
+pub use bridge::{BridgeConfig, DEFAULT_BRIDGE_QUIC_PORT, IrohSeedAddr, RelayBridgeSpec};
 pub use call::{CallOptions, CallTimeout};
 pub use connect_options::{
     ConnectDeadline, ConnectDeadlineExceeded, ConnectOptions, ConnectTimeoutError,
@@ -45,8 +47,8 @@ pub use pool::{
 };
 pub use relay::{RelayConfig, RelayEdgeTlsMode};
 pub use resolver::{
-    ConfigError, ConfigResolver, ConfigSources, EnvCatalog, EnvFilePolicy, EnvMap,
-    RelayConfigOverrides, RelayTlsTrust, ResolvedRelayClientConfig, ResolvedServerConfig,
+    BridgeConfigOverrides, ConfigError, ConfigResolver, ConfigSources, EnvCatalog, EnvFilePolicy,
+    EnvMap, RelayConfigOverrides, RelayTlsTrust, ResolvedRelayClientConfig, ResolvedServerConfig,
     ServerConfigOverrides, ServerConfigPatch,
 };
 pub use timeout::{TimeoutError, deadline_after, timeout_from_seconds, validate_timeout};

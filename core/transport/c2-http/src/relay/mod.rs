@@ -60,6 +60,7 @@ pub(crate) mod forwarding;
 #[cfg(test)]
 mod forwarding_tests;
 pub(crate) mod gossip;
+pub mod iroh_transport;
 #[cfg(test)]
 mod memory_tests;
 pub(crate) mod peer;

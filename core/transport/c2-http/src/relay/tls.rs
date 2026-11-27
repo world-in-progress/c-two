@@ -1,13 +1,10 @@
 //! TLS identity and acceptor for the relay edge listener.
 
 use std::collections::BTreeSet;
-use std::fs;
-use std::io;
-use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use crate::private_state::{persistent_tls_identity, state_dir};
 use c2_config::{RelayConfig, RelayEdgeTlsMode};
-use c2_local_security::{create_private_dir, verify_private_file, write_private_file};
 use rustls::ServerConfig;
 use rustls_pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
 use sha2::{Digest, Sha256};
@@ -25,7 +22,11 @@ impl EdgeTls {
                 config.tls_cert.clone().expect("validated TLS certificate"),
                 config.tls_key.clone().expect("validated TLS key"),
             ),
-            Some(RelayEdgeTlsMode::AutoSelfSigned) => persistent_identity(config)?,
+            Some(RelayEdgeTlsMode::AutoSelfSigned) => persistent_tls_identity(
+                &state_dir(config.state_dir.as_deref(), ".c3-relay")?,
+                "edge",
+                edge_subject_alt_names(config),
+            )?,
             Some(RelayEdgeTlsMode::Plaintext) | None => return Ok(None),
         };
 
@@ -50,51 +51,6 @@ impl EdgeTls {
             leaf_sha256,
         }))
     }
-}
-
-fn persistent_identity(config: &RelayConfig) -> Result<(PathBuf, PathBuf), String> {
-    let dir = match &config.state_dir {
-        Some(dir) => dir.clone(),
-        None => std::env::home_dir()
-            .ok_or("cannot find the home directory for edge TLS; specify --state-dir")?
-            .join(".c3-relay"),
-    };
-    create_private_dir(&dir).map_err(|e| file_error(&dir, e))?;
-    let cert = dir.join("edge-cert.pem");
-    let key = dir.join("edge-key.pem");
-    match (private_file_exists(&cert)?, private_file_exists(&key)?) {
-        (true, true) => {}
-        (false, false) => {
-            let names = edge_subject_alt_names(config);
-            // rcgen's default key algorithm is ECDSA P-256 with SHA-256.
-            let identity = rcgen::generate_simple_self_signed(names)
-                .map_err(|error| format!("generate edge TLS identity: {error}"))?;
-            write_private_file(&key, identity.signing_key.serialize_pem().as_bytes())
-                .map_err(|e| file_error(&key, e))?;
-            if let Err(error) = write_private_file(&cert, identity.cert.pem().as_bytes()) {
-                let _ = fs::remove_file(&key);
-                return Err(file_error(&cert, error));
-            }
-            #[cfg(unix)]
-            fs::File::open(&dir)
-                .and_then(|dir| dir.sync_all())
-                .map_err(|e| file_error(&dir, e))?;
-        }
-        _ => return Err(format!("incomplete edge TLS identity in {}", dir.display())),
-    }
-    Ok((cert, key))
-}
-
-fn private_file_exists(path: &Path) -> Result<bool, String> {
-    match verify_private_file(path) {
-        Ok(()) => Ok(true),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
-        Err(error) => Err(file_error(path, error)),
-    }
-}
-
-fn file_error(path: &Path, error: io::Error) -> String {
-    format!("edge TLS state {}: {error}", path.display())
 }
 
 fn edge_subject_alt_names(config: &RelayConfig) -> Vec<String> {

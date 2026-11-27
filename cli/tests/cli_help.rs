@@ -8,6 +8,7 @@ fn c3_help_lists_runtime_commands() {
         .assert()
         .success()
         .stdout(predicate::str::contains("relay"))
+        .stdout(predicate::str::contains("bridge"))
         .stdout(predicate::str::contains("contract"))
         .stdout(predicate::str::contains("registry"));
 }
@@ -51,4 +52,21 @@ fn c3_help_respects_no_color_for_banner() {
         .assert()
         .success()
         .stdout(predicate::str::contains("\x1b[38;2;102;237;173m").not());
+}
+
+#[test]
+fn bridge_help_lists_supported_options() {
+    let mut command = assert_cmd::cargo::cargo_bin_cmd!("c3");
+    let mut result = command.args(["bridge", "--help"]).assert().success();
+    for flag in [
+        "--bind",
+        "--quic-bind",
+        "--tls-cert",
+        "--tls-key",
+        "--state-dir",
+        "--token",
+        "--dry-run",
+    ] {
+        result = result.stdout(predicate::str::contains(flag));
+    }
 }

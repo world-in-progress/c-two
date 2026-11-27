@@ -53,7 +53,7 @@ pub fn spawn_background_tasks(
         handles.push(tokio::spawn(dead_peer_probe_loop(s, c)));
     }
 
-    if !config.seeds.is_empty() {
+    if config.seeds.iter().any(|seed| !seed.starts_with("iroh://")) {
         let s = state.clone();
         let c = cancel.clone();
         handles.push(tokio::spawn(seed_retry_loop(s, c)));
@@ -339,7 +339,7 @@ async fn seed_retry_loop(state: Arc<RelayState>, cancel: CancellationToken) {
         // The first join and later retries use the same path.
         let has_alive = state.with_route_table(|rt| !rt.alive_peers().is_empty());
         if !has_alive {
-            for seed_url in &seeds {
+            for seed_url in seeds.iter().filter(|seed| !seed.starts_with("iroh://")) {
                 let join_url = peer_endpoint_url(seed_url, "/_peer/join");
                 let envelope = PeerEnvelope::new(
                     state.relay_id(),
