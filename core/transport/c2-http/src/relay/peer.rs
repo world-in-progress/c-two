@@ -1,10 +1,27 @@
 use serde::{Deserialize, Serialize};
 
 use crate::relay::types::{
-    Locality, RouteDigestHash, RouteEntry, valid_route_digest_hash, valid_wire_relay_id,
+    Locality, PeerAddress, RouteDigestHash, RouteEntry, valid_route_digest_hash,
+    valid_wire_relay_id,
 };
 
-pub const PROTOCOL_VERSION: u32 = 8;
+pub const PROTOCOL_VERSION: u32 = 9;
+
+#[derive(Clone, Copy)]
+pub(crate) struct PeerSender<'a> {
+    pub relay_id: &'a str,
+    pub endpoint_id: Option<iroh::EndpointId>,
+}
+
+impl PeerSender<'_> {
+    #[cfg(test)]
+    pub(crate) fn http(relay_id: &str) -> PeerSender<'_> {
+        PeerSender {
+            relay_id,
+            endpoint_id: None,
+        }
+    }
+}
 
 /// Envelope wrapping every peer-to-peer message.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -23,7 +40,7 @@ pub enum PeerMessage {
     RouteAnnounce {
         name: String,
         relay_id: String,
-        relay_url: String,
+        address: PeerAddress,
         crm_ns: String,
         crm_name: String,
         crm_ver: String,
@@ -40,7 +57,10 @@ pub enum PeerMessage {
         removed_at: f64,
     },
     /// A relay wants to join the mesh.
-    RelayJoin { relay_id: String, url: String },
+    RelayJoin {
+        relay_id: String,
+        address: PeerAddress,
+    },
     /// A relay is gracefully leaving the mesh.
     RelayLeave { relay_id: String },
     /// A deployer asks peers that cannot reach a relay to forget it.
@@ -51,13 +71,11 @@ pub enum PeerMessage {
     DigestExchange { digest: Vec<DigestEntry> },
     /// Anti-entropy diff: entries the sender has that recipient was missing.
     DigestDiff { entries: Vec<DigestDiffEntry> },
-    /// Unknown message type from a newer protocol version.
-    #[serde(other)]
-    Unknown,
 }
 
 /// One entry in a digest map.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DigestEntry {
     pub name: String,
     pub relay_id: String,
@@ -73,7 +91,7 @@ pub enum DigestDiffEntry {
     Active {
         name: String,
         relay_id: String,
-        relay_url: String,
+        address: PeerAddress,
         crm_ns: String,
         crm_name: String,
         crm_ver: String,
@@ -155,7 +173,7 @@ pub fn validate_route_state_envelope(
         PeerMessage::RouteAnnounce {
             name,
             relay_id,
-            relay_url,
+            address,
             crm_ns,
             crm_name,
             crm_ver,
@@ -169,7 +187,7 @@ pub fn validate_route_state_envelope(
                 || !valid_active_route_fields(
                     name,
                     relay_id,
-                    relay_url,
+                    address,
                     crm_ns,
                     crm_name,
                     crm_ver,
@@ -221,7 +239,7 @@ pub fn validate_route_state_envelope(
             )
             .map(ValidatedRouteStateEnvelope::DigestDiff);
         }
-        PeerMessage::RelayJoin { .. } | PeerMessage::Heartbeat { .. } | PeerMessage::Unknown => {}
+        PeerMessage::RelayJoin { .. } | PeerMessage::Heartbeat { .. } => {}
     };
 
     Ok(ValidatedRouteStateEnvelope::Message(envelope))
@@ -254,7 +272,7 @@ fn validate_digest_diff_entries(
             DigestDiffEntry::Active {
                 name,
                 relay_id,
-                relay_url,
+                address,
                 crm_ns,
                 crm_name,
                 crm_ver,
@@ -268,7 +286,7 @@ fn validate_digest_diff_entries(
                     || !valid_active_route_fields(
                         &name,
                         &relay_id,
-                        &relay_url,
+                        &address,
                         &crm_ns,
                         &crm_name,
                         &crm_ver,
@@ -285,7 +303,7 @@ fn validate_digest_diff_entries(
                 validated.push(ValidatedDigestDiffEntry::Active(RouteEntry {
                     name,
                     relay_id,
-                    relay_url,
+                    address,
                     server_id: None,
                     server_instance_id: None,
                     ipc_address: None,
@@ -328,7 +346,7 @@ fn validate_digest_diff_entries(
 fn valid_active_route_fields(
     name: &str,
     relay_id: &str,
-    relay_url: &str,
+    address: &PeerAddress,
     crm_ns: &str,
     crm_name: &str,
     crm_ver: &str,
@@ -340,7 +358,7 @@ fn valid_active_route_fields(
 ) -> bool {
     crate::relay::route_table::valid_route_name(name)
         && valid_wire_relay_id(relay_id)
-        && crate::valid_relay_url(relay_url)
+        && address.is_valid()
         && crate::relay::route_table::valid_crm_tag(crm_ns, crm_name, crm_ver)
         && c2_contract::validate_contract_hash("abi_hash", abi_hash).is_ok()
         && c2_contract::validate_contract_hash("signature_hash", signature_hash).is_ok()
@@ -359,9 +377,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn mesh_eight_rejects_seven_and_future_envelopes() {
-        assert_eq!(PROTOCOL_VERSION, 8);
-        for protocol_version in [7, 9] {
+    fn mesh_nine_rejects_eight_and_future_envelopes() {
+        assert_eq!(PROTOCOL_VERSION, 9);
+        for protocol_version in [8, 10] {
             let mut envelope = PeerEnvelope::new(
                 "relay-a",
                 PeerMessage::Heartbeat {
@@ -372,16 +390,16 @@ mod tests {
             envelope.protocol_version = protocol_version;
             assert!(matches!(
                 validate_route_state_envelope(envelope, None),
-                Err(PeerRouteStateError::UnsupportedRouteStateProtocol { got, supported: 8 })
+                Err(PeerRouteStateError::UnsupportedRouteStateProtocol { got, supported: 9 })
                     if got == protocol_version
             ));
         }
     }
 
     #[test]
-    fn mesh_eight_rejects_retired_fields_on_route_messages_and_diffs() {
+    fn mesh_nine_rejects_retired_fields_on_route_messages_and_diffs() {
         let active = serde_json::json!({
-            "name": "grid", "relay_id": "relay-a", "relay_url": "http://relay-a:8080",
+            "name": "grid", "relay_id": "relay-a", "address": {"http_url": "http://relay-a:8080"},
             "crm_ns": "test.ns", "crm_name": "Grid", "crm_ver": "0.1.0",
             "abi_hash": "a".repeat(64), "signature_hash": "b".repeat(64),
             "max_payload_size": 1024, "registered_at": 1000.0,
@@ -394,7 +412,7 @@ mod tests {
                 active.clone(),
                 "RouteAnnounce",
                 false,
-                vec!["route_uid", "route_revision"],
+                vec!["route_uid", "route_revision", "relay_url"],
             ),
             (
                 deleted.clone(),
@@ -406,7 +424,7 @@ mod tests {
                 active,
                 "Active",
                 true,
-                vec!["route_uid", "hash", "route_revision"],
+                vec!["route_uid", "hash", "route_revision", "relay_url"],
             ),
             (deleted, "Deleted", true, vec!["hash", "removed_revision"]),
         ] {
@@ -418,7 +436,7 @@ mod tests {
                     message = serde_json::json!({"type": "DigestDiff", "entries": [message]});
                 }
                 let envelope = serde_json::json!({
-                    "protocol_version": 8, "sender_relay_id": "relay-a", "message": message,
+                    "protocol_version": 9, "sender_relay_id": "relay-a", "message": message,
                 });
                 assert!(
                     serde_json::from_value::<PeerEnvelope>(envelope).is_err(),
@@ -460,7 +478,7 @@ mod tests {
             PeerMessage::RouteAnnounce {
                 name: "grid".into(),
                 relay_id: "relay-a".into(),
-                relay_url: "http://relay-a:8080".into(),
+                address: PeerAddress::http("http://relay-a:8080"),
                 crm_ns: "cc.demo".into(),
                 crm_name: "Grid".into(),
                 crm_ver: "0.1.0".into(),
@@ -490,7 +508,7 @@ mod tests {
             PeerMessage::RouteAnnounce {
                 name: "grid".into(),
                 relay_id: "relay-a".into(),
-                relay_url: "http://relay-a:8080".into(),
+                address: PeerAddress::http("http://relay-a:8080"),
                 crm_ns: "cc.demo".into(),
                 crm_name: "Grid".into(),
                 crm_ver: "0.1.0".into(),

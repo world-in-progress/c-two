@@ -19,8 +19,6 @@ pub use control::{
     LOCAL_ENDPOINT_NAMESPACE_HEADER, RelayControlClient, RelayRegistration, RelayRegistrationScope,
     RelayResolvedRoutes, RelayRouteInfo,
 };
-#[cfg(feature = "relay")]
-pub(crate) use http_client::add_expected_contract_headers;
 pub use http_client::{HttpClient, HttpError, HttpInputOwner};
 pub use pool::HttpClientPool;
 pub use relay_aware::{

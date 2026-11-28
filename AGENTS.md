@@ -91,7 +91,7 @@ uv run python examples/python/ipc_client.py <address>
 # Relay mesh example, three terminals (with shared CARGO_TARGET_DIR above, build c3 into it and add to PATH;
 # or run `python tools/dev/c3_tool.py --build --link` without CARGO_TARGET_DIR set)
 cargo build --manifest-path cli/Cargo.toml && export PATH="$CARGO_TARGET_DIR/debug:$PATH"
-c3 relay --bind 0.0.0.0:8300
+c3 relay --bind 127.0.0.1:8300
 uv run python examples/python/relay_mesh/resource.py
 uv run python examples/python/relay_mesh/client.py
 
@@ -100,7 +100,7 @@ uv sync --group examples
 
 # CLI tool
 c3 --version
-c3 relay --upstream grid=my_server@ipc://my_server --bind 0.0.0.0:8080
+c3 relay --upstream grid=my_server@ipc://my_server --bind 127.0.0.1:8080
 ```
 
 Windows ARM64 uses the same native source gates on `windows-11-arm`, including Rust/Python/Node interoperability and standard-user consumers. Release wheels cover Python 3.11–3.14 and 3.14t on ARM64; other platforms retain 3.10. Windows syntax-only 3.10 checks install/find `3.10-windows-x86_64-none`; runtime tests must use the native architecture.
@@ -171,7 +171,7 @@ Retired surfaces have no compatibility aliases; names of still-supported interna
 | Replaceable receive-pool slots and safe coordinate-to-lease constructors | Frame admission mints pool-bound carriers; prepared SHM replies carry their allocated owner. |
 | `endpoint_protocol`, protocol-selecting SDK/CLI APIs, logon-name fallback | `c2-config::LocalEndpoint::from_address()` derives one OS implementation and verifies native identity. |
 | The owner subsystem: `OwnerBound`, owner control and its 0x16 frame, `OwnerBootstrap`, recovery tickets and takeover, owned children, `LifecycleConfig` | Removed without replacement ([ADR 0002](docs/decisions/0002-remove-owner-subsystem.md)); supervise host processes with ordinary process management and shutdown. |
-| Handshake 17 or older, SHM 3, C/FFI ABI 9 or older, relay mesh 7 or older, `topic-stream;version=1`, old Unix credential schemas and namespace-format adoption | Use IPC 18, SHM 4, C/FFI ABI 10, relay mesh 8, `topic-stream;version=2` and Unix credential schema 4; unsupported roots require offline archive/rebuild. |
+| Handshake 17 or older, SHM 3, C/FFI ABI 9 or older, relay mesh 8 or older, cross-machine HTTP `/_peer/*`, `topic-stream;version=1`, old Unix credential schemas and namespace-format adoption | Use IPC 18, SHM 4, C/FFI ABI 10, [relay mesh 9](docs/decisions/0008-relay-tls-http2-and-iroh-mesh.md), `topic-stream;version=2` and Unix credential schema 4. Unsupported roots require offline archive/rebuild. |
 | IPC 16 or older business frames: `FLAG_CALL_V2`, `FLAG_REPLY_V2`, `FLAG_CHUNK_LAST`, call/reply controls, indexed chunk headers, CTRL release frame, and settled-request markers | IPC 18 call records (`OPEN` with KeyedUnary/Recover, `READY`, `CALL_END`, `SYNC`/`SYNC_ACK`, `QUERY_CALL`/`QUERY_CALL_RESULT`, `ADMIT_TOPIC`/`ADMIT_TOPIC_RESULT`, `RELEASE`, stream/topic records, `CAP_ADMISSION_HOOK`, compact `CallMetadata`), writer-assigned request IDs and the high-water mark. |
 | Node frame I/O in TypeScript, `callChain`, compatibility ABI loaders, raw socket/path/symbol injection, ABI 7 per-connection memory context and foreign-loop transfer | Use ABI 10: Node calls `c2-core` through client domain, endpoint contexts, calls (with `metadata_json`), topic subscriptions and local response buffers. |
 | Python `cc.register()` / `Runtime.register()` returning route-name `str` | Returns `Registration` (`name`, `publisher(topic)`, `is_closed`, `active_subscribers`); Runtime keeps the route live. |

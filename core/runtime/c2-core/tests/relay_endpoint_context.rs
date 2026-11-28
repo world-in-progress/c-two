@@ -177,7 +177,8 @@ impl HttpFixture {
         let state = HttpState {
             route: RelayRouteInfo {
                 name: expected.route_name,
-                relay_url: url.clone(),
+                relay_url: Some(url.clone()),
+                proxy_via_anchor: false,
                 ipc_address: Some("ipc://same-owner".into()),
                 server_id: Some("same-owner".into()),
                 server_instance_id: Some("candidate-instance".into()),

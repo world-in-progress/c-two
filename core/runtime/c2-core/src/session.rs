@@ -281,7 +281,7 @@ pub(crate) struct ShutdownWork {
     pub(crate) server: Option<Arc<c2_server::Server>>,
     pub(crate) route_names: Vec<String>,
     pub(crate) relay_anchor_address: Option<String>,
-    pub(crate) relay_use_proxy: bool,
+    pub(crate) relay_client_config: c2_config::ResolvedRelayClientConfig,
     pub(crate) shutdown_timeout: Duration,
     relay_cleanup_config_error: Option<String>,
     scopes: HashMap<String, RelayRegistrationScope>,
@@ -293,7 +293,7 @@ impl ShutdownWork {
             server,
             route_names: Vec::new(),
             relay_anchor_address: None,
-            relay_use_proxy: false,
+            relay_client_config: Default::default(),
             shutdown_timeout,
             relay_cleanup_config_error: None,
             scopes: HashMap::new(),
@@ -465,7 +465,7 @@ struct RuntimeState {
 #[derive(Clone)]
 struct RelayProjection {
     relay_anchor_address: String,
-    relay_use_proxy: bool,
+    relay_client_config: c2_config::ResolvedRelayClientConfig,
     control: Arc<RelayControlClient>,
     local_endpoint_context: Option<c2_config::LocalEndpointContext>,
 }
@@ -1727,7 +1727,7 @@ impl Runtime {
         server: &Arc<c2_server::Server>,
         route: BuiltRoute,
         relay_anchor_address: Option<&str>,
-        relay_use_proxy: bool,
+        relay_client_config: &c2_config::ResolvedRelayClientConfig,
     ) -> Result<RegisterOutcome, LifecycleError> {
         self.ensure_active()?;
         let identity = RuntimeIdentity {
@@ -1769,7 +1769,7 @@ impl Runtime {
         if let Some(relay_anchor_address) = effective_relay_anchor_address.as_deref() {
             let projection = match self.relay_projection_for_address(
                 relay_anchor_address,
-                relay_use_proxy,
+                relay_client_config,
                 Some(server.local_endpoint().context()),
             ) {
                 Ok(projection) => projection,
@@ -1889,7 +1889,7 @@ impl Runtime {
                     self.rollback_closed_registration(&rt, server, &registration_scope);
                 let relay_cleanup_error = self.relay_cleanup(
                     effective_relay_anchor_address.as_deref(),
-                    relay_use_proxy,
+                    relay_client_config,
                     &registration_scope,
                 );
                 let (status_code, error_message, semantic_error) = http_error_parts(err);
@@ -1912,7 +1912,7 @@ impl Runtime {
                     self.rollback_closed_registration(&rt, server, &registration_scope);
                 let relay_cleanup_error = self.relay_cleanup(
                     effective_relay_anchor_address.as_deref(),
-                    relay_use_proxy,
+                    relay_client_config,
                     &registration_scope,
                 );
                 return Err(LifecycleError::RegisterFailure(Box::new(
@@ -1974,7 +1974,7 @@ impl Runtime {
         name: &str,
         expected_topics: Option<&Arc<c2_server::topic::RouteTopics>>,
         relay_anchor_address: Option<&str>,
-        relay_use_proxy: bool,
+        relay_client_config: &c2_config::ResolvedRelayClientConfig,
     ) -> Result<UnregisterOutcome, LifecycleError> {
         let route_name = name.to_string();
         let effective_relay_anchor_address =
@@ -2001,7 +2001,7 @@ impl Runtime {
         {
             match scopes.get(&route_name) {
                 Some(scope) => {
-                    self.relay_cleanup(Some(relay_anchor_address), relay_use_proxy, scope)
+                    self.relay_cleanup(Some(relay_anchor_address), relay_client_config, scope)
                 }
                 None => Some(RelayCleanupError {
                     route_name: route_name.clone(),
@@ -2101,7 +2101,7 @@ impl Runtime {
         server: Option<&Arc<c2_server::Server>>,
         route_names: Vec<String>,
         relay_anchor_address: Option<&str>,
-        relay_use_proxy: bool,
+        relay_client_config: &c2_config::ResolvedRelayClientConfig,
         relay_cleanup_config_error: Option<String>,
         shutdown_timeout: Duration,
     ) -> ShutdownOutcome {
@@ -2117,7 +2117,7 @@ impl Runtime {
                 None,
                 route_names,
                 relay_anchor_address,
-                relay_use_proxy,
+                relay_client_config,
                 relay_cleanup_config_error,
                 shutdown_timeout,
                 scopes,
@@ -2130,7 +2130,7 @@ impl Runtime {
                 Some(server),
                 route_names,
                 relay_anchor_address,
-                relay_use_proxy,
+                relay_client_config,
                 relay_cleanup_config_error,
                 shutdown_timeout,
                 scopes,
@@ -2140,7 +2140,7 @@ impl Runtime {
             server,
             route_names,
             relay_anchor_address,
-            relay_use_proxy,
+            relay_client_config,
             relay_cleanup_config_error,
             shutdown_timeout,
             scopes,
@@ -2166,7 +2166,7 @@ impl Runtime {
         server: &Arc<c2_server::Server>,
         route_names: Vec<String>,
         relay_anchor_address: Option<&str>,
-        relay_use_proxy: bool,
+        relay_client_config: &c2_config::ResolvedRelayClientConfig,
         shutdown_timeout: Duration,
     ) -> FailedStartShutdownReceipt {
         let scopes = self.capture_registration_scopes(server);
@@ -2174,7 +2174,7 @@ impl Runtime {
             server,
             route_names,
             relay_anchor_address,
-            relay_use_proxy,
+            relay_client_config,
             None,
             shutdown_timeout,
             scopes,
@@ -2186,7 +2186,7 @@ impl Runtime {
         server: &Arc<c2_server::Server>,
         route_names: Vec<String>,
         relay_anchor_address: Option<&str>,
-        relay_use_proxy: bool,
+        relay_client_config: &c2_config::ResolvedRelayClientConfig,
         relay_cleanup_config_error: Option<String>,
         shutdown_timeout: Duration,
         scopes: HashMap<String, RelayRegistrationScope>,
@@ -2203,7 +2203,7 @@ impl Runtime {
                 server: Some(server.clone()),
                 route_names,
                 relay_anchor_address: relay_anchor_address.map(str::to_owned),
-                relay_use_proxy,
+                relay_client_config: relay_client_config.clone(),
                 relay_cleanup_config_error,
                 shutdown_timeout,
                 scopes,
@@ -2411,7 +2411,7 @@ impl Runtime {
         server: Option<&Arc<c2_server::Server>>,
         route_names: Vec<String>,
         relay_anchor_address: Option<&str>,
-        relay_use_proxy: bool,
+        relay_client_config: &c2_config::ResolvedRelayClientConfig,
         relay_cleanup_config_error: Option<String>,
         shutdown_timeout: Duration,
         scopes: HashMap<String, RelayRegistrationScope>,
@@ -2420,7 +2420,7 @@ impl Runtime {
             server: server.cloned(),
             route_names,
             relay_anchor_address: relay_anchor_address.map(str::to_owned),
-            relay_use_proxy,
+            relay_client_config: relay_client_config.clone(),
             relay_cleanup_config_error,
             shutdown_timeout,
             scopes,
@@ -2446,7 +2446,7 @@ impl Runtime {
         let server = work.server.as_ref();
         let route_names = &work.route_names;
         let relay_anchor_address = work.relay_anchor_address.as_deref();
-        let relay_use_proxy = work.relay_use_proxy;
+        let relay_client_config = &work.relay_client_config;
         let scopes = &work.scopes;
         let (mut effective_relay_anchor_address, mut relay_config_errors) =
             match self.effective_relay_anchor_address_arg(relay_anchor_address) {
@@ -2609,7 +2609,7 @@ impl Runtime {
                     if let Some(scope) = scopes.get(&close.route_name) {
                         if let Some(error) = self.relay_cleanup(
                             effective_relay_anchor_address.as_deref(),
-                            relay_use_proxy,
+                            relay_client_config,
                             scope,
                         ) {
                             outcome.relay_errors.push(error);
@@ -2673,7 +2673,7 @@ impl Runtime {
         &self,
         relay_anchor_address: &str,
         expected: ExpectedRouteContract,
-        relay_use_proxy: bool,
+        relay_client_config: &c2_config::ResolvedRelayClientConfig,
         deadline: ConnectDeadline,
     ) -> Result<RelayResolvedConnection, crate::Error> {
         connect_stage_check(deadline, "relay_acquire")?;
@@ -2682,14 +2682,13 @@ impl Runtime {
             .clone();
         let projection = self.relay_projection_for_address_with_deadline(
             relay_anchor_address,
-            relay_use_proxy,
+            relay_client_config,
             frozen_context.as_ref(),
             deadline,
         )?;
         let client = RelayAwareHttpClient::new_with_control_and_budget(
             Arc::clone(&projection.control),
             expected,
-            projection.relay_use_proxy,
             RelayAwareClientConfig {
                 // One observation followed by at most one pre-dispatch refresh.
                 max_attempts: 2,
@@ -2746,14 +2745,14 @@ impl Runtime {
         &self,
         relay_url: &str,
         expected: ExpectedRouteContract,
-        relay_use_proxy: bool,
+        relay_client_config: &c2_config::ResolvedRelayClientConfig,
         deadline: ConnectDeadline,
     ) -> Result<RelayAwareHttpClient, crate::Error> {
         connect_stage_check(deadline, "relay_acquire")?;
         let client = RelayAwareHttpClient::new_with_budget(
             relay_url,
             expected,
-            relay_use_proxy,
+            relay_client_config,
             RelayAwareClientConfig {
                 // One observation followed by at most one pre-dispatch refresh.
                 max_attempts: 2,
@@ -2840,12 +2839,12 @@ impl Runtime {
     fn relay_projection_for_address(
         &self,
         relay_anchor_address: &str,
-        relay_use_proxy: bool,
+        relay_client_config: &c2_config::ResolvedRelayClientConfig,
         local_endpoint_context: Option<&c2_config::LocalEndpointContext>,
     ) -> Result<RelayProjection, LifecycleError> {
         self.relay_projection_for_address_with_deadline(
             relay_anchor_address,
-            relay_use_proxy,
+            relay_client_config,
             local_endpoint_context,
             ConnectDeadline::default(),
         )
@@ -2855,7 +2854,7 @@ impl Runtime {
     fn relay_projection_for_address_with_deadline(
         &self,
         relay_anchor_address: &str,
-        relay_use_proxy: bool,
+        relay_client_config: &c2_config::ResolvedRelayClientConfig,
         local_endpoint_context: Option<&c2_config::LocalEndpointContext>,
         deadline: ConnectDeadline,
     ) -> Result<RelayProjection, crate::Error> {
@@ -2864,22 +2863,26 @@ impl Runtime {
             let state = connect_state_lock(&self.state, deadline, "runtime_relay_wait")?;
             if let Some(projection) = state.relay_projection.as_ref()
                 && projection.relay_anchor_address == relay_anchor_address
-                && projection.relay_use_proxy == relay_use_proxy
+                && &projection.relay_client_config == relay_client_config
                 && projection.local_endpoint_context.as_ref() == local_endpoint_context
             {
                 return Ok(projection.clone());
             }
         }
 
-        let control = RelayControlClient::new(&relay_anchor_address, relay_use_proxy)
-            .map_err(|e| LifecycleError::Relay(e.to_string()))?;
+        let control = RelayControlClient::new_with_config(
+            &relay_anchor_address,
+            relay_client_config,
+            Default::default(),
+        )
+        .map_err(|e| LifecycleError::Relay(e.to_string()))?;
         let control = Arc::new(match local_endpoint_context {
             Some(context) => control.with_local_endpoint_context(context),
             None => control,
         });
         let projection = RelayProjection {
             relay_anchor_address,
-            relay_use_proxy,
+            relay_client_config: relay_client_config.clone(),
             control,
             local_endpoint_context: local_endpoint_context.cloned(),
         };
@@ -2909,7 +2912,7 @@ impl Runtime {
     fn relay_cleanup(
         &self,
         relay_anchor_address: Option<&str>,
-        relay_use_proxy: bool,
+        relay_client_config: &c2_config::ResolvedRelayClientConfig,
         scope: &RelayRegistrationScope,
     ) -> Option<RelayCleanupError> {
         let route_name = scope.name.as_str();
@@ -2917,7 +2920,7 @@ impl Runtime {
         let frozen_context = self.state.lock().frozen_local_endpoint.clone();
         let projection = match self.relay_projection_for_address(
             relay_anchor_address,
-            relay_use_proxy,
+            relay_client_config,
             frozen_context.as_ref(),
         ) {
             Ok(projection) => projection,
@@ -3350,7 +3353,7 @@ mod tests {
         let client = RelayAwareHttpClient::new(
             "https://relay.example",
             expected,
-            false,
+            &Default::default(),
             RelayAwareClientConfig::default(),
         )
         .unwrap();
@@ -3440,7 +3443,7 @@ mod tests {
             let client = RelayAwareHttpClient::new(
                 anchor,
                 expected.clone(),
-                false,
+                &Default::default(),
                 RelayAwareClientConfig::default(),
             )
             .unwrap();
@@ -3900,7 +3903,7 @@ mod tests {
         .expect("session");
         let server = test_server("missing-server");
         let err = session
-            .unregister_route(&server, "absent", None, None, false)
+            .unregister_route(&server, "absent", None, None, &Default::default())
             .expect_err("missing route should error");
         assert_eq!(err, LifecycleError::MissingRoute("absent".to_string()));
     }
@@ -3957,7 +3960,7 @@ mod tests {
         register_dummy(&server, &route_name);
 
         let outcome = session
-            .unregister_route(&server, &route_name, None, None, false)
+            .unregister_route(&server, &route_name, None, None, &Default::default())
             .expect("local unregister should succeed");
 
         assert!(outcome.local_removed);
@@ -3978,7 +3981,12 @@ mod tests {
         .expect("session");
         let server = test_server("relay-fail-server");
         session
-            .register_route(&server, dummy_route(&server, &route_name), None, false)
+            .register_route(
+                &server,
+                dummy_route(&server, &route_name),
+                None,
+                &Default::default(),
+            )
             .expect("Core registration captures the concrete relay cleanup scope");
 
         let outcome = session
@@ -3987,7 +3995,7 @@ mod tests {
                 &route_name,
                 None,
                 Some("http://127.0.0.1:9"),
-                false,
+                &Default::default(),
             )
             .expect("local unregister should succeed despite relay failure");
         assert_eq!(outcome.route_name, route_name);
@@ -3998,7 +4006,13 @@ mod tests {
         assert!(!relay_error.message.is_empty());
 
         let err = session
-            .unregister_route(&server, &outcome.route_name, None, None, false)
+            .unregister_route(
+                &server,
+                &outcome.route_name,
+                None,
+                None,
+                &Default::default(),
+            )
             .expect_err("route should have already been removed locally");
         assert!(matches!(err, LifecycleError::MissingRoute(_)));
     }
@@ -4038,7 +4052,12 @@ mod tests {
 
         let server_for_thread = Arc::clone(&server);
         let register_thread = thread::spawn(move || {
-            session.register_route(&server_for_thread, route, Some(&relay_url), false)
+            session.register_route(
+                &server_for_thread,
+                route,
+                Some(&relay_url),
+                &Default::default(),
+            )
         });
 
         let request = request_seen_rx
@@ -4211,7 +4230,12 @@ mod tests {
         let registering_session = session.clone();
         let registering_server = Arc::clone(&server);
         let register_thread = thread::spawn(move || {
-            registering_session.register_route(&registering_server, route, Some(&relay_url), false)
+            registering_session.register_route(
+                &registering_server,
+                route,
+                Some(&relay_url),
+                &Default::default(),
+            )
         });
         let final_seen = final_seen_rx.recv_timeout(Duration::from_secs(5));
         let rt = Runtime::server_runtime().expect("runtime");
@@ -4222,18 +4246,27 @@ mod tests {
         let replacement = if matches!(interference, FinalInterference::Replace) {
             // Both removal and replacement go through Core's real transactions,
             // including the saved registration scope; no raw server insertion.
-            let removal = session.unregister_route(&server, &route_name, None, None, false);
-            let registration =
-                session.register_route(&server, dummy_route(&server, &route_name), None, false);
+            let removal =
+                session.unregister_route(&server, &route_name, None, None, &Default::default());
+            let registration = session.register_route(
+                &server,
+                dummy_route(&server, &route_name),
+                None,
+                &Default::default(),
+            );
             Some((removal, registration))
         } else {
             None
         };
         let sibling = if matches!(interference, FinalInterference::UnregisterOther) {
             let name = unique_route_name("unrelated");
-            let registration =
-                session.register_route(&server, dummy_route(&server, &name), None, false);
-            let removal = session.unregister_route(&server, &name, None, None, false);
+            let registration = session.register_route(
+                &server,
+                dummy_route(&server, &name),
+                None,
+                &Default::default(),
+            );
+            let removal = session.unregister_route(&server, &name, None, None, &Default::default());
             Some((registration, removal))
         } else {
             None
@@ -4250,7 +4283,7 @@ mod tests {
             Some(&server),
             vec![route_name.clone()],
             None,
-            false,
+            &Default::default(),
             None,
             Duration::from_secs(5),
         );
@@ -4393,7 +4426,12 @@ mod tests {
         let registration_observer = session.clone();
         let server_for_thread = Arc::clone(&server);
         let register_thread = thread::spawn(move || {
-            session.register_route(&server_for_thread, route, Some(&relay_url), false)
+            session.register_route(
+                &server_for_thread,
+                route,
+                Some(&relay_url),
+                &Default::default(),
+            )
         });
 
         let final_request = final_request_rx
@@ -4466,7 +4504,7 @@ mod tests {
             Some(&server),
             vec![first.clone(), second.clone()],
             None,
-            false,
+            &Default::default(),
             None,
             Duration::from_secs(5),
         );
@@ -4477,7 +4515,7 @@ mod tests {
             Some(&server),
             first_outcome.removed_routes.clone(),
             None,
-            false,
+            &Default::default(),
             None,
             Duration::from_secs(5),
         );
@@ -4500,13 +4538,13 @@ mod tests {
         let first_route = dummy_route(&server, &first);
         let first_handle = first_route.route_handle();
         session
-            .register_route(&server, first_route, None, false)
+            .register_route(&server, first_route, None, &Default::default())
             .expect("first route should register");
 
         let second_route = dummy_route(&server, &second);
         let second_handle = second_route.route_handle();
         session
-            .register_route(&server, second_route, None, false)
+            .register_route(&server, second_route, None, &Default::default())
             .expect("second route should register");
 
         let first_guard = first_handle
@@ -4520,7 +4558,7 @@ mod tests {
                 Some(&shutdown_server),
                 route_names,
                 None,
-                false,
+                &Default::default(),
                 None,
                 Duration::from_secs(5),
             )
@@ -4560,7 +4598,7 @@ mod tests {
             Some(&server),
             vec![route_name],
             None,
-            false,
+            &Default::default(),
             None,
             Duration::from_secs(5),
         );
@@ -4605,7 +4643,7 @@ mod tests {
             Some(&server),
             vec![route_name.clone()],
             None,
-            false,
+            &Default::default(),
             None,
             Duration::from_secs(5),
         );
@@ -4637,7 +4675,7 @@ mod tests {
             Some(&server),
             vec![route_name.clone()],
             None,
-            false,
+            &Default::default(),
             Some("forced relay proxy config failure".to_string()),
             Duration::from_secs(5),
         );
@@ -4682,7 +4720,7 @@ mod tests {
             Some(&server),
             vec![route_name.clone()],
             None,
-            false,
+            &Default::default(),
             None,
             Duration::from_secs(5),
         );
@@ -4742,7 +4780,7 @@ mod tests {
             Some(&server),
             vec![route_name.clone()],
             None,
-            false,
+            &Default::default(),
             None,
             Duration::from_secs(5),
         );
@@ -4791,7 +4829,7 @@ mod tests {
         let route = dummy_route(&server, &route_name);
         let handle = route.route_handle();
         session
-            .register_route(&server, route, None, false)
+            .register_route(&server, route, None, &Default::default())
             .expect("route should register");
         let runner = {
             let server = Arc::clone(&server);
@@ -4868,7 +4906,7 @@ mod tests {
             Some(&server),
             vec![route_name.clone()],
             None,
-            false,
+            &Default::default(),
             None,
             Duration::from_secs(5),
         );
@@ -4902,7 +4940,7 @@ mod tests {
             Some(&server),
             vec![route_name],
             None,
-            false,
+            &Default::default(),
             None,
             Duration::from_secs(5),
         );
@@ -5160,7 +5198,14 @@ mod retirement_tests {
                     .unwrap()
                     .server
                     .unwrap();
-                let repeated = runtime.shutdown(Some(&server), Vec::new(), None, false, None, WAIT);
+                let repeated = runtime.shutdown(
+                    Some(&server),
+                    Vec::new(),
+                    None,
+                    &Default::default(),
+                    None,
+                    WAIT,
+                );
                 assert_eq!(repeated, original_outcome);
                 let receipt = runtime
                     .begin_session_retirement(
@@ -5203,7 +5248,13 @@ mod retirement_tests {
             .server
             .unwrap();
         FORCE_SHUTDOWN_SPAWN_FAILURE.with(|flag| flag.set(true));
-        let failed = runtime.begin_failed_start_shutdown(&server, Vec::new(), None, false, WAIT);
+        let failed = runtime.begin_failed_start_shutdown(
+            &server,
+            Vec::new(),
+            None,
+            &Default::default(),
+            WAIT,
+        );
         FORCE_SHUTDOWN_SPAWN_FAILURE.with(|flag| flag.set(false));
         let historical = failed.terminal_outcome().unwrap();
         assert!(historical.runtime_barrier_error.is_some());
@@ -5229,7 +5280,13 @@ mod retirement_tests {
             .unwrap()
             .server
             .unwrap();
-        let failed = runtime.begin_failed_start_shutdown(&server, Vec::new(), None, false, WAIT);
+        let failed = runtime.begin_failed_start_shutdown(
+            &server,
+            Vec::new(),
+            None,
+            &Default::default(),
+            WAIT,
+        );
         assert!(failed.observe_with_timeout(WAIT).1);
         failed.set_terminal_error_for_test("retained failed-start cleanup error");
         let historical = failed.terminal_outcome().unwrap();
@@ -5243,8 +5300,13 @@ mod retirement_tests {
             .unwrap()
             .server
             .unwrap();
-        let other_failed =
-            runtime.begin_failed_start_shutdown(&other_server, Vec::new(), None, false, WAIT);
+        let other_failed = runtime.begin_failed_start_shutdown(
+            &other_server,
+            Vec::new(),
+            None,
+            &Default::default(),
+            WAIT,
+        );
         assert!(other_failed.observe_with_timeout(WAIT).1);
         drop(other_host);
         drop(other_server);

@@ -14,7 +14,7 @@ use c2_server::{
 use futures::StreamExt;
 use tower::ServiceExt;
 
-use super::router::build_router;
+use super::router::build_local_router;
 use super::state::{RegisterCommitResult, RelayState};
 use super::test_support::{NoopDisseminator, TEST_ABI_HASH, TEST_SIGNATURE_HASH};
 
@@ -194,7 +194,7 @@ async fn removed_echo_route_returns_not_found() {
         LocalEndpointContext::default_for_platform().unwrap(),
         budget(16 * 1024, 0, 1),
     );
-    let response = build_router(state)
+    let response = build_local_router(state)
         .oneshot(call_request("/_echo"))
         .await
         .unwrap();
@@ -205,7 +205,7 @@ async fn removed_echo_route_returns_not_found() {
 async fn full_memory_budget_answers_pre_admission_errors_without_waiting() {
     let memory = 16 * 1024;
     let budget = budget(memory, 0, 1);
-    let app = build_router(state(
+    let app = build_local_router(state(
         LocalEndpointContext::default_for_platform().unwrap(),
         budget.clone(),
     ));
@@ -242,7 +242,7 @@ async fn full_memory_budget_answers_pre_admission_errors_without_waiting() {
 async fn zero_memory_budget_immediately_refuses_even_a_zero_byte_call() {
     let fixture = Fixture::start("adm-zero", 0, 0, 0).await;
     let mut request = Box::pin(
-        build_router(fixture.state.clone())
+        build_local_router(fixture.state.clone())
             .oneshot(call_request("/_c2/calls/call?route=output&method=produce")),
     );
     let std::task::Poll::Ready(Ok(refused)) = futures::poll!(&mut request) else {
@@ -256,7 +256,7 @@ async fn zero_memory_budget_immediately_refuses_even_a_zero_byte_call() {
 #[tokio::test]
 async fn unary_response_holds_slot_through_eof_abort_and_last_transport_frame() {
     let fixture = Fixture::start("adm-slot", 4 * RESPONSE_BYTES as u64, 0, 1).await;
-    let app = build_router(fixture.state.clone());
+    let app = build_local_router(fixture.state.clone());
     for abort in [false, true] {
         let response = app
             .clone()
@@ -304,7 +304,7 @@ async fn tiny_memory_budget_recycles_download_window_while_a_second_call_waits()
     let memory = 8 * 1024;
     let fixture = Fixture::start("adm-window", memory, RESPONSE_BYTES as u64 + 64, 2).await;
     let state = fixture.state.clone();
-    let app = build_router(state.clone());
+    let app = build_local_router(state.clone());
     tokio::time::timeout(WAIT, async {
         let first = app
             .clone()
@@ -317,8 +317,16 @@ async fn tiny_memory_budget_recycles_download_window_while_a_second_call_waits()
             RESPONSE_BYTES.to_string()
         );
         let snapshot = state.domain_snapshot();
-        assert_eq!(snapshot.memory.used_bytes, memory);
+        let first_window = snapshot.memory.used_bytes;
+        assert!(first_window > 0 && first_window < memory);
         assert!(snapshot.file_spill.used_bytes >= RESPONSE_BYTES as u64);
+        // Occupy the remaining fair-share slack so the second call genuinely
+        // waits on shared memory while the first call recycles its window.
+        let _slack = state
+            .forwarding
+            .budget()
+            .try_reserve_memory(memory - first_window)
+            .unwrap();
 
         let mut second =
             Box::pin(app.oneshot(call_request("/_c2/calls/call?route=output&method=produce")));
@@ -329,6 +337,7 @@ async fn tiny_memory_budget_recycles_download_window_while_a_second_call_waits()
         let second = second.await.unwrap();
         assert_eq!(second.status(), StatusCode::OK);
         collect_output(second.into_body().into_data_stream(), memory as usize).await;
+        drop(_slack);
         let snapshot = state.domain_snapshot();
         assert_eq!(snapshot.memory.peak_bytes, memory);
         assert_eq!(snapshot.memory.used_bytes, 0);

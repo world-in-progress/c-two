@@ -2,7 +2,7 @@
 
 C3 **0.8.0** accompanies C-Two **0.12.x**, sharing its IPC 17, SHM 4, C/FFI ABI 9, relay mesh 7, Unix namespace format 3 and endpoint maintenance behavior. See the [0.12.0 release notes](../docs/releases/0.12.0.md).
 
-Current source builds use IPC 18, C/FFI ABI 10 and relay mesh 8. `c3 relay` forwards keyed unary submission, recovery and outcome queries over the fixed HTTP endpoints defined in [ADR 0007](../docs/decisions/0007-call-metadata-and-admission-hooks.md).
+Current source builds use IPC 18, C/FFI ABI 10 and relay mesh 9. `c3 relay` forwards keyed unary submission, recovery and outcome queries over the fixed HTTP endpoints defined in [ADR 0007](../docs/decisions/0007-call-metadata-and-admission-hooks.md).
 
 Python does not own CLI behavior; do not add command behavior under `sdk/python/src/c_two`. `cli/` contains the Rust crate for `c3`, the native C-Two command-line interface. It starts relay servers and inspects relay registry state for C-Two deployments.
 
@@ -13,6 +13,7 @@ This guide covers the native c3 interface. Configuration is documented in the [c
 `c3` owns product-level runtime commands:
 
 - `c3 relay` starts the HTTP relay used for cross-machine discovery.
+- `c3 bridge` starts a private rendezvous and encrypted packet forwarding server for iroh relay peers.
 - `c3 registry list-routes` lists route names registered with a relay.
 - `c3 registry peers` lists peer relays known by a mesh relay.
 - `c3 registry force-leave` makes a mesh relay forget an unreachable relay.
@@ -79,7 +80,7 @@ The output contains C-Two contract/release/composition metadata, the target-spec
 
 ## Configuration
 
-Relay startup and `--dry-run` use the same Rust configuration resolver and capture the environment catalog once per invocation. Set `C2_ENV_FILE` to load a different file from the default `.env` in the current directory, or set it to an empty string to disable file loading.
+Relay and bridge startup and `--dry-run` use the same Rust configuration resolver and capture the environment catalog once per invocation. Set `C2_ENV_FILE` to load a different file from the default `.env` in the current directory, or set it to an empty string to disable file loading.
 
 ```bash
 C2_ENV_FILE=relay.env c3 relay --dry-run
@@ -98,19 +99,28 @@ Color output follows common terminal conventions (checked in priority order):
 Start a relay:
 
 ```bash
-c3 relay --bind 0.0.0.0:8080
+c3 relay --bind 127.0.0.1:8080
 ```
 
-Relay HTTP and mesh endpoints are not public-facing APIs. Bind to `0.0.0.0` only inside a trusted deployment boundary, and restrict access with private networking, firewall rules, Kubernetes NetworkPolicy, service mesh policy, or ingress authentication.
+The loopback listener serves Host registration, administration, local Mesh 9 peers, discovery and RPC. Add `--edge-bind` for external clients or a reverse proxy. The edge listener serves discovery and RPC without exposing local IPC addresses or server instance identity, even on a loopback bind.
 
 Useful options:
 
 | Option | Environment | Default | Purpose |
 |---|---|---:|---|
-| `--bind`, `-b` | `C2_RELAY_BIND` | `0.0.0.0:8080` | HTTP listen address. Port `0` takes a free port; the `C-Two relay listening at` line prints the bound address. |
-| `--seeds`, `-s` | `C2_RELAY_SEEDS` | empty | Comma-separated seed relay URLs for mesh mode. |
-| `--relay-id` | `C2_RELAY_ID` | generated | Stable relay identifier for the mesh protocol. |
-| `--advertise-url` | `C2_RELAY_ADVERTISE_URL` | derived from the bound address | Public URL other relays should use to reach this relay. |
+| `--bind`, `-b` | `C2_RELAY_BIND` | `127.0.0.1:8080` | Loopback HTTP control address. Port `0` selects a free port. |
+| `--edge-bind` | `C2_RELAY_EDGE_BIND` | unset | Optional business and discovery listen address. A non-loopback address defaults to TLS. |
+| `--tls-cert`, `--tls-key` | `C2_RELAY_TLS_CERT`, `C2_RELAY_TLS_KEY` | unset | Edge PEM certificate chain and private key. Supply both. |
+| `--tls-auto` | `C2_RELAY_TLS_AUTO` | false | Select a persistent self-signed certificate, including on loopback. |
+| `--tls-san` | `C2_RELAY_TLS_SAN` | empty | Comma-separated additional DNS names and IP addresses for automatic TLS. |
+| `--state-dir` | `C2_RELAY_STATE_DIR` | `~/.c3-relay` | Private directory for generated edge TLS credentials and the mesh endpoint key. Create its parent before startup. |
+| `--insecure-plaintext` | `C2_RELAY_INSECURE_PLAINTEXT` | false | Explicitly allow a non-loopback plaintext edge. |
+| `--seeds`, `-s` | `C2_RELAY_SEEDS` | empty | Comma-separated loopback HTTP URLs or `iroh://<endpoint-id>[@<ip:port>]` seed addresses. |
+| `--bridge` | `C2_RELAY_BRIDGE` | unset | Private HTTPS bridge URL with optional certificate pin and QUIC address discovery port. |
+| `--bridge-token` | `C2_RELAY_BRIDGE_TOKEN` | unset | Required with a bridge. Printable ASCII without whitespace. |
+| `--cluster-secret` | `C2_RELAY_CLUSTER_SECRET` | unset | Shared secret for iroh peer authentication. Required with a bridge or iroh seed and distinct from the bridge token. |
+| `--relay-id` | `C2_RELAY_ID` | generated | Stable relay identifier. With iroh enabled, the default derives from the persistent endpoint key. |
+| `--advertise-url` | `C2_RELAY_ADVERTISE_URL` | derived from the bound address | Public URL clients use for this relay, including a reverse proxy URL. |
 | `--ipc-root` | `C2_IPC_ROOT` | `/tmp/c2-v3-<uidhex>` (Unix) | Final owner-controlled endpoint directory; custom directories are application-provisioned, and `0755` is accepted when other identities cannot modify them. Not applicable on Windows, where upstream IPC uses TokenUser-scoped Named Pipes. |
 | `--memory-budget-bytes` | `C2_MEMORY_BUDGET_BYTES` | 16 GiB | Memory for the relay's business forwarding and upstream IPC storage. Zero closes new forwarding admission. |
 | `--file-spill-budget-bytes` | `C2_FILE_SPILL_BUDGET_BYTES` | 16 GiB | Temporary file-backed reassembly capacity. Zero disables file spill. |
@@ -121,11 +131,16 @@ Examples:
 
 ```bash
 c3 relay --bind 127.0.0.1:8080
-c3 relay --bind 0.0.0.0:8080 --upstream grid=server@ipc://server
-c3 relay --relay-id relay-a --advertise-url http://relay-a:8080 --seeds http://relay-b:8080,http://relay-c:8080
+c3 relay --bind 127.0.0.1:8080 --upstream grid=server@ipc://server
+c3 relay --edge-bind 0.0.0.0:8443 --advertise-url https://relay.example.org:8443
+c3 relay --bind 127.0.0.1:8081 --relay-id relay-b --seeds http://127.0.0.1:8080
 ```
 
-Use `--dry-run` to validate and print the resolved configuration and effective relay domain budgets and slot limit without starting the server. It exits right after config resolution and does not bind the listen socket (port `0` still prints as `0`), run startup checks on `--advertise-url`, or register `--upstream` entries.
+Loopback edge listeners default to plaintext for a same-host reverse proxy. Cleartext listeners support HTTP/1.1 and HTTP/2 prior knowledge. TLS listeners negotiate `h2` or `http/1.1` with ALPN. Select an explicit certificate and key, an automatically generated identity, or plaintext. The relay prints the bound addresses and the dialable edge URL. Give it `--advertise-url` for a public hostname or IP when binding a wildcard. Without that setting, a wildcard produces a same-family loopback URL.
+
+Automatic TLS generates `edge-cert.pem` and `edge-key.pem` in the state directory. The directory and generated files use Unix modes `0700` and `0600` or a protected Windows DACL for the current TokenUser. Each relay needing a distinct identity uses a separate state directory. The leaf certificate includes the advertised host, configured SANs, the non-wildcard edge IP and loopback names and addresses. Subsequent starts reuse the files and print the same leaf DER fingerprint. Configure clients with `C2_RELAY_CERT_SHA256=sha256:<hex>` for a pinned identity or `C2_RELAY_CA_CERT` for a custom PEM trust root. Configure Host registration with the loopback URL.
+
+Use `--dry-run` to validate and print the resolved listener and TLS options, budgets and slot limit. It keeps configured ports, including `0`, and exits before opening listeners, loading or generating certificates, or registering upstreams.
 
 ```bash
 c3 relay --bind 127.0.0.1:9999 --memory-budget-bytes 134217728 --dry-run
@@ -144,6 +159,28 @@ The relay evicts unreferenced upstream IPC connections after 60 seconds without 
 When running normally, `c3 relay` installs a Ctrl+C handler and stops the relay cleanly on interrupt.
 
 `c3 relay` also serves resource-owned topic subscriptions ([ADR 0005](../docs/decisions/0005-publish-subscribe.md)). Each local route's declared topics become available at `POST /_c2/topics/subscribe?route=<pct>&topic=<pct>` with `application/vnd.c-two.topic-stream;version=2`. The relay opens one shared upstream IPC subscription per registration and topic and fans out a single budgeted copy to all downstream HTTP subscribers, including across two-tier cross-relay hops. Ctrl+C ends forwarded subscriptions with `CallCancelled` naming relay shutdown after the frame each subscriber already selected. See [relay topic forwarding](../docs/reference/contracts-and-routing.md#relay-topic-forwarding).
+
+## Bridge
+
+Run `c3 bridge` on a reachable machine to give relay endpoints a common place to discover addresses and forward encrypted packets when a direct link is unavailable. It accepts authenticated bridge clients over HTTPS and offers QUIC address discovery over UDP. It holds the bridge token and TLS identity.
+
+| Option | Environment | Default |
+|---|---|---|
+| `--bind` | `C2_BRIDGE_BIND` | `0.0.0.0:8443` |
+| `--quic-bind` | `C2_BRIDGE_QUIC_BIND` | `0.0.0.0:7842`, set `off` to disable |
+| `--tls-cert`, `--tls-key` | `C2_BRIDGE_TLS_CERT`, `C2_BRIDGE_TLS_KEY` | Generated self-signed identity. Supply both for an explicit PEM chain and key. |
+| `--state-dir` | `C2_BRIDGE_STATE_DIR` | `~/.c3-bridge` |
+| `--token` | `C2_BRIDGE_TOKEN` | Generated and persisted; an explicit token must be printable ASCII without whitespace |
+
+Start the bridge, copy the printed `--bridge` URL, replace `<HOST>` with a reachable address when present, and share its token with relay operators. A generated bridge identity uses `bridge-cert.pem` and `bridge-key.pem`. The generated token is stored in `bridge-token` as 64 lowercase hex digits. The owner-only directory and files persist across restarts. Supply `--dry-run` to resolve settings without opening sockets or generating files. Dry-run prints `token=explicit` or `token=auto`. Ctrl+C stops the server.
+
+A relay uses `--bridge 'https://host:8443?pin=<64-lower-hex>&quic=off'` with the bridge token. Omit `pin` for a publicly trusted certificate. The default address discovery port is 7842. Set `quic=<port>` for another port or `quic=off` to disable it. Keep the cluster secret on the relays so they can authenticate each other end to end. Relay dry-run reports both credentials as set or unset.
+
+Relay startup stores `mesh-key.ed25519` in its private state directory and prints an `iroh://<endpoint-id>` seed for other relays. With a shared bridge, the endpoint ID is sufficient to reach a relay behind NAT. For a direct seed without a bridge, append a reachable `@<ip:port>` hint. The default relay ID derives from the persistent endpoint key, so keep the state directory across restarts.
+
+Mesh 9 bootstraps and exchanges routes over authenticated iroh connections across machines. Relays use their shared cluster secret to authenticate each other and keep peer control and RPC data on separate QUIC connections. iroh prefers a direct UDP path and forwards encrypted traffic through the bridge over HTTPS/WebSocket when direct connectivity fails. HTTP seeds and `/_peer/*` are available on the loopback control listener for local meshes. [ADR 0008](../docs/decisions/0008-relay-tls-http2-and-iroh-mesh.md)
+
+SDK clients need only the HTTP(S) URL of a relay anchor. If a route is reachable only over iroh, or the edge directs the client through the anchor, discovery sets `proxy_via_anchor: true`. The client uses its configured anchor URL, including any reverse proxy path prefix and TLS trust. The anchor forwards to the route owner, which connects to the Host over IPC. [Relay discovery and forwarding](../docs/reference/contracts-and-routing.md#relay-discovery-and-forwarding)
 
 ## Local endpoint maintenance
 
@@ -173,13 +210,15 @@ List registered routes:
 c3 registry list-routes --relay http://127.0.0.1:8080
 ```
 
-Each line names one registration: the route name, the relay that holds it and its URL, the registration time, and that relay's status as this relay sees it (Alive, Suspect or Dead). A line ends with `route conflict` when more than one live registration of the name exists; new acquisitions of such a name fail with `RouteConflict` until the deployer unregisters one copy. A name whose registrations are all on Suspect or Dead relays stays held: it does not resolve and cannot be registered elsewhere until that relay comes back and withdraws it, or the deployer force-leaves the relay below. A Host that ended without unregistering keeps its name at its relay; withdraw it there with `POST /_admin/unregister` and a JSON body with `name` and `server_id`, and the relay passes the withdrawal on to its peers.
+Each line names one registration: the route name, the relay that holds it and its address, the registration time, and that relay's status as this relay sees it (Alive, Suspect or Dead). A line ends with `route conflict` when more than one live registration of the name exists; new acquisitions of such a name fail with `RouteConflict` until the deployer unregisters one copy. A name whose registrations are all on Suspect or Dead relays stays held: it does not resolve and cannot be registered elsewhere until that relay comes back and withdraws it, or the deployer force-leaves the relay below. A Host that ended without unregistering keeps its name at its relay; withdraw it there with `POST /_admin/unregister` and a JSON body with `name` and `server_id`, and the relay passes the withdrawal on to its peers.
 
 List known mesh peers:
 
 ```bash
 c3 registry peers --relay http://127.0.0.1:8080
 ```
+
+Both listings display the relay’s HTTP URL when available, or `iroh://<endpoint-id>` for an iroh-only address. The iroh address is for relay peering. Use the anchor’s HTTP(S) URL for SDK clients.
 
 Force an unreachable relay to leave the mesh:
 

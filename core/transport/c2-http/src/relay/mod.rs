@@ -51,17 +51,25 @@ pub(crate) mod client_lifecycle;
 #[cfg(test)]
 mod client_lifecycle_tests;
 pub(crate) mod conn_pool;
-pub(crate) mod connection;
 pub(crate) mod disseminator;
+#[cfg(test)]
+mod edge_tests;
 #[cfg(test)]
 mod force_leave_tests;
 pub(crate) mod forwarding;
 #[cfg(test)]
 mod forwarding_tests;
 pub(crate) mod gossip;
+pub mod iroh_transport;
 #[cfg(test)]
 mod memory_tests;
+#[cfg(test)]
+mod mesh_forward_tests;
+#[cfg(test)]
+mod mesh_stream_tests;
 pub(crate) mod peer;
+pub(crate) mod peer_client;
+pub(crate) mod peer_forward;
 pub(crate) mod peer_handlers;
 #[cfg(test)]
 mod route_identity_tests;
@@ -69,16 +77,20 @@ pub(crate) mod route_table;
 pub(crate) mod router;
 pub mod server;
 pub(crate) mod state;
+pub(crate) mod stream_control;
 #[cfg(test)]
 mod stream_tests;
 pub(crate) mod streaming;
 #[cfg(test)]
 pub(crate) mod test_support;
+mod tls;
 pub(crate) mod topic_hub;
 pub(crate) mod topic_remote;
+mod transport;
 pub(crate) mod types;
 pub(crate) mod upstream_control;
 pub(crate) mod url;
 
 pub use c2_config::RelayConfig;
 pub use server::{RelayControlError, RelayServer, RelayServerOptions, RelayShutdownReceipt};
+pub use types::{IrohPeerAddr, PeerAddress};

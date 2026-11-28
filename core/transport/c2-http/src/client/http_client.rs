@@ -138,8 +138,8 @@ pub enum HttpError {
 /// client carries no total call timeout: only the caller's explicit
 /// `CallScope` / `CallOptions` deadline bounds a call.
 pub struct HttpClient {
-    client: reqwest::Client,
-    probe_client: reqwest::Client,
+    data_client: reqwest::Client,
+    control_client: reqwest::Client,
     base_url: String,
 }
 
@@ -214,27 +214,29 @@ pub(crate) enum HttpUnaryMode<'a> {
     Recover(&'a str),
 }
 
+pub(super) const CONTROL_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 impl HttpClient {
-    /// Create a new client with an explicit proxy policy. The data-plane
+    /// Create independent control and data pools with the same trust policy. The data-plane
     /// client has no total/upload timeout, no hidden POST replay and no
     /// redirects: inherited defaults, explicit deadlines and Unlimited belong
     /// to the caller's scope.
-    pub fn new(base_url: &str, max_connections: usize, use_proxy: bool) -> Result<Self, HttpError> {
-        let client = crate::relay_client_builder_with_proxy(use_proxy)
-            .pool_max_idle_per_host(max_connections)
-            .retry(reqwest::retry::never())
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .map_err(|e| HttpError::Transport(e.to_string()))?;
-        // Probes are control-plane operations with an independent safety timeout.
-        // Waiting for them never resets the owner's original absolute deadline.
-        let probe_client = crate::relay_client_builder_with_proxy(use_proxy)
-            .timeout(std::time::Duration::from_secs(5))
-            .build()
-            .map_err(|e| HttpError::Transport(e.to_string()))?;
+    pub fn new(
+        base_url: &str,
+        max_connections: usize,
+        policy: &c2_config::ResolvedRelayClientConfig,
+    ) -> Result<Self, HttpError> {
+        let tls = crate::relay_tls_config(&policy.tls_trust)?;
+        let build = |tls| {
+            crate::tls::relay_client_builder_with_tls(policy.use_proxy, tls)
+                .pool_max_idle_per_host(max_connections)
+                .retry(reqwest::retry::never())
+                .build()
+                .map_err(|e| HttpError::Transport(e.to_string()))
+        };
         Ok(Self {
-            client,
-            probe_client,
+            data_client: build(tls.clone())?,
+            control_client: build(tls)?,
             base_url: base_url.trim_end_matches('/').to_owned(),
         })
     }
@@ -254,7 +256,7 @@ impl HttpClient {
             HttpUnaryMode::Keyed(id) => (KEYED_PATH, Some(id)),
             HttpUnaryMode::Recover(id) => (RECOVER_PATH, Some(id)),
         };
-        let mut request = self.client.post(format!(
+        let mut request = self.data_client.post(format!(
             "{}{path}?route={}&method={}",
             self.base_url,
             encode_segment(&expected.route_name),
@@ -288,7 +290,7 @@ impl HttpClient {
             control.check_dispatch()?;
         }
         let resp = self
-            .client
+            .data_client
             .execute(request)
             .await
             .map_err(HttpError::Request)?;
@@ -308,7 +310,7 @@ impl HttpClient {
             self.base_url,
             encode_segment(&expected.route_name)
         );
-        let request = self.client.get(url).header(CALL_ID_HEADER, call_id);
+        let request = self.control_client.get(url).header(CALL_ID_HEADER, call_id);
         let response = add_expected_contract_headers(add_metadata(request, metadata), expected)
             .send()
             .await
@@ -370,7 +372,7 @@ impl HttpClient {
             )
             .await?;
         let request = self
-            .client
+            .data_client
             .post(&url)
             .header("Content-Type", "application/octet-stream")
             .header("Accept", crate::stream_wire::MEDIA_TYPE)
@@ -382,7 +384,7 @@ impl HttpClient {
         control.check_active()?;
         control.check_dispatch()?;
         let response = self
-            .client
+            .data_client
             .execute(request)
             .await
             .map_err(HttpError::Request)?;
@@ -408,7 +410,7 @@ impl HttpClient {
             .to_owned();
         Ok(HttpResponseStream::start(
             response,
-            self.client.clone(),
+            self.control_client.clone(),
             self.base_url.clone(),
             token,
             budget.clone(),
@@ -445,7 +447,7 @@ impl HttpClient {
             encode_segment(topic_name)
         );
         let request = self
-            .client
+            .data_client
             .post(url)
             .header("Accept", crate::topic_wire::MEDIA_TYPE)
             .header(
@@ -468,14 +470,18 @@ impl HttpClient {
             .map_err(|e| HttpError::InvalidInput(e.to_string()))?;
         control.check_active()?;
         control.check_dispatch()?;
-        let client = self.client.clone();
+        let data_client = self.data_client.clone();
+        let control_client = self.control_client.clone();
         let base_url = self.base_url.clone();
         let budget = budget.clone();
         let actor_cancel = cancellation.clone();
         let (tx, rx) = tokio::sync::oneshot::channel();
         tokio::spawn(async move {
             let result = async {
-                let response = client.execute(request).await.map_err(HttpError::Request)?;
+                let response = data_client
+                    .execute(request)
+                    .await
+                    .map_err(HttpError::Request)?;
                 if response.status().as_u16() != 200 {
                     return Err(crate::payload::read_http_error(response, &budget, None).await);
                 }
@@ -494,7 +500,7 @@ impl HttpClient {
                 topic_open_headers(response.headers()).map_err(stream_protocol_error)?;
                 HttpTopicSubscription::start(
                     response,
-                    client.clone(),
+                    control_client,
                     base_url,
                     token,
                     budget,
@@ -525,8 +531,9 @@ impl HttpClient {
     pub async fn health_async(&self) -> Result<bool, HttpError> {
         let url = format!("{}/health", self.base_url);
         let resp = self
-            .client
+            .control_client
             .get(&url)
+            .timeout(CONTROL_REQUEST_TIMEOUT)
             .send()
             .await
             .map_err(HttpError::Request)?;
@@ -543,7 +550,12 @@ impl HttpClient {
         } else {
             format!("{}/_probe/{route}", self.base_url)
         };
-        let request = add_expected_contract_headers(self.probe_client.get(&url), expected);
+        let request = add_expected_contract_headers(
+            self.control_client
+                .get(&url)
+                .timeout(CONTROL_REQUEST_TIMEOUT),
+            expected,
+        );
         let response = request.send().await.map_err(HttpError::Request)?;
         if response.status().as_u16() == 200 {
             Ok(())
@@ -680,7 +692,7 @@ mod tests {
                 }),
             );
             let server = tokio::spawn(async move { axum::serve(listener, app).await });
-            let client = HttpClient::new(&url, 1, false).unwrap();
+            let client = HttpClient::new(&url, 1, &Default::default()).unwrap();
             let result = client
                 .topic_route_async(
                     &expected,
@@ -708,7 +720,7 @@ mod tests {
 
     #[tokio::test]
     async fn prepared_owned_body_guard_returns_intact_local_error_before_network() {
-        let client = HttpClient::new("http://127.0.0.1:9", 100, false).unwrap();
+        let client = HttpClient::new("http://127.0.0.1:9", 100, &Default::default()).unwrap();
         let expected = ExpectedRouteContract {
             route_name: "grid".into(),
             crm_ns: "test.grid".into(),
@@ -759,12 +771,12 @@ mod tests {
     }
 
     #[test]
-    fn data_client_has_no_total_timeout_while_probe_remains_bounded() {
-        let client = HttpClient::new("http://localhost:9988", 100, false).unwrap();
+    fn pools_leave_total_call_timeouts_to_the_call_scope() {
+        let client = HttpClient::new("http://localhost:9988", 100, &Default::default()).unwrap();
         // reqwest's Client Debug projects its actual configured TotalTimeout
         // (reqwest 0.12.28 RequestConfig::fmt_as_field), not a local policy copy.
-        assert!(!format!("{:?}", client.client).contains("TotalTimeout"));
-        assert!(format!("{:?}", client.probe_client).contains("TotalTimeout"));
+        assert!(!format!("{:?}", client.data_client).contains("TotalTimeout"));
+        assert!(!format!("{:?}", client.control_client).contains("TotalTimeout"));
     }
 
     #[test]
@@ -805,3 +817,7 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "tls_tests.rs"]
+mod tls_tests;

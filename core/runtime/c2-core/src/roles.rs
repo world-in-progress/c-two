@@ -214,7 +214,7 @@ impl FrozenServerConfig {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct HostSettings {
     pub relay_anchor_address: Option<String>,
-    pub relay_use_proxy: bool,
+    pub relay_client_config: c2_config::ResolvedRelayClientConfig,
     pub shutdown_timeout: std::time::Duration,
 }
 

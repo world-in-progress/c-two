@@ -731,11 +731,7 @@ impl ServiceDefinition {
     }
 
     /// Configure the bounded history ring depth (`>= 1`) of a declared topic.
-    pub fn with_topic_capacity(
-        mut self,
-        topic_name: &str,
-        capacity: usize,
-    ) -> Result<Self, Error> {
+    pub fn with_topic_capacity(mut self, topic_name: &str, capacity: usize) -> Result<Self, Error> {
         let config = TopicConfig { capacity };
         config.validate().map_err(Error::Semantic)?;
         let slot = self.topics.get_mut(topic_name).ok_or_else(|| {
@@ -1000,14 +996,16 @@ impl HostOptions {
         {
             return Err(LifecycleError::Relay("invalid HTTP relay base URL".into()));
         }
-        let relay_use_proxy = match (self.relay_use_proxy, frozen) {
-            (_, _) if relay_anchor_address.is_none() => false,
-            (Some(use_proxy), _) => use_proxy,
-            (None, Some(settings)) => settings.relay_use_proxy,
-            (None, None) => {
-                c2_config::ConfigResolver::resolve_relay_client(None, catalog)
+        let relay_client_config = match (relay_anchor_address.as_ref(), frozen) {
+            (None, _) => Default::default(),
+            (Some(_), Some(settings)) => {
+                let mut config = settings.relay_client_config.clone();
+                config.use_proxy = self.relay_use_proxy.unwrap_or(config.use_proxy);
+                config
+            }
+            (Some(_), None) => {
+                c2_config::ConfigResolver::resolve_relay_client(self.relay_use_proxy, catalog)
                     .map_err(|error| LifecycleError::Configuration(error.to_string()))?
-                    .use_proxy
             }
         };
         let shutdown_timeout = self
@@ -1018,7 +1016,7 @@ impl HostOptions {
             .map_err(|error| LifecycleError::Configuration(error.to_string()))?;
         Ok(crate::roles::HostSettings {
             relay_anchor_address,
-            relay_use_proxy,
+            relay_client_config,
             shutdown_timeout,
         })
     }
@@ -1047,7 +1045,7 @@ pub(crate) struct HostInner {
     /// through its operation slots exactly like remote calls.
     domain_budget: c2_mem::DomainBudget,
     relay_anchor_address: Option<String>,
-    relay_use_proxy: bool,
+    relay_client_config: c2_config::ResolvedRelayClientConfig,
     shutdown_timeout: Duration,
     route_names: Mutex<HashSet<String>>,
     route_topics: Mutex<HashMap<String, Arc<RouteTopics>>>,
@@ -1112,7 +1110,7 @@ impl HostInner {
             Some(&self.server),
             route_names,
             self.relay_anchor_address.as_deref(),
-            self.relay_use_proxy,
+            &self.relay_client_config,
             None,
             timeout,
         );
@@ -1144,7 +1142,7 @@ impl HostInner {
             &self.server,
             self.route_names.lock().iter().cloned().collect(),
             self.relay_anchor_address.as_deref(),
-            self.relay_use_proxy,
+            &self.relay_client_config,
             self.shutdown_timeout,
         )
     }
@@ -1204,7 +1202,7 @@ impl HostInner {
             route_name,
             Some(topics),
             self.relay_anchor_address.as_deref(),
-            self.relay_use_proxy,
+            &self.relay_client_config,
         ) {
             Ok(outcome) => outcome,
             Err(LifecycleError::MissingRoute(_)) => UnregisterOutcome {
@@ -1280,7 +1278,7 @@ impl Host {
         );
         work.route_names = routes.iter().cloned().collect();
         work.relay_anchor_address = self.inner.relay_anchor_address.clone();
-        work.relay_use_proxy = self.inner.relay_use_proxy;
+        work.relay_client_config = self.inner.relay_client_config.clone();
         Ok(work)
     }
 
@@ -1386,7 +1384,7 @@ impl Host {
             &self.inner.server,
             route,
             self.inner.relay_anchor_address.as_deref(),
-            self.inner.relay_use_proxy,
+            &self.inner.relay_client_config,
         ) {
             Ok(outcome) => outcome,
             Err(error) => {
@@ -1663,7 +1661,7 @@ impl Runtime {
         let budget = admission.budget.clone();
         let crate::roles::HostSettings {
             relay_anchor_address,
-            relay_use_proxy,
+            relay_client_config,
             shutdown_timeout,
         } = admission.settings;
         let endpoint = self
@@ -1703,7 +1701,7 @@ impl Runtime {
             server: Arc::clone(&server),
             domain_budget: admission.budget,
             relay_anchor_address,
-            relay_use_proxy,
+            relay_client_config,
             shutdown_timeout,
             route_names: Mutex::new(HashSet::new()),
             route_topics: Mutex::new(HashMap::new()),
@@ -3449,7 +3447,7 @@ mod lifecycle_tests {
             Some(&host.inner.server),
             vec![route.clone()],
             Some(&relay_url),
-            false,
+            &Default::default(),
             None,
             Duration::from_millis(100),
         );

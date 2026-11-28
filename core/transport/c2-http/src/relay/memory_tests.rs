@@ -3,7 +3,7 @@
 //! The first five tests cover RelayState -> IpcClient -> LocalStream -> Server,
 //! not HTTP. Connections perform real identity/contract/token handshakes; no
 //! injected pools, synthetic reservations, or acquire bypass.
-//! The last test uses an actual TCP listener and build_router, including an
+//! The last test uses an actual TCP listener and build_local_router, including an
 //! incomplete HTTP Content-Length upload and a later complete HTTP call.
 //! IPC endpoints have unique owner incarnations. Reply reassembly is copied
 //! into a local Vec before a public call returns; budget peaks and refunds
@@ -31,7 +31,7 @@ use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 
 use super::conn_pool::{CachedClient, UpstreamLease};
-use super::router::build_router;
+use super::router::build_local_router;
 use super::state::{RegisterCommitResult, RelayState};
 use super::test_support::{NoopDisseminator, TEST_ABI_HASH, TEST_SIGNATURE_HASH};
 use super::types::RouteEntry;
@@ -715,10 +715,11 @@ async fn exercise_http_upload(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn actual_http_incomplete_upload_and_completed_call_refund_after_idle_close() {
-    let charge = DedicatedSegment::required_shm_size(PAYLOAD_LEN).unwrap() as u64
-        + 2 * PAYLOAD_LEN as u64
-        + c2_config::CHUNK_SIZE;
-    let state = state(charge, REPLY_LEN as u64);
+    let dedicated = DedicatedSegment::required_shm_size(PAYLOAD_LEN).unwrap() as u64;
+    let budget_limit = dedicated + 2 * PAYLOAD_LEN as u64 + c2_config::CHUNK_SIZE;
+    let fair_window = (budget_limit - PAYLOAD_LEN as u64) / 2;
+    let charge = dedicated + PAYLOAD_LEN as u64 + fair_window;
+    let state = state(budget_limit, REPLY_LEN as u64);
     let upstream = Upstream::start(&state, "http", 113, true).await;
     // Keep the original acquired client so an unnoticed eviction/replacement
     // cannot masquerade as survival of the HTTP upload's connection.
@@ -727,7 +728,7 @@ async fn actual_http_incomplete_upload_and_completed_call_refund_after_idle_clos
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let (stop_tx, stop_rx) = oneshot::channel();
-    let app = build_router(state.clone());
+    let app = build_local_router(state.clone());
     let mut http_task = tokio::spawn(async move {
         axum::serve(listener, app)
             .with_graceful_shutdown(async {

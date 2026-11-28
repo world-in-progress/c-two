@@ -2,15 +2,57 @@
 
 use std::sync::Arc;
 
-use axum::{Json, extract::State, http::StatusCode, response::IntoResponse};
+use axum::{
+    Json,
+    extract::{FromRequest, Request, State},
+    http::StatusCode,
+    response::{IntoResponse, Response},
+};
+
+use super::iroh_transport::AuthenticatedIrohPeer;
 
 use crate::relay::authority::RouteAuthority;
 use crate::relay::peer::{
-    DigestDiffEntry, PROTOCOL_VERSION, PeerEnvelope, PeerMessage, ValidatedRouteStateEnvelope,
-    validate_route_state_envelope,
+    DigestDiffEntry, PROTOCOL_VERSION, PeerEnvelope, PeerMessage, PeerSender,
+    ValidatedRouteStateEnvelope, validate_route_state_envelope,
 };
 use crate::relay::state::RelayState;
 use crate::relay::types::*;
+
+/// Mesh envelope and the endpoint identity verified by the transport.
+pub(super) struct PeerRequest(PeerEnvelope, Option<iroh::EndpointId>);
+
+impl FromRequest<Arc<RelayState>> for PeerRequest {
+    type Rejection = Response;
+
+    async fn from_request(
+        request: Request,
+        state: &Arc<RelayState>,
+    ) -> Result<Self, Self::Rejection> {
+        let endpoint_id = request
+            .extensions()
+            .get::<AuthenticatedIrohPeer>()
+            .map(|peer| peer.endpoint_id);
+        let join = request.uri().path() == "/_peer/join";
+        let Json(envelope) = Json::<PeerEnvelope>::from_request(request, state)
+            .await
+            .map_err(IntoResponse::into_response)?;
+        if envelope.protocol_version != PROTOCOL_VERSION {
+            return Err(StatusCode::BAD_REQUEST.into_response());
+        }
+        let sender = PeerSender {
+            relay_id: &envelope.sender_relay_id,
+            endpoint_id,
+        };
+        if !join
+            && endpoint_id.is_some()
+            && !state.with_route_table(|table| table.matches_sender(sender, false))
+        {
+            return Err(StatusCode::FORBIDDEN.into_response());
+        }
+        Ok(Self(envelope, endpoint_id))
+    }
+}
 
 fn current_full_sync_envelope(state: &RelayState) -> FullSyncEnvelope {
     let mut snapshot = state.full_snapshot();
@@ -24,63 +66,41 @@ fn current_full_sync_envelope(state: &RelayState) -> FullSyncEnvelope {
     {
         snapshot.peers.push(PeerSnapshot {
             relay_id: state.relay_id().to_string(),
-            url: state.config().effective_advertise_url(),
+            address: state.local_peer_address(),
             route_count: state.local_route_count(),
             status: PeerStatus::Alive,
         });
     }
     FullSyncEnvelope {
         protocol_version: PROTOCOL_VERSION,
+        sender_relay_id: state.relay_id().to_string(),
         snapshot: FullSyncSnapshot::from_internal(snapshot),
     }
-}
-
-fn check_protocol_version(envelope: &PeerEnvelope) -> bool {
-    if envelope.protocol_version != PROTOCOL_VERSION {
-        eprintln!(
-            "[relay] Ignoring message from {} with protocol_version {}",
-            envelope.sender_relay_id, envelope.protocol_version
-        );
-        return false;
-    }
-    true
-}
-
-fn trusted_peer(state: &RelayState, sender_relay_id: &str) -> bool {
-    sender_relay_id != state.relay_id() && state.peer_is_alive(sender_relay_id)
-}
-
-fn known_peer(state: &RelayState, sender_relay_id: &str) -> bool {
-    sender_relay_id != state.relay_id() && state.has_peer(sender_relay_id)
 }
 
 fn valid_peer_relay_id(relay_id: &str) -> bool {
     c2_config::validate_relay_id(relay_id).is_ok()
 }
 
-fn valid_peer_relay_url(url: &str) -> bool {
-    crate::valid_relay_url(url)
-}
-
 /// POST /_peer/announce — receive RouteAnnounce or RouteWithdraw
-pub async fn handle_peer_announce(
+pub(super) async fn handle_peer_announce(
     State(state): State<Arc<RelayState>>,
-    Json(envelope): Json<PeerEnvelope>,
+    PeerRequest(envelope, endpoint_id): PeerRequest,
 ) -> impl IntoResponse {
-    if !check_protocol_version(&envelope) {
-        return StatusCode::OK;
-    }
     let Ok(ValidatedRouteStateEnvelope::Message(envelope)) =
         validate_route_state_envelope(envelope, None)
     else {
         return StatusCode::OK;
     };
-    let sender_relay_id = envelope.sender_relay_id.clone();
+    let sender = PeerSender {
+        relay_id: &envelope.sender_relay_id,
+        endpoint_id,
+    };
     match envelope.message {
         PeerMessage::RouteAnnounce {
             name,
             relay_id,
-            relay_url,
+            address,
             crm_ns,
             crm_name,
             crm_ver,
@@ -93,11 +113,11 @@ pub async fn handle_peer_announce(
             // Peer wire data never carries owner-private fields; keep peer
             // route storage scrubbed as a second local invariant.
             let _ = RouteAuthority::new(&state).announce_peer(
-                sender_relay_id,
+                sender,
                 RouteEntry {
                     name,
                     relay_id,
-                    relay_url,
+                    address,
                     server_id: None,
                     server_instance_id: None,
                     ipc_address: None,
@@ -119,147 +139,116 @@ pub async fn handle_peer_announce(
             relay_id,
             removed_at,
         } => {
-            let _ = RouteAuthority::new(&state).withdraw_peer(
-                sender_relay_id,
-                name,
-                relay_id,
-                removed_at,
-            );
+            let _ = RouteAuthority::new(&state).withdraw_peer(sender, name, relay_id, removed_at);
         }
-        _ => {
-            if matches!(envelope.message, PeerMessage::Unknown) {
-                eprintln!(
-                    "[relay] Ignoring unknown message type from {}",
-                    envelope.sender_relay_id
-                );
-            }
-        }
+        _ => {}
     }
     StatusCode::OK
 }
 
 /// POST /_peer/join — a new relay wants to join
-pub async fn handle_peer_join(
+pub(super) async fn handle_peer_join(
     State(state): State<Arc<RelayState>>,
-    Json(envelope): Json<PeerEnvelope>,
+    PeerRequest(envelope, endpoint_id): PeerRequest,
 ) -> impl IntoResponse {
-    if !check_protocol_version(&envelope) {
-        return (
-            StatusCode::OK,
-            Json(serde_json::json!({"status": "ignored"})),
-        )
-            .into_response();
+    if envelope.protocol_version != PROTOCOL_VERSION {
+        return StatusCode::BAD_REQUEST.into_response();
     }
-    let sender_relay_id = envelope.sender_relay_id.clone();
-    if let PeerMessage::RelayJoin { relay_id, url } = envelope.message {
-        if relay_id != sender_relay_id {
-            return (
-                StatusCode::OK,
-                Json(serde_json::json!({"status": "ignored"})),
-            )
-                .into_response();
-        }
-        if !valid_peer_relay_id(&relay_id) || !valid_peer_relay_url(&url) {
-            return (
-                StatusCode::OK,
-                Json(serde_json::json!({"status": "ignored"})),
-            )
-                .into_response();
-        }
-        if relay_id == state.relay_id() {
-            return (StatusCode::OK, Json(serde_json::json!({"status": "self"}))).into_response();
-        }
-        if state.with_route_table_mut(|rt| rt.record_peer_join(relay_id, url)) {
-            Json(current_full_sync_envelope(&state)).into_response()
-        } else {
-            (
-                StatusCode::OK,
-                Json(serde_json::json!({"status": "ignored"})),
-            )
-                .into_response()
-        }
-    } else {
-        StatusCode::BAD_REQUEST.into_response()
+    let PeerMessage::RelayJoin { relay_id, address } = envelope.message else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    if !valid_peer_relay_id(&relay_id) || !address.is_valid() {
+        return StatusCode::BAD_REQUEST.into_response();
     }
+    if relay_id != envelope.sender_relay_id
+        || relay_id == state.relay_id()
+        || endpoint_id.is_some_and(|id| address.endpoint_id() != Some(id))
+    {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    if !state.with_route_table_mut(|rt| rt.record_peer_join(relay_id.clone(), address.clone())) {
+        tracing::warn!(
+            relay_id = %relay_id,
+            target = %address.display_target(),
+            "rejected peer join: relay_id is already bound to a different endpoint identity (run `c3 registry force-leave` to retire the old peer)"
+        );
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    Json(current_full_sync_envelope(&state)).into_response()
 }
 
 /// GET /_peer/sync — return full route table + peer list
-pub async fn handle_peer_sync(State(state): State<Arc<RelayState>>) -> impl IntoResponse {
+pub(super) async fn handle_peer_sync(State(state): State<Arc<RelayState>>) -> impl IntoResponse {
     Json(current_full_sync_envelope(&state))
 }
 
 /// POST /_peer/heartbeat — periodic liveness check
-pub async fn handle_peer_heartbeat(
+pub(super) async fn handle_peer_heartbeat(
     State(state): State<Arc<RelayState>>,
-    Json(envelope): Json<PeerEnvelope>,
+    PeerRequest(envelope, endpoint_id): PeerRequest,
 ) -> impl IntoResponse {
-    if !check_protocol_version(&envelope) {
-        return StatusCode::OK;
-    }
     let Ok(ValidatedRouteStateEnvelope::Message(envelope)) =
         validate_route_state_envelope(envelope, None)
     else {
         return StatusCode::OK;
     };
-    let sender_relay_id = envelope.sender_relay_id.clone();
+    let sender = PeerSender {
+        relay_id: &envelope.sender_relay_id,
+        endpoint_id,
+    };
     if let PeerMessage::Heartbeat {
         relay_id,
         route_count,
     } = envelope.message
     {
-        if !valid_peer_relay_id(&sender_relay_id)
-            || !valid_peer_relay_id(&relay_id)
-            || sender_relay_id != relay_id
-            || !known_peer(&state, &sender_relay_id)
-        {
+        if sender.relay_id != relay_id {
             return StatusCode::OK;
         }
         state.with_route_table_mut(|rt| {
-            rt.record_peer_heartbeat(&relay_id, route_count);
+            if rt.matches_sender(sender, false) {
+                rt.record_peer_heartbeat(&relay_id, route_count);
+            }
         });
     }
     StatusCode::OK
 }
 
 /// POST /_peer/leave — graceful departure
-pub async fn handle_peer_leave(
+pub(super) async fn handle_peer_leave(
     State(state): State<Arc<RelayState>>,
-    Json(envelope): Json<PeerEnvelope>,
+    PeerRequest(envelope, endpoint_id): PeerRequest,
 ) -> impl IntoResponse {
-    if !check_protocol_version(&envelope) {
-        return StatusCode::OK;
-    }
     let Ok(ValidatedRouteStateEnvelope::Message(envelope)) =
         validate_route_state_envelope(envelope, None)
     else {
         return StatusCode::OK;
     };
-    let sender_relay_id = envelope.sender_relay_id.clone();
-    if let PeerMessage::RelayLeave { relay_id } = envelope.message {
-        if !valid_peer_relay_id(&sender_relay_id)
-            || !valid_peer_relay_id(&relay_id)
-            || sender_relay_id != relay_id
-            || !trusted_peer(&state, &sender_relay_id)
-        {
-            return StatusCode::OK;
-        }
-        state.unregister_peer(&relay_id);
+    let sender = PeerSender {
+        relay_id: &envelope.sender_relay_id,
+        endpoint_id,
+    };
+    if matches!(envelope.message, PeerMessage::RelayLeave { .. }) {
+        state.unregister_peer(sender);
     }
     StatusCode::OK
 }
 
 /// POST /_peer/force-leave — a deployer declaration forwarded by a live peer
-pub async fn handle_peer_force_leave(
+pub(super) async fn handle_peer_force_leave(
     State(state): State<Arc<RelayState>>,
-    Json(envelope): Json<PeerEnvelope>,
+    PeerRequest(envelope, endpoint_id): PeerRequest,
 ) -> impl IntoResponse {
     let Ok(ValidatedRouteStateEnvelope::Message(envelope)) =
         validate_route_state_envelope(envelope, None)
     else {
         return StatusCode::OK;
     };
+    let sender = PeerSender {
+        relay_id: &envelope.sender_relay_id,
+        endpoint_id,
+    };
     if let PeerMessage::RelayForceLeave { relay_id } = envelope.message
-        && RouteAuthority::new(&state).force_leave_from_peer(&envelope.sender_relay_id, &relay_id)
+        && RouteAuthority::new(&state).force_leave_from_peer(sender, &relay_id)
     {
         crate::relay::gossip::broadcast_force_leave(&state, relay_id);
     }
@@ -267,15 +256,16 @@ pub async fn handle_peer_force_leave(
 }
 
 /// POST /_peer/digest — anti-entropy digest exchange
-pub async fn handle_peer_digest(
+pub(super) async fn handle_peer_digest(
     State(state): State<Arc<RelayState>>,
-    Json(envelope): Json<PeerEnvelope>,
+    PeerRequest(envelope, endpoint_id): PeerRequest,
 ) -> impl IntoResponse {
-    if !check_protocol_version(&envelope) {
-        return StatusCode::OK.into_response();
-    }
     let sender_relay_id = envelope.sender_relay_id.clone();
-    if !valid_peer_relay_id(&sender_relay_id) || !trusted_peer(&state, &sender_relay_id) {
+    let sender = PeerSender {
+        relay_id: &sender_relay_id,
+        endpoint_id,
+    };
+    if !state.with_route_table(|rt| rt.matches_sender(sender, true)) {
         return StatusCode::OK.into_response();
     }
     let validated = match validate_route_state_envelope(envelope, Some(&sender_relay_id)) {
@@ -323,8 +313,11 @@ pub async fn handle_peer_digest(
                         .route_state_for_diff(&peer_entry.name, &peer_entry.relay_id, false)
                         .is_none()
                 {
-                    let tombstone = state
-                        .authoritative_missing_tombstone(&peer_entry.name, &peer_entry.relay_id);
+                    let tombstone = state.authoritative_missing_tombstone(
+                        sender,
+                        &peer_entry.name,
+                        &peer_entry.relay_id,
+                    );
                     if let Some(tombstone) = tombstone {
                         diff_entries.push(DigestDiffEntry::Deleted {
                             name: tombstone.name,
@@ -345,7 +338,7 @@ pub async fn handle_peer_digest(
         }
         ValidatedRouteStateEnvelope::DigestDiff(entries) => {
             for diff in entries {
-                let _ = RouteAuthority::new(&state).apply_digest_diff(&sender_relay_id, diff);
+                let _ = RouteAuthority::new(&state).apply_digest_diff(sender, diff);
             }
             StatusCode::OK.into_response()
         }
@@ -376,6 +369,10 @@ mod tests {
         }
     }
 
+    fn http_request(envelope: PeerEnvelope) -> PeerRequest {
+        PeerRequest(envelope, None)
+    }
+
     fn test_state() -> Arc<RelayState> {
         Arc::new(RelayState::new(
             Arc::new(RelayConfig {
@@ -394,7 +391,7 @@ mod tests {
     fn known_peer_with_status(state: &RelayState, relay_id: &str, status: PeerStatus) {
         state.register_peer(PeerInfo {
             relay_id: relay_id.into(),
-            url: format!("http://{relay_id}:8080"),
+            address: PeerAddress::http(format!("http://{relay_id}:8080")),
             route_count: 0,
             last_heartbeat: std::time::Instant::now(),
             status,
@@ -418,7 +415,7 @@ mod tests {
         let entry = crate::relay::peer::DigestDiffEntry::Active {
             name: name.into(),
             relay_id: relay_id.into(),
-            relay_url: relay_url.into(),
+            address: PeerAddress::http(relay_url),
             crm_ns: "test.ns".into(),
             crm_name: crm_name.into(),
             crm_ver: "0.1.0".into(),
@@ -447,7 +444,7 @@ mod tests {
     fn announce_peer_route(state: &RelayState, entry: RouteEntry) {
         let sender_relay_id = entry.relay_id.clone();
         RouteAuthority::new(state)
-            .announce_peer(sender_relay_id, entry)
+            .announce_peer(PeerSender::http(&sender_relay_id), entry)
             .unwrap();
     }
 
@@ -459,7 +456,7 @@ mod tests {
             PeerMessage::RouteAnnounce {
                 name: "grid".into(),
                 relay_id: "relay-b".into(),
-                relay_url: "http://relay-b:8080".into(),
+                address: PeerAddress::http("http://relay-b:8080"),
                 crm_ns: "test.ns".into(),
                 crm_name: "Grid".into(),
                 crm_ver: "0.1.0".into(),
@@ -471,7 +468,7 @@ mod tests {
             },
         );
 
-        let response = handle_peer_announce(State(state.clone()), Json(envelope))
+        let response = handle_peer_announce(State(state.clone()), http_request(envelope))
             .await
             .into_response();
 
@@ -488,7 +485,7 @@ mod tests {
             PeerMessage::RouteAnnounce {
                 name: "grid".into(),
                 relay_id: "relay-c".into(),
-                relay_url: "http://relay-c:8080".into(),
+                address: PeerAddress::http("http://relay-c:8080"),
                 crm_ns: "test.ns".into(),
                 crm_name: "Grid".into(),
                 crm_ver: "0.1.0".into(),
@@ -500,7 +497,7 @@ mod tests {
             },
         );
 
-        let response = handle_peer_announce(State(state.clone()), Json(envelope))
+        let response = handle_peer_announce(State(state.clone()), http_request(envelope))
             .await
             .into_response();
 
@@ -518,7 +515,7 @@ mod tests {
             PeerMessage::RouteAnnounce {
                 name: long_name,
                 relay_id: "relay-b".into(),
-                relay_url: "http://relay-b:8080".into(),
+                address: PeerAddress::http("http://relay-b:8080"),
                 crm_ns: "test.ns".into(),
                 crm_name: "Grid".into(),
                 crm_ver: "0.1.0".into(),
@@ -530,7 +527,7 @@ mod tests {
             },
         );
 
-        let response = handle_peer_announce(State(state.clone()), Json(envelope))
+        let response = handle_peer_announce(State(state.clone()), http_request(envelope))
             .await
             .into_response();
 
@@ -560,7 +557,7 @@ mod tests {
                 PeerMessage::RouteAnnounce {
                     name: route_name.clone(),
                     relay_id: "relay-b".into(),
-                    relay_url: "http://relay-b:8080".into(),
+                    address: PeerAddress::http("http://relay-b:8080"),
                     crm_ns: crm_ns.into(),
                     crm_name: crm_name.into(),
                     crm_ver: crm_ver.into(),
@@ -572,7 +569,7 @@ mod tests {
                 },
             );
 
-            let response = handle_peer_announce(State(state.clone()), Json(envelope))
+            let response = handle_peer_announce(State(state.clone()), http_request(envelope))
                 .await
                 .into_response();
 
@@ -593,7 +590,7 @@ mod tests {
             PeerMessage::RouteAnnounce {
                 name: "grid".into(),
                 relay_id: "relay-b".into(),
-                relay_url: "http://spoofed:8080".into(),
+                address: PeerAddress::http("http://spoofed:8080"),
                 crm_ns: "test.ns".into(),
                 crm_name: "Grid".into(),
                 crm_ver: "0.1.0".into(),
@@ -605,7 +602,7 @@ mod tests {
             },
         );
 
-        let response = handle_peer_announce(State(state.clone()), Json(envelope))
+        let response = handle_peer_announce(State(state.clone()), http_request(envelope))
             .await
             .into_response();
 
@@ -613,7 +610,7 @@ mod tests {
         let routes = state.list_routes();
         assert_eq!(routes.len(), 1);
         assert_eq!(routes[0].name, "grid");
-        assert_eq!(routes[0].relay_url, "http://relay-b:8080");
+        assert_eq!(routes[0].address.display_target(), "http://relay-b:8080");
     }
 
     #[tokio::test]
@@ -625,7 +622,7 @@ mod tests {
             PeerMessage::RouteAnnounce {
                 name: "grid".into(),
                 relay_id: "relay-b".into(),
-                relay_url: "http://relay-b:8080".into(),
+                address: PeerAddress::http("http://relay-b:8080"),
                 crm_ns: "test.ns".into(),
                 crm_name: "Grid".into(),
                 crm_ver: "0.1.0".into(),
@@ -637,7 +634,7 @@ mod tests {
             },
         );
 
-        let response = handle_peer_announce(State(state.clone()), Json(envelope))
+        let response = handle_peer_announce(State(state.clone()), http_request(envelope))
             .await
             .into_response();
 
@@ -654,14 +651,14 @@ mod tests {
                 "relay-b",
                 PeerMessage::RelayJoin {
                     relay_id: "relay-b".into(),
-                    url: "http://relay-b:8080".into(),
+                    address: PeerAddress::http("http://relay-b:8080"),
                 },
             );
             envelope.protocol_version = protocol_version;
-            let response = handle_peer_join(State(state.clone()), Json(envelope))
+            let response = handle_peer_join(State(state.clone()), http_request(envelope))
                 .await
                 .into_response();
-            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
             assert!(
                 state.list_peers().is_empty(),
                 "accepted version {protocol_version}"
@@ -677,11 +674,11 @@ mod tests {
             "relay-b",
             PeerMessage::RelayJoin {
                 relay_id: "relay-b".into(),
-                url: "http://relay-b-new:8080".into(),
+                address: PeerAddress::http("http://relay-b-new:8080"),
             },
         );
 
-        let response = handle_peer_join(State(state.clone()), Json(envelope))
+        let response = handle_peer_join(State(state.clone()), http_request(envelope))
             .await
             .into_response();
 
@@ -692,7 +689,8 @@ mod tests {
                 .into_iter()
                 .find(|peer| peer.relay_id == "relay-b")
                 .unwrap()
-                .url,
+                .address
+                .display_target(),
             "http://relay-b-new:8080"
         );
     }
@@ -706,7 +704,7 @@ mod tests {
             RouteEntry {
                 name: "grid".into(),
                 relay_id: "relay-b".into(),
-                relay_url: "http://spoofed:8080".into(),
+                address: PeerAddress::http("http://spoofed:8080"),
                 server_id: None,
                 server_instance_id: None,
                 ipc_address: None,
@@ -723,24 +721,24 @@ mod tests {
             },
         );
         assert!(
-            matches!(state.list_routes().as_slice(), [route] if route.name == "grid" && route.relay_url == "http://relay-b:8080")
+            matches!(state.list_routes().as_slice(), [route] if route.name == "grid" && route.address.display_target() == "http://relay-b:8080")
         );
 
         let envelope = PeerEnvelope::new(
             "relay-b",
             PeerMessage::RelayJoin {
                 relay_id: "relay-b".into(),
-                url: "http://relay-b-new:8080".into(),
+                address: PeerAddress::http("http://relay-b-new:8080"),
             },
         );
 
-        let response = handle_peer_join(State(state.clone()), Json(envelope))
+        let response = handle_peer_join(State(state.clone()), http_request(envelope))
             .await
             .into_response();
 
         assert_eq!(response.status(), StatusCode::OK);
         assert!(
-            matches!(state.list_routes().as_slice(), [route] if route.name == "grid" && route.relay_url == "http://relay-b-new:8080")
+            matches!(state.list_routes().as_slice(), [route] if route.name == "grid" && route.address.display_target() == "http://relay-b-new:8080")
         );
     }
 
@@ -756,7 +754,7 @@ mod tests {
             },
         );
 
-        let response = handle_peer_heartbeat(State(state.clone()), Json(envelope))
+        let response = handle_peer_heartbeat(State(state.clone()), http_request(envelope))
             .await
             .into_response();
 
@@ -771,7 +769,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn heartbeat_from_known_dead_peer_marks_alive() {
+    async fn heartbeat_from_known_dead_peer_does_not_bypass_recovery() {
         let state = test_state();
         known_peer_with_status(&state, "relay-b", PeerStatus::Dead);
         let envelope = PeerEnvelope::new(
@@ -782,7 +780,7 @@ mod tests {
             },
         );
 
-        let response = handle_peer_heartbeat(State(state.clone()), Json(envelope))
+        let response = handle_peer_heartbeat(State(state.clone()), http_request(envelope))
             .await
             .into_response();
 
@@ -792,8 +790,8 @@ mod tests {
             .into_iter()
             .find(|peer| peer.relay_id == "relay-b")
             .unwrap();
-        assert_eq!(peer.status, PeerStatus::Alive);
-        assert_eq!(peer.route_count, 7);
+        assert_eq!(peer.status, PeerStatus::Dead);
+        assert_eq!(peer.route_count, 0);
     }
 
     #[tokio::test]
@@ -805,7 +803,7 @@ mod tests {
             RouteEntry {
                 name: "grid".into(),
                 relay_id: "relay-b".into(),
-                relay_url: "http://relay-b:8080".into(),
+                address: PeerAddress::http("http://relay-b:8080"),
                 server_id: None,
                 server_instance_id: None,
                 ipc_address: None,
@@ -829,7 +827,7 @@ mod tests {
         );
         envelope.protocol_version = crate::relay::peer::PROTOCOL_VERSION - 1;
 
-        let response = handle_peer_leave(State(state.clone()), Json(envelope))
+        let response = handle_peer_leave(State(state.clone()), http_request(envelope))
             .await
             .into_response();
 
@@ -847,7 +845,7 @@ mod tests {
             RouteEntry {
                 name: "grid".into(),
                 relay_id: "relay-b".into(),
-                relay_url: "http://relay-b:8080".into(),
+                address: PeerAddress::http("http://relay-b:8080"),
                 server_id: None,
                 server_instance_id: None,
                 ipc_address: None,
@@ -873,7 +871,7 @@ mod tests {
         );
         envelope.protocol_version = crate::relay::peer::PROTOCOL_VERSION - 1;
 
-        let response = handle_peer_announce(State(state.clone()), Json(envelope))
+        let response = handle_peer_announce(State(state.clone()), http_request(envelope))
             .await
             .into_response();
 
@@ -900,7 +898,7 @@ mod tests {
         );
         envelope.protocol_version = crate::relay::peer::PROTOCOL_VERSION - 1;
 
-        let response = handle_peer_digest(State(state.clone()), Json(envelope))
+        let response = handle_peer_digest(State(state.clone()), http_request(envelope))
             .await
             .into_response();
 
@@ -917,7 +915,7 @@ mod tests {
             RouteEntry {
                 name: "grid".into(),
                 relay_id: "relay-b".into(),
-                relay_url: "http://relay-b:8080".into(),
+                address: PeerAddress::http("http://relay-b:8080"),
                 server_id: None,
                 server_instance_id: None,
                 ipc_address: None,
@@ -941,7 +939,7 @@ mod tests {
         );
         envelope.protocol_version = crate::relay::peer::PROTOCOL_VERSION - 1;
 
-        let response = handle_peer_digest(State(state.clone()), Json(envelope))
+        let response = handle_peer_digest(State(state.clone()), http_request(envelope))
             .await
             .into_response();
 
@@ -959,7 +957,7 @@ mod tests {
             rt.register_route(RouteEntry {
                 name: "grid".into(),
                 relay_id: "relay-a".into(),
-                relay_url: "http://relay-a:8080".into(),
+                address: PeerAddress::http("http://relay-a:8080"),
                 server_id: Some("server-secret".into()),
                 server_instance_id: Some("instance-secret".into()),
                 ipc_address: Some("ipc://secret".into()),
@@ -984,7 +982,7 @@ mod tests {
             },
         );
 
-        let response = handle_peer_announce(State(state.clone()), Json(envelope))
+        let response = handle_peer_announce(State(state.clone()), http_request(envelope))
             .await
             .into_response();
 
@@ -999,15 +997,15 @@ mod tests {
             "relay-b",
             PeerMessage::RelayJoin {
                 relay_id: "relay-c".into(),
-                url: "http://relay-c:8080".into(),
+                address: PeerAddress::http("http://relay-c:8080"),
             },
         );
 
-        let response = handle_peer_join(State(state.clone()), Json(envelope))
+        let response = handle_peer_join(State(state.clone()), http_request(envelope))
             .await
             .into_response();
 
-        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
         assert!(!state.has_peer("relay-c"));
     }
 
@@ -1022,22 +1020,14 @@ mod tests {
                 sender,
                 PeerMessage::RelayJoin {
                     relay_id: relay_id.into(),
-                    url: url.into(),
+                    address: PeerAddress::http(url),
                 },
             );
 
-            let response = handle_peer_join(State(state.clone()), Json(envelope))
+            let response = handle_peer_join(State(state.clone()), http_request(envelope))
                 .await
                 .into_response();
-            let status = response.status();
-            let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
-            let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-
-            assert_eq!(status, StatusCode::OK);
-            assert_eq!(
-                body.get("status").and_then(serde_json::Value::as_str),
-                Some("ignored")
-            );
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
             assert!(
                 !state.has_peer(relay_id),
                 "invalid join mutated peer {relay_id}"
@@ -1066,7 +1056,7 @@ mod tests {
                     ],
                 },
             );
-            let response = handle_peer_digest(State(state.clone()), Json(envelope))
+            let response = handle_peer_digest(State(state.clone()), http_request(envelope))
                 .await
                 .into_response();
             assert_eq!(response.status(), StatusCode::OK);
@@ -1091,7 +1081,7 @@ mod tests {
             },
         );
 
-        let response = handle_peer_digest(State(state.clone()), Json(envelope))
+        let response = handle_peer_digest(State(state.clone()), http_request(envelope))
             .await
             .into_response();
 
@@ -1099,7 +1089,7 @@ mod tests {
         let routes = state.list_routes();
         assert_eq!(routes.len(), 1);
         assert_eq!(routes[0].name, "grid");
-        assert_eq!(routes[0].relay_url, "http://relay-b:8080");
+        assert_eq!(routes[0].address.display_target(), "http://relay-b:8080");
     }
 
     #[tokio::test]
@@ -1118,7 +1108,7 @@ mod tests {
             },
         );
 
-        let response = handle_peer_digest(State(state.clone()), Json(envelope))
+        let response = handle_peer_digest(State(state.clone()), http_request(envelope))
             .await
             .into_response();
 
@@ -1136,7 +1126,7 @@ mod tests {
             rt.register_route(RouteEntry {
                 name: "local".into(),
                 relay_id: "relay-a".into(),
-                relay_url: "http://relay-a:8080".into(),
+                address: PeerAddress::http("http://relay-a:8080"),
                 server_id: Some("server-local".into()),
                 server_instance_id: Some("instance-local".into()),
                 ipc_address: Some("ipc://local".into()),
@@ -1157,7 +1147,7 @@ mod tests {
             RouteEntry {
                 name: "remote".into(),
                 relay_id: "relay-c".into(),
-                relay_url: "http://spoofed:8080".into(),
+                address: PeerAddress::http("http://spoofed:8080"),
                 server_id: None,
                 server_instance_id: None,
                 ipc_address: None,
@@ -1175,7 +1165,7 @@ mod tests {
         );
         let envelope = PeerEnvelope::new("relay-b", PeerMessage::DigestExchange { digest: vec![] });
 
-        let response = handle_peer_digest(State(state), Json(envelope))
+        let response = handle_peer_digest(State(state), http_request(envelope))
             .await
             .into_response();
         let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
@@ -1212,7 +1202,7 @@ mod tests {
             },
         );
 
-        let response = handle_peer_digest(State(state.clone()), Json(envelope))
+        let response = handle_peer_digest(State(state.clone()), http_request(envelope))
             .await
             .into_response();
         let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
@@ -1251,7 +1241,7 @@ mod tests {
             },
         );
 
-        let response = handle_peer_digest(State(state.clone()), Json(envelope))
+        let response = handle_peer_digest(State(state.clone()), http_request(envelope))
             .await
             .into_response();
 
@@ -1268,7 +1258,7 @@ mod tests {
             RouteEntry {
                 name: "grid".into(),
                 relay_id: "relay-b".into(),
-                relay_url: "http://relay-b:8080".into(),
+                address: PeerAddress::http("http://relay-b:8080"),
                 server_id: None,
                 server_instance_id: None,
                 ipc_address: None,
@@ -1293,13 +1283,13 @@ mod tests {
 
         // Other peer endpoints must acknowledge and ignore a valid digest diff.
         for response in [
-            handle_peer_announce(State(state.clone()), Json(envelope.clone()))
+            handle_peer_announce(State(state.clone()), http_request(envelope.clone()))
                 .await
                 .into_response(),
-            handle_peer_heartbeat(State(state.clone()), Json(envelope.clone()))
+            handle_peer_heartbeat(State(state.clone()), http_request(envelope.clone()))
                 .await
                 .into_response(),
-            handle_peer_leave(State(state.clone()), Json(envelope.clone()))
+            handle_peer_leave(State(state.clone()), http_request(envelope.clone()))
                 .await
                 .into_response(),
         ] {
@@ -1308,7 +1298,7 @@ mod tests {
             assert_eq!(tombstone_count(&state), 0);
         }
 
-        let response = handle_peer_digest(State(state.clone()), Json(envelope))
+        let response = handle_peer_digest(State(state.clone()), http_request(envelope))
             .await
             .into_response();
 
@@ -1324,7 +1314,7 @@ mod tests {
             rt.register_route(RouteEntry {
                 name: "grid".into(),
                 relay_id: "relay-a".into(),
-                relay_url: "http://relay-a:8080".into(),
+                address: PeerAddress::http("http://relay-a:8080"),
                 server_id: Some("server-secret".into()),
                 server_instance_id: Some("instance-secret".into()),
                 ipc_address: Some("ipc://secret".into()),
@@ -1360,7 +1350,7 @@ mod tests {
             rt.register_route(RouteEntry {
                 name: "grid".into(),
                 relay_id: "relay-a".into(),
-                relay_url: "http://relay-a:8080".into(),
+                address: PeerAddress::http("http://relay-a:8080"),
                 server_id: Some("server-grid".into()),
                 server_instance_id: Some("instance-grid".into()),
                 ipc_address: Some("ipc://grid".into()),
@@ -1387,7 +1377,7 @@ mod tests {
         let routes = receiver.list_routes();
         assert_eq!(routes.len(), 1);
         assert_eq!(routes[0].name, "grid");
-        assert_eq!(routes[0].relay_url, "http://relay-a:8080");
+        assert_eq!(routes[0].address.display_target(), "http://relay-a:8080");
         assert!(routes[0].ipc_address.is_none());
     }
 }

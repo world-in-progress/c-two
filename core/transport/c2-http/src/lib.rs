@@ -17,29 +17,27 @@ pub mod stream_wire;
 pub mod topic_wire;
 
 #[cfg(feature = "relay")]
+pub mod bridge;
+#[cfg(feature = "relay")]
+mod private_state;
+#[cfg(feature = "relay")]
 pub mod relay;
 
-/// Build a relay client builder with an explicit proxy policy.
-pub fn relay_client_builder_with_proxy(use_proxy: bool) -> reqwest::ClientBuilder {
-    let builder = reqwest::Client::builder().pool_idle_timeout(c2_config::IDLE_CONNECTION_TIMEOUT);
-    if use_proxy {
-        builder
-    } else {
-        builder.no_proxy()
-    }
-}
+mod tls;
+pub use tls::{relay_client_builder, relay_tls_config};
 
 /// Validate a relay base URL before opening a business or control path.
 pub fn valid_relay_url(url: &str) -> bool {
-    match reqwest::Url::parse(url) {
-        Ok(parsed) => {
-            matches!(parsed.scheme(), "http" | "https")
-                && parsed.host_str().is_some()
-                && parsed.query().is_none()
-                && parsed.fragment().is_none()
-                && parsed.username().is_empty()
-                && parsed.password().is_none()
-        }
-        Err(_) => false,
-    }
+    parse_relay_url(url).is_some()
+}
+
+fn parse_relay_url(url: &str) -> Option<reqwest::Url> {
+    let parsed = reqwest::Url::parse(url).ok()?;
+    (matches!(parsed.scheme(), "http" | "https")
+        && parsed.host_str().is_some()
+        && parsed.query().is_none()
+        && parsed.fragment().is_none()
+        && parsed.username().is_empty()
+        && parsed.password().is_none())
+    .then_some(parsed)
 }

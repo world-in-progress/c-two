@@ -101,7 +101,7 @@ For another process on the same host, pass the resource process's `cc.server_add
 
 `runtime = cc.Runtime()` creates an application-owned Python Runtime with its own configuration, routes and native session. Configure it through `runtime.set_*()`, then use `runtime.start()` for an empty Host readiness check or `runtime.register()` for resources. The module functions continue to use the default runtime; `cc.serve()` owns its process signal handling and has no instance equivalent. Call `runtime.shutdown()` and inspect its structured outcome when the application is done; if it returns pending, call shutdown again to observe completion and replace the session. `runtime.set_client()` and `runtime.set_server()` configure that instance's independent role-domain capacity, and `runtime.memory_stats()` and `runtime.call_execution_snapshot()` read both roles (module-level `cc.observe.*` reads the default runtime). See the [independent runtime example](examples/python/independent_runtime.py) and [Python API guide](docs/reference/python-usage.md#independent-python-runtime-instances).
 
-For relay routing, start `c3 relay --bind 0.0.0.0:8300`, set `cc.set_relay_anchor('http://relay-host:8300')` on both sides, then connect by name. The relay is a separate process. Explicit IPC addresses bypass relay discovery.
+For relay routing, start `c3 relay --bind 127.0.0.1:8300`, set `cc.set_relay_anchor('http://127.0.0.1:8300')` on both sides, then connect by name. Start the relay as a separate process. To serve remote clients, add `--edge-bind` and configure the HTTPS URL and certificate trust on those clients. Register resources through the loopback address. Explicit IPC addresses bypass relay discovery. [Relay CLI](cli/README.md#relay)
 
 ## Examples and documentation
 

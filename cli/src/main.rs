@@ -1,3 +1,4 @@
+mod bridge;
 mod contract;
 mod endpoint;
 mod registry;
@@ -13,7 +14,7 @@ const BANNER: &str = include_str!("../assets/banner_unicode.txt");
 const BANNER_COLOR: &str = "\x1b[38;2;102;237;173m";
 const RESET_COLOR: &str = "\x1b[0m";
 
-#[derive(Debug, Parser)]
+#[derive(Parser)]
 #[command(
     name = "c3",
     version = version::VERSION,
@@ -24,8 +25,10 @@ struct Cli {
     command: Commands,
 }
 
-#[derive(Debug, Subcommand)]
+#[derive(Subcommand)]
 enum Commands {
+    /// Start a private bridge for iroh relay peers.
+    Bridge(bridge::BridgeArgs),
     /// Validate and inspect portable C-Two contract descriptors.
     Contract(contract::ContractArgs),
     /// Inspect, reap, or sweep native local endpoints.
@@ -40,6 +43,7 @@ fn main() -> Result<ExitCode> {
     let matches = Cli::command().before_help(render_banner()).get_matches();
     let cli = Cli::from_arg_matches(&matches)?;
     match cli.command {
+        Commands::Bridge(args) => bridge::run(args).map(|()| ExitCode::SUCCESS),
         Commands::Contract(args) => contract::run(args).map(|()| ExitCode::SUCCESS),
         Commands::Endpoint(args) => endpoint::run(args),
         Commands::Relay(args) => relay::run(args).map(|()| ExitCode::SUCCESS),

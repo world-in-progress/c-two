@@ -14,7 +14,7 @@ use super::{
     HttpCallControl, HttpClientPool, HttpError, HttpInputOwner, HttpResponseStream,
     HttpStreamCancellation, RelayControlClient, RelayResolvedRoutes, RelayRouteInfo,
 };
-use c2_config::{CallMetadata, LocalEndpointContext};
+use c2_config::{CallMetadata, LocalEndpointContext, RelayTlsTrust, ResolvedRelayClientConfig};
 use c2_contract::ExpectedRouteContract;
 
 /// Whether an HTTP call failure is proven to precede CRM dispatch.
@@ -112,7 +112,6 @@ pub struct RelayAwareHttpClient {
     control: Arc<RelayControlClient>,
     pool: &'static HttpClientPool,
     expected: ExpectedRouteContract,
-    use_proxy: bool,
     config: RelayAwareClientConfig,
     current: Mutex<Option<SelectedHttpTarget>>,
     anchor_allows_local_ipc: bool,
@@ -125,13 +124,13 @@ impl RelayAwareHttpClient {
     pub fn new(
         relay_url: &str,
         expected: ExpectedRouteContract,
-        use_proxy: bool,
+        policy: &ResolvedRelayClientConfig,
         config: RelayAwareClientConfig,
     ) -> Result<Self, HttpError> {
         Self::new_with_budget(
             relay_url,
             expected,
-            use_proxy,
+            policy,
             config,
             DomainBudget::from_limits(&c2_config::DomainLimits::default()),
         )
@@ -141,24 +140,26 @@ impl RelayAwareHttpClient {
     pub fn new_with_budget(
         relay_url: &str,
         expected: ExpectedRouteContract,
-        use_proxy: bool,
+        policy: &ResolvedRelayClientConfig,
         config: RelayAwareClientConfig,
         budget: DomainBudget,
     ) -> Result<Self, HttpError> {
-        let control = Arc::new(RelayControlClient::new(relay_url, use_proxy)?);
-        Self::new_with_control_and_budget(control, expected, use_proxy, config, budget)
+        let control = Arc::new(RelayControlClient::new_with_config(
+            relay_url,
+            policy,
+            Default::default(),
+        )?);
+        Self::new_with_control_and_budget(control, expected, config, budget)
     }
 
     pub fn new_with_control(
         control: Arc<RelayControlClient>,
         expected: ExpectedRouteContract,
-        use_proxy: bool,
         config: RelayAwareClientConfig,
     ) -> Result<Self, HttpError> {
         Self::new_with_control_and_budget(
             control,
             expected,
-            use_proxy,
             config,
             DomainBudget::from_limits(&c2_config::DomainLimits::default()),
         )
@@ -168,7 +169,6 @@ impl RelayAwareHttpClient {
     pub fn new_with_control_and_budget(
         control: Arc<RelayControlClient>,
         expected: ExpectedRouteContract,
-        use_proxy: bool,
         config: RelayAwareClientConfig,
         budget: DomainBudget,
     ) -> Result<Self, HttpError> {
@@ -185,7 +185,6 @@ impl RelayAwareHttpClient {
             control,
             pool: HttpClientPool::instance(),
             expected,
-            use_proxy,
             config,
             current: Mutex::new(None),
         })
@@ -579,7 +578,12 @@ impl RelayAwareHttpClient {
             }
 
             for route in ordered {
-                let relay_url = route.relay_url.trim_end_matches('/').to_string();
+                let relay_url = route
+                    .relay_url
+                    .as_deref()
+                    .expect("validated relay target")
+                    .trim_end_matches('/')
+                    .to_string();
                 let client =
                     match self.acquire_route_client_with_deadline(&relay_url, None, deadline) {
                         Ok(client) => client,
@@ -688,12 +692,22 @@ impl RelayAwareHttpClient {
             .await?;
         let raw_routes_non_empty = !routes.routes.is_empty();
         let local_endpoint_namespace = routes.local_endpoint_namespace;
-        let filtered = filter_routes_by_expected_contract(routes.routes, &self.expected);
+        let mut filtered = filter_routes_by_expected_contract(routes.routes, &self.expected);
         if raw_routes_non_empty && filtered.is_empty() {
             return Err(HttpError::ServerError(
                 409,
                 crm_contract_mismatch_body(self.route_name()),
             ));
+        }
+        let anchor_url = reqwest::Url::parse(self.control.base_url())
+            .map_err(|_| HttpError::InvalidInput("invalid relay anchor URL".into()))?;
+        for route in &mut filtered {
+            normalize_resolved_target(
+                &anchor_url,
+                self.control.base_url(),
+                route,
+                &self.control.policy().tls_trust,
+            )?;
         }
         Ok(RelayResolvedRoutes {
             routes: filtered,
@@ -748,7 +762,9 @@ impl RelayAwareHttpClient {
         deadline: c2_config::ConnectDeadline,
     ) -> Result<RelayPoolGuard, HttpError> {
         check_active(control)?;
-        let client = self.pool.acquire_lease(relay_url, self.use_proxy, deadline);
+        let client = self
+            .pool
+            .acquire_lease(relay_url, self.control.policy(), deadline);
         // The mutex/build wait is complete; rejection also drops the acquired lease.
         check_active(control)?;
         super::connect_deadline::check(deadline, "relay_pool_acquire")?;
@@ -768,7 +784,13 @@ impl RelayAwareHttpClient {
         let mut preferred = Vec::new();
         let mut rest = Vec::new();
         for route in routes {
-            if route.relay_url.trim_end_matches('/') == current.relay_url {
+            if route
+                .relay_url
+                .as_deref()
+                .expect("validated relay target")
+                .trim_end_matches('/')
+                == current.relay_url
+            {
                 preferred.push(route);
             } else {
                 rest.push(route);
@@ -983,12 +1005,56 @@ fn relay_anchor_allows_local_ipc(anchor_url: &str) -> bool {
     if !matches!(parsed.scheme(), "http" | "https") {
         return false;
     }
-    let Some(host) = parsed.host_str() else {
-        return false;
-    };
-    let ip_host = host.trim_start_matches('[').trim_end_matches(']');
-    host.eq_ignore_ascii_case("localhost")
-        || ip_host.parse::<IpAddr>().is_ok_and(|ip| ip.is_loopback())
+    is_loopback_url(&parsed)
+}
+
+fn is_loopback_url(url: &reqwest::Url) -> bool {
+    url.host_str().is_some_and(|host| {
+        let ip_host = host.trim_start_matches('[').trim_end_matches(']');
+        host.eq_ignore_ascii_case("localhost")
+            || ip_host.parse::<IpAddr>().is_ok_and(|ip| ip.is_loopback())
+    })
+}
+
+fn validate_resolved_target(
+    anchor: &reqwest::Url,
+    relay_url: &str,
+    trust: &RelayTlsTrust,
+) -> Result<(), HttpError> {
+    let target = crate::parse_relay_url(relay_url)
+        .ok_or_else(|| HttpError::InvalidInput("invalid resolved relay URL".into()))?;
+    if anchor.scheme() == "https" && target.scheme() == "http" && !is_loopback_url(&target) {
+        return Err(HttpError::InvalidInput(
+            "HTTPS relay resolved to a non-loopback HTTP target".into(),
+        ));
+    }
+    if matches!(trust, RelayTlsTrust::CertSha256(_))
+        && target.scheme() == "https"
+        && target.origin() != anchor.origin()
+    {
+        return Err(HttpError::InvalidInput(
+            "relay certificate pin cannot be used for a different HTTPS origin".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn normalize_resolved_target(
+    anchor: &reqwest::Url,
+    anchor_base: &str,
+    route: &mut RelayRouteInfo,
+    trust: &RelayTlsTrust,
+) -> Result<(), HttpError> {
+    if route.proxy_via_anchor {
+        route.relay_url = Some(anchor_base.to_owned());
+    } else {
+        let target = route
+            .relay_url
+            .as_deref()
+            .ok_or_else(|| HttpError::InvalidInput("resolved relay URL is required".into()))?;
+        validate_resolved_target(anchor, target, trust)?;
+    }
+    Ok(())
 }
 
 #[cfg(all(test, feature = "relay"))]
@@ -1062,7 +1128,7 @@ mod tests {
         let client = RelayAwareHttpClient::new(
             &registry_url,
             expected_contract(),
-            false,
+            &Default::default(),
             RelayAwareClientConfig::default(),
         )
         .unwrap()
@@ -1141,7 +1207,7 @@ mod tests {
         let client = RelayAwareHttpClient::new(
             &registry_url,
             expected_contract(),
-            false,
+            &Default::default(),
             RelayAwareClientConfig::default(),
         )
         .unwrap()
@@ -1185,7 +1251,7 @@ mod tests {
         let client = RelayAwareHttpClient::new(
             &registry_url,
             expected_contract(),
-            false,
+            &Default::default(),
             RelayAwareClientConfig {
                 max_attempts: 10,
                 ..Default::default()
@@ -1232,7 +1298,8 @@ mod tests {
     fn route_info(name: String, relay_url: String) -> RelayRouteInfo {
         RelayRouteInfo {
             name,
-            relay_url,
+            relay_url: Some(relay_url),
+            proxy_via_anchor: false,
             ipc_address: None,
             server_id: None,
             server_instance_id: None,
@@ -1243,6 +1310,72 @@ mod tests {
             signature_hash: TEST_SIGNATURE_HASH.to_string(),
             max_payload_size: 1024,
         }
+    }
+
+    #[test]
+    fn anchor_proxy_uses_anchor_path_and_direct_targets_are_validated() {
+        let anchor_base = "https://lab.example.com/c2";
+        let anchor = reqwest::Url::parse(anchor_base).unwrap();
+        let trust = RelayTlsTrust::SystemDefault;
+        let mut route = route_info("grid".into(), "http://insecure.example".into());
+        route.relay_url = None;
+        route.proxy_via_anchor = true;
+        normalize_resolved_target(&anchor, anchor_base, &mut route, &trust).unwrap();
+        assert_eq!(route.relay_url.as_deref(), Some(anchor_base));
+        route.proxy_via_anchor = false;
+        route.relay_url = None;
+        assert!(normalize_resolved_target(&anchor, anchor_base, &mut route, &trust).is_err());
+        route.relay_url = Some("http://insecure.example".into());
+        assert!(normalize_resolved_target(&anchor, anchor_base, &mut route, &trust).is_err());
+        route.relay_url = Some("http://127.0.0.1:8080".into());
+        normalize_resolved_target(&anchor, anchor_base, &mut route, &trust).unwrap();
+
+        let mut value = serde_json::to_value(&route).unwrap();
+        let fields = value.as_object_mut().unwrap();
+        fields.remove("proxy_via_anchor");
+        fields.remove("relay_url");
+        let defaulted: RelayRouteInfo = serde_json::from_value(value.clone()).unwrap();
+        assert!(!defaulted.proxy_via_anchor);
+        assert!(defaulted.relay_url.is_none());
+        value["proxy_via_anchor"] = serde_json::json!("true");
+        assert!(serde_json::from_value::<RelayRouteInfo>(value).is_err());
+    }
+
+    #[tokio::test]
+    async fn proxy_resolution_and_probe_keep_anchor_path() {
+        let probes = Arc::new(AtomicUsize::new(0));
+        let observed = probes.clone();
+        let routes = Router::new()
+            .route(
+                "/_resolve/{route}",
+                get(|| async {
+                    let mut route = route_info("grid".into(), "http://unused.example".into());
+                    route.relay_url = None;
+                    route.proxy_via_anchor = true;
+                    Json(vec![route])
+                }),
+            )
+            .route(
+                "/_probe/{route}",
+                get(move || {
+                    observed.fetch_add(1, Ordering::SeqCst);
+                    async { StatusCode::OK }
+                }),
+            );
+        let (base, server) = spawn_app(Router::new().nest("/c2", routes)).await;
+        let anchor = format!("{base}/c2");
+        let client = RelayAwareHttpClient::new(
+            &anchor,
+            expected_contract(),
+            &Default::default(),
+            RelayAwareClientConfig::default(),
+        )
+        .unwrap()
+        .with_http_only();
+        let target = client.select_target_async(false).await;
+        server.abort();
+        assert_eq!(target.unwrap().as_url(), anchor);
+        assert_eq!(probes.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
@@ -1288,7 +1421,7 @@ mod tests {
         let client = RelayAwareHttpClient::new(
             &registry_url,
             expected_contract(),
-            false,
+            &Default::default(),
             RelayAwareClientConfig {
                 max_attempts: 2,
                 ..Default::default()
@@ -1576,7 +1709,7 @@ mod tests {
         let body = Json(vec![
             route_info(name.clone(), state.live_url.clone()),
             RelayRouteInfo {
-                relay_url: state.stale_url.clone(),
+                relay_url: Some(state.stale_url.clone()),
                 ipc_address: Some("ipc://local-grid".to_string()),
                 server_id: Some("local-grid".to_string()),
                 server_instance_id: Some("inst-local-grid".to_string()),
@@ -1600,7 +1733,7 @@ mod tests {
     ) -> Response {
         state.resolve_count.fetch_add(1, Ordering::SeqCst);
         let body = Json(vec![RelayRouteInfo {
-            relay_url: state.stale_url.clone(),
+            relay_url: Some(state.stale_url.clone()),
             ipc_address: Some("ipc://local-grid".to_string()),
             server_id: Some("local-grid".to_string()),
             server_instance_id: Some("inst-local-grid".to_string()),
@@ -1754,7 +1887,7 @@ mod tests {
         let client = RelayAwareHttpClient::new(
             &registry_url,
             expected_contract(),
-            false,
+            &Default::default(),
             RelayAwareClientConfig {
                 max_attempts: 3,
                 ..Default::default()
@@ -1816,7 +1949,7 @@ mod tests {
         let client = RelayAwareHttpClient::new(
             &registry_url,
             expected_contract(),
-            false,
+            &Default::default(),
             RelayAwareClientConfig {
                 max_attempts: 3,
                 ..Default::default()
@@ -1849,7 +1982,7 @@ mod tests {
             let client = RelayAwareHttpClient::new(
                 anchor,
                 expected_contract(),
-                false,
+                &Default::default(),
                 RelayAwareClientConfig::default(),
             )
             .unwrap();
@@ -1867,7 +2000,7 @@ mod tests {
         let client = RelayAwareHttpClient::new(
             "http://127.0.0.1:9",
             expected_contract(),
-            false,
+            &Default::default(),
             RelayAwareClientConfig::default(),
         )
         .unwrap();
@@ -1939,7 +2072,7 @@ mod tests {
         let client = RelayAwareHttpClient::new(
             &registry_url,
             expected_contract(),
-            false,
+            &Default::default(),
             RelayAwareClientConfig::default(),
         )
         .unwrap()
@@ -2041,7 +2174,7 @@ mod tests {
         let client = RelayAwareHttpClient::new(
             &registry_url,
             expected_contract(),
-            false,
+            &Default::default(),
             RelayAwareClientConfig {
                 max_attempts: 3,
                 ..Default::default()
@@ -2081,7 +2214,7 @@ mod tests {
         let client = RelayAwareHttpClient::new(
             &registry_url,
             expected_contract(),
-            false,
+            &Default::default(),
             RelayAwareClientConfig {
                 max_attempts: 1,
                 ..Default::default()
@@ -2136,7 +2269,7 @@ mod tests {
         let client = RelayAwareHttpClient::new(
             &registry_url,
             expected_contract(),
-            false,
+            &Default::default(),
             RelayAwareClientConfig {
                 max_attempts: 1,
                 ..Default::default()
@@ -2184,7 +2317,7 @@ mod tests {
             let client = RelayAwareHttpClient::new(
                 &url,
                 expected_contract(),
-                false,
+                &Default::default(),
                 RelayAwareClientConfig {
                     max_attempts: 1,
                     ..Default::default()
@@ -2251,7 +2384,7 @@ mod tests {
         let client = RelayAwareHttpClient::new(
             &url,
             expected_contract(),
-            false,
+            &Default::default(),
             RelayAwareClientConfig {
                 max_attempts: 1,
                 ..Default::default()
@@ -2299,7 +2432,7 @@ mod tests {
         let client = RelayAwareHttpClient::new(
             &registry_url,
             expected_contract(),
-            false,
+            &Default::default(),
             RelayAwareClientConfig {
                 max_attempts: 1,
                 ..Default::default()
@@ -2343,7 +2476,7 @@ mod tests {
         let client = RelayAwareHttpClient::new(
             &registry_url,
             expected_contract(),
-            false,
+            &Default::default(),
             RelayAwareClientConfig {
                 max_attempts: 1,
                 ..Default::default()
@@ -2370,7 +2503,7 @@ mod tests {
         let result = RelayAwareHttpClient::new(
             "http://relay.example",
             malformed,
-            false,
+            &Default::default(),
             RelayAwareClientConfig::default(),
         );
         let err = match result {
@@ -2390,7 +2523,6 @@ mod tests {
         let result = RelayAwareHttpClient::new_with_control(
             control,
             malformed,
-            false,
             RelayAwareClientConfig::default(),
         );
         let err = match result {
@@ -2404,7 +2536,7 @@ mod tests {
     #[test]
     fn local_ipc_selection_requires_loopback_anchor() {
         let routes = vec![RelayRouteInfo {
-            relay_url: "http://relay.example".to_string(),
+            relay_url: Some("http://relay.example".to_string()),
             ipc_address: Some("ipc://local-grid".to_string()),
             server_id: Some("local-grid".to_string()),
             server_instance_id: Some("inst-local-grid".to_string()),
@@ -2549,7 +2681,7 @@ mod tests {
         let client = RelayAwareHttpClient::new(
             &registry_url,
             expected_contract(),
-            false,
+            &Default::default(),
             RelayAwareClientConfig {
                 max_attempts: 1,
                 ..Default::default()
@@ -2600,7 +2732,7 @@ mod tests {
         let client = RelayAwareHttpClient::new(
             &registry_url,
             expected_contract(),
-            false,
+            &Default::default(),
             RelayAwareClientConfig {
                 max_attempts: 1,
                 ..Default::default()
@@ -2651,7 +2783,7 @@ mod tests {
         let client = RelayAwareHttpClient::new(
             &registry_url,
             expected_contract(),
-            false,
+            &Default::default(),
             RelayAwareClientConfig {
                 max_attempts: 3,
                 ..Default::default()
@@ -2704,9 +2836,13 @@ mod tests {
                 .with_state(state),
         )
         .await;
-        let client =
-            RelayAwareHttpClient::new(&registry, expected_contract(), false, Default::default())
-                .unwrap();
+        let client = RelayAwareHttpClient::new(
+            &registry,
+            expected_contract(),
+            &Default::default(),
+            Default::default(),
+        )
+        .unwrap();
         acquire_http(&client).await;
         let control = HttpCallControl::new(|| Ok(()), || Ok(()));
         let metadata = CallMetadata::empty();
@@ -2792,7 +2928,7 @@ mod tests {
         let client = RelayAwareHttpClient::new(
             &registry_url,
             expected_contract(),
-            false,
+            &Default::default(),
             RelayAwareClientConfig {
                 max_attempts: 1,
                 ..Default::default()
@@ -2843,7 +2979,7 @@ mod tests {
         let client = RelayAwareHttpClient::new(
             &registry_url,
             expected_contract(),
-            false,
+            &Default::default(),
             RelayAwareClientConfig {
                 max_attempts: 3,
                 ..Default::default()
@@ -2898,7 +3034,7 @@ mod tests {
         let client = RelayAwareHttpClient::new(
             &registry_url,
             expected_contract(),
-            false,
+            &Default::default(),
             RelayAwareClientConfig {
                 max_attempts: 3,
                 ..Default::default()
@@ -2949,7 +3085,7 @@ mod tests {
         let client = RelayAwareHttpClient::new(
             &registry_url,
             expected_contract(),
-            false,
+            &Default::default(),
             RelayAwareClientConfig {
                 max_attempts: 3,
                 ..Default::default()
@@ -3097,7 +3233,7 @@ mod tests {
             let client = RelayAwareHttpClient::new(
                 &url,
                 expected_contract(),
-                false,
+                &Default::default(),
                 RelayAwareClientConfig::default(),
             )
             .unwrap()

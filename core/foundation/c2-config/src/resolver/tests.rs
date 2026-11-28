@@ -340,3 +340,250 @@ fn outcome_store_limits_resolve_and_validate_against_memory_budget() {
             .contains("C2_OUTCOME_MAX_RETAINED_BYTES")
     );
 }
+
+fn relay_client_settings(vars: &[(&str, &str)]) -> Result<ResolvedRelayClientConfig, ConfigError> {
+    ConfigResolver::resolve_relay_client(None, &catalog(vars))
+}
+
+#[test]
+fn relay_tls_trust_defaults_to_builtin_roots_and_accepts_a_ca_path() {
+    assert_eq!(
+        relay_client_settings(&[]).unwrap(),
+        ResolvedRelayClientConfig::default()
+    );
+    assert_eq!(
+        relay_client_settings(&[(RELAY_CA_CERT, "my CA.pem"), (RELAY_USE_PROXY, "yes")]).unwrap(),
+        ResolvedRelayClientConfig {
+            use_proxy: true,
+            tls_trust: RelayTlsTrust::CustomCaCert("my CA.pem".into()),
+        }
+    );
+}
+
+#[test]
+fn relay_certificate_fingerprint_has_one_identity() {
+    let digest = "ab".repeat(32);
+    let prefixed = format!("sha256:{}", digest.to_ascii_uppercase());
+    let bare = relay_client_settings(&[(RELAY_CERT_SHA256, &digest)]).unwrap();
+    assert_eq!(bare.tls_trust, RelayTlsTrust::CertSha256([0xab; 32]));
+    assert_eq!(
+        bare,
+        relay_client_settings(&[(RELAY_CERT_SHA256, &prefixed)]).unwrap()
+    );
+}
+
+#[test]
+fn relay_tls_rejects_ambiguous_or_malformed_configuration() {
+    let pin = "ab".repeat(32);
+    let invalid_hex = "ag".repeat(32);
+    for (vars, expected) in [
+        (
+            vec![(RELAY_CA_CERT, "ca.pem"), (RELAY_CERT_SHA256, pin.as_str())],
+            "mutually exclusive",
+        ),
+        (vec![(RELAY_CA_CERT, "")], RELAY_CA_CERT),
+        (vec![(RELAY_CA_CERT, "  ")], RELAY_CA_CERT),
+        (vec![(RELAY_CERT_SHA256, "")], RELAY_CERT_SHA256),
+        (vec![(RELAY_CERT_SHA256, "sha256:abcd")], RELAY_CERT_SHA256),
+        (
+            vec![(RELAY_CERT_SHA256, invalid_hex.as_str())],
+            RELAY_CERT_SHA256,
+        ),
+    ] {
+        assert!(
+            relay_client_settings(&vars)
+                .unwrap_err()
+                .to_string()
+                .contains(expected)
+        );
+    }
+}
+
+#[test]
+fn relay_tls_requires_utf8() {
+    #[cfg(unix)]
+    let invalid = {
+        use std::os::unix::ffi::OsStringExt;
+        OsString::from_vec(vec![0xff])
+    };
+    #[cfg(windows)]
+    let invalid = {
+        use std::os::windows::ffi::OsStringExt;
+        OsString::from_wide(&[0xd800])
+    };
+    for key in [RELAY_CA_CERT, RELAY_CERT_SHA256] {
+        let catalog = EnvCatalog::load(ConfigSources {
+            env_file: EnvFilePolicy::Disabled,
+            process_env: [(key.to_owned(), invalid.clone())].into(),
+        })
+        .unwrap();
+        assert!(
+            ConfigResolver::resolve_relay_client(None, &catalog)
+                .unwrap_err()
+                .to_string()
+                .contains(&format!("{key} must be valid UTF-8"))
+        );
+    }
+}
+
+#[test]
+fn relay_server_resolves_edge_settings_and_rejects_conflicting_modes() {
+    use crate::RelayEdgeTlsMode;
+
+    let resolve =
+        |entries| ConfigResolver::resolve_relay_server(Default::default(), &catalog(entries));
+    let automatic = resolve(&[
+        (RELAY_EDGE_BIND, "[::]:8443"),
+        (RELAY_TLS_AUTO, "yes"),
+        (RELAY_TLS_SAN, "relay.example, 192.0.2.1"),
+        (RELAY_STATE_DIR, "edge-state"),
+    ])
+    .unwrap();
+    assert_eq!(
+        automatic.edge_tls_mode().unwrap(),
+        Some(RelayEdgeTlsMode::AutoSelfSigned)
+    );
+    assert_eq!(automatic.tls_san, ["relay.example", "192.0.2.1"]);
+    assert_eq!(automatic.state_dir, Some(PathBuf::from("edge-state")));
+    assert_eq!(automatic.effective_advertise_url(), "https://[::1]:8443");
+
+    let explicit = resolve(&[
+        (RELAY_EDGE_BIND, "localhost:8443"),
+        (RELAY_TLS_CERT, "cert.pem"),
+        (RELAY_TLS_KEY, "key.pem"),
+    ])
+    .unwrap();
+    assert_eq!(
+        explicit.edge_tls_mode().unwrap(),
+        Some(RelayEdgeTlsMode::ExplicitCert)
+    );
+    assert_eq!(explicit.tls_cert, Some(PathBuf::from("cert.pem")));
+    assert_eq!(explicit.tls_key, Some(PathBuf::from("key.pem")));
+
+    for options in [
+        &[(RELAY_BIND, "0.0.0.0:8080")][..],
+        &[(RELAY_TLS_AUTO, "true")][..],
+        &[(RELAY_INSECURE_PLAINTEXT, "yes")][..],
+        &[(RELAY_TLS_SAN, "relay.example")][..],
+        &[(RELAY_STATE_DIR, "edge-state")][..],
+        &[
+            (RELAY_EDGE_BIND, "localhost:8443"),
+            (RELAY_TLS_CERT, "cert.pem"),
+        ][..],
+        &[
+            (RELAY_EDGE_BIND, "localhost:8443"),
+            (RELAY_TLS_AUTO, "true"),
+            (RELAY_INSECURE_PLAINTEXT, "true"),
+        ][..],
+        &[(RELAY_ADVERTISE_URL, "http://0.0.0.0:8080")][..],
+    ] {
+        assert!(resolve(options).is_err(), "{options:?}");
+    }
+}
+
+#[test]
+fn bridge_overrides_resolve_and_reject_invalid_credentials_or_listeners() {
+    let variables = catalog(&[
+        (BRIDGE_BIND, "127.0.0.1:9443"),
+        (BRIDGE_QUIC_BIND, "OfF"),
+        (BRIDGE_TOKEN, "secret-token"),
+    ]);
+    let config = ConfigResolver::resolve_bridge(
+        BridgeConfigOverrides {
+            bind: Some("127.0.0.1:0".into()),
+            ..Default::default()
+        },
+        &variables,
+    )
+    .unwrap();
+    assert_eq!(config.bind, "127.0.0.1:0");
+    assert_eq!(config.quic_bind, None);
+    assert_eq!(config.token.as_deref(), Some("secret-token"));
+    assert!(!format!("{config:?}").contains("secret-token"));
+
+    for (key, value) in [
+        (BRIDGE_BIND, "127.0.0.1:65536"),
+        (BRIDGE_QUIC_BIND, "127.0.0.1:65536"),
+        (BRIDGE_TLS_CERT, "only-cert.pem"),
+        (BRIDGE_TLS_KEY, "only-key.pem"),
+        (BRIDGE_TOKEN, ""),
+        (BRIDGE_TOKEN, "secret token"),
+        (BRIDGE_TOKEN, "secret\n"),
+    ] {
+        assert!(
+            ConfigResolver::resolve_bridge(Default::default(), &catalog(&[(key, value)])).is_err(),
+            "{key}"
+        );
+    }
+}
+
+#[test]
+fn iroh_relay_resolver_keeps_cluster_and_bridge_credentials_separate() {
+    let bridge = "https://bridge.example.org?quic=off";
+    fn resolve(vars: &[(&str, &str)]) -> Result<RelayConfig, ConfigError> {
+        ConfigResolver::resolve_relay_server(Default::default(), &catalog(vars))
+    }
+    for vars in [
+        &[(RELAY_BRIDGE, bridge)][..],
+        &[(RELAY_BRIDGE_TOKEN, "bridge-only")],
+        &[(RELAY_BRIDGE, bridge), (RELAY_BRIDGE_TOKEN, "bridge-only")],
+        &[
+            (RELAY_BRIDGE, bridge),
+            (RELAY_BRIDGE_TOKEN, "same"),
+            (RELAY_CLUSTER_SECRET, "same"),
+        ],
+        &[
+            (RELAY_BRIDGE, bridge),
+            (RELAY_BRIDGE_TOKEN, " bad "),
+            (RELAY_CLUSTER_SECRET, "secret"),
+        ],
+        &[(RELAY_CLUSTER_SECRET, "")],
+    ] {
+        assert!(resolve(vars).is_err());
+    }
+    let seed = format!("iroh://{}", "ab".repeat(32));
+    assert!(
+        resolve(&[
+            (RELAY_SEEDS, &seed),
+            (RELAY_CLUSTER_SECRET, "private-cluster")
+        ])
+        .is_err()
+    );
+    let direct = format!("{seed}@127.0.0.1:9443");
+    let config = resolve(&[
+        (RELAY_SEEDS, &direct),
+        (RELAY_CLUSTER_SECRET, "private-cluster"),
+        (RELAY_STATE_DIR, "state"),
+    ])
+    .unwrap();
+    assert!(config.iroh_enabled());
+    assert!(!config.relay_id_explicit);
+    let config = resolve(&[
+        (RELAY_BRIDGE, bridge),
+        (RELAY_BRIDGE_TOKEN, "bridge-only"),
+        (RELAY_CLUSTER_SECRET, "private-cluster"),
+        (RELAY_SEEDS, &seed),
+        (RELAY_ID, "explicit"),
+    ])
+    .unwrap();
+    assert!(config.relay_id_explicit);
+    let debug = format!("{config:?}");
+    assert!(!debug.contains("bridge-only"));
+    assert!(!debug.contains("private-cluster"));
+    assert!(crate::validate_relay_id(&RelayConfig::derive_iroh_relay_id(&[0x12; 32])).is_ok());
+}
+
+#[test]
+fn malformed_env_entries_do_not_echo_mesh_secrets() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("relay.env");
+    std::fs::write(&path, "C2_RELAY_CLUSTER_SECRET=private-secret unexpected\n").unwrap();
+    let error = EnvCatalog::load(ConfigSources {
+        env_file: EnvFilePolicy::Path(path),
+        process_env: EnvMap::new(),
+    })
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("failed to parse env file"));
+    assert!(!error.contains("private-secret"));
+}

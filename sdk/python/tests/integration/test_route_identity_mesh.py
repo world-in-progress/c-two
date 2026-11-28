@@ -74,12 +74,20 @@ def mesh(monkeypatch, request, tmp_path):
         def routes(self, relay: GatedRelay, name: str) -> list[dict]:
             response = self.http.get(f"{relay.url}/_routes")
             response.raise_for_status()
-            return [row for row in response.json()["routes"] if row["name"] == name]
+            rows = [row for row in response.json()["routes"] if row["name"] == name]
+            for row in rows:
+                assert row["address"]["http_url"].startswith("http://")
+                assert "relay_url" not in row
+            return rows
 
         def peer(self, relay: GatedRelay, peer_id: str) -> dict | None:
             response = self.http.get(f"{relay.url}/_peers")
             response.raise_for_status()
-            return next((row for row in response.json() if row["relay_id"] == peer_id), None)
+            peer = next((row for row in response.json() if row["relay_id"] == peer_id), None)
+            if peer is not None:
+                assert peer["address"]["http_url"].startswith("http://")
+                assert "url" not in peer
+            return peer
 
         def resolve(self, relay: GatedRelay, name: str) -> httpx.Response:
             contract = crm_contract(Lifecycle)
@@ -112,11 +120,12 @@ def mesh(monkeypatch, request, tmp_path):
 
         def join(self, left: GatedRelay, right: GatedRelay) -> None:
             for sender, recipient in ((left, right), (right, left)):
-                envelope = {"protocol_version": 8, "sender_relay_id": sender.relay_id,
+                envelope = {"protocol_version": 9, "sender_relay_id": sender.relay_id,
                             "message": {"type": "RelayJoin", "relay_id": sender.relay_id,
-                                        "url": sender.gate.url}}
+                                        "address": {"http_url": sender.gate.url}}}
                 response = self.http.post(f"{recipient.gate.url}/_peer/join", json=envelope)
                 assert response.status_code == 200, response.text
+                assert response.json()["protocol_version"] == 9
             wait_state(lambda: self.peer(left, right.relay_id),
                        lambda peer: peer is not None and peer["status"] == "Alive")
             wait_state(lambda: self.peer(right, left.relay_id),
@@ -125,7 +134,7 @@ def mesh(monkeypatch, request, tmp_path):
             # returned full snapshot. Drive the normal digest/diff exchange so
             # two formerly independent local registrations converge promptly.
             for source, target in ((left, right), (right, left)):
-                digest = {"protocol_version": 8, "sender_relay_id": target.relay_id,
+                digest = {"protocol_version": 9, "sender_relay_id": target.relay_id,
                           "message": {"type": "DigestExchange", "digest": []}}
                 response = self.http.post(f"{source.gate.url}/_peer/digest", json=digest)
                 assert response.status_code == 200, response.text
@@ -469,7 +478,7 @@ def test_relay_crash_restart_reregisters_after_peer_recovery(mesh):
     # authoritative absence before a new Host claims the route.
     a.restart()
     mesh.join(a, b)
-    stale = {"protocol_version": 8, "sender_relay_id": b.relay_id,
+    stale = {"protocol_version": 9, "sender_relay_id": b.relay_id,
              "message": {"type": "DigestExchange", "digest": [
                  {"name": name, "relay_id": a.relay_id, "deleted": False, "hash": "0" * 64}
              ]}}

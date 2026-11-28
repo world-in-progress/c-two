@@ -28,6 +28,96 @@ const nextTurn=()=>new Promise(resolve=>setImmediate(resolve));
 function deferred(){let resolve;const promise=new Promise(r=>{resolve=r});return {promise,resolve};}
 const textReply=(status,body)=>({status,async arrayBuffer(){return new TextEncoder().encode(body).buffer}});
 
+test('HTTPS relay discovery permits loopback HTTP and refuses public HTTP before probing', async () => {
+  for (const [relayUrl, allowed] of [
+    ['http://relay.example:8301', false],
+    ['http://127.relay.example:8301', false],
+    ['http://127.0.0.2:8301', true],
+    ['http://[::1]:8301', true],
+  ]) {
+    const calls = [];
+    const route = {
+      name: 'route', relay_url: relayUrl, crm_ns: contract.namespace,
+      crm_name: contract.name, crm_ver: contract.version, abi_hash: hash,
+      signature_hash: hash, max_payload_size: 100,
+    };
+    const client = transport.createRelayAwareHttpEncodedTransport('https://anchor.example/relay', {
+      fetch: async (url, init) => {
+        calls.push(url);
+        assert.equal(init.redirect, 'error');
+        if (url.includes('/_resolve/')) return textReply(200, JSON.stringify([route]));
+        return textReply(200, '');
+      },
+    });
+    try {
+      const call = client.call('route', contract, 'ping', () => new Uint8Array());
+      if (allowed) {
+        await call;
+        assert.deepEqual(calls.slice(1).map(url => new URL(url).origin), [relayUrl, relayUrl]);
+      } else {
+        await assert.rejects(call, error => {
+          assert.equal(error.transportPhase, 'pre_dispatch');
+          assert.match(error.message, /non-loopback HTTP target/);
+          return true;
+        });
+        assert.equal(calls.length, 1);
+      }
+    } finally {
+      await client.close();
+    }
+  }
+});
+
+for (const relayAware of [false, true]) test(`proxy-via-anchor preserves the HTTPS base path (relayAware=${relayAware})`, async () => {
+  const anchor = 'https://lab.example.com/c2';
+  const calls = [];
+  const route = {
+    name: 'route', relay_url: null, proxy_via_anchor: true, crm_ns: contract.namespace,
+    crm_name: contract.name, crm_ver: contract.version, abi_hash: hash,
+    signature_hash: hash, max_payload_size: 100,
+  };
+  const factory = relayAware ? transport.createRelayAwareHttpEncodedTransport : transport.createHttpRelayEncodedTransport;
+  const client = factory(anchor, {fetch: async (url, init) => {
+    calls.push([url, init.method]);
+    return url.includes('/_resolve/') ? textReply(200, JSON.stringify([route])) : textReply(200, '');
+  }});
+  try {
+    await client.call('route', contract, 'ping', () => new Uint8Array());
+    assert.equal(calls.length, 3);
+    assert.ok(calls[0][0].startsWith(`${anchor}/_resolve/`));
+    assert.ok(calls[1][0].startsWith(`${anchor}/_probe/`));
+    assert.ok(calls[2][0].startsWith(`${anchor}/_c2/calls/`));
+    assert.deepEqual(calls.map(([, method]) => method), ['GET', 'GET', 'POST']);
+  } finally {
+    await client.close?.();
+  }
+});
+
+test('relay discovery rejects invalid proxy flags and missing direct relay URLs', async () => {
+  for (const fields of [
+    {proxy_via_anchor: 'true', relay_url: 'https://relay.example'},
+    {proxy_via_anchor: null, relay_url: 'https://relay.example'},
+    {proxy_via_anchor: false, relay_url: null},
+    {},
+  ]) {
+    const route = {
+      name: 'route', ...fields, crm_ns: contract.namespace, crm_name: contract.name,
+      crm_ver: contract.version, abi_hash: hash, signature_hash: hash, max_payload_size: 100,
+    };
+    let requests = 0;
+    const client = transport.createRelayAwareHttpEncodedTransport('https://lab.example.com/c2', {
+      fetch: async () => { requests++; return textReply(200, JSON.stringify([route])); },
+    });
+    try {
+      await assert.rejects(client.call('route', contract, 'ping', () => new Uint8Array()),
+        error => error.transportPhase === 'pre_dispatch' && /payload shape invalid/.test(error.message));
+      assert.equal(requests, 1);
+    } finally {
+      await client.close();
+    }
+  }
+});
+
 test('719 resolve is typed, pre-dispatch, and a later acquisition can succeed',async()=>{
   const registrations='[{"relay_id":"a","relay_url":"http://localhost:8301","registered_at":1,"relay_status":"Alive"}]';
   const details={route:'route',dispatch_phase:'pre_dispatch',registrations};

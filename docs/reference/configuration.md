@@ -22,10 +22,24 @@ The capacity variables apply independently to each active role domain. `M` is th
 | `C2_MAX_EXECUTION_WORKERS` | Host parallelism clamped to 4–64, with fallback parallelism 4 | Host's `max_execution_workers`. An explicit value must be at least 1 and may exceed 64. |
 | `C2_OUTCOME_MAX_ENTRIES` | 4096 | Host's `outcome_max_entries`, at least 1. Caps settled call outcomes across all registrations. |
 | `C2_OUTCOME_MAX_RETAINED_BYTES` | `min(64 MiB, server.M / 4)` | Host's `outcome_max_retained_bytes`, from 0 through `server.M`. Zero selects metadata-only retention. |
-| `C2_RELAY_BIND` | `0.0.0.0:8080` | `c3 relay --bind` / `-b` |
+| `C2_RELAY_BIND` | `127.0.0.1:8080` | `c3 relay --bind` / `-b` |
+| `C2_RELAY_EDGE_BIND` | Unset | `c3 relay --edge-bind` |
+| `C2_RELAY_TLS_CERT`, `C2_RELAY_TLS_KEY` | Unset | `--tls-cert`, `--tls-key` |
+| `C2_RELAY_TLS_AUTO` | `false` | `--tls-auto` |
+| `C2_RELAY_TLS_SAN` | Empty | `--tls-san` |
+| `C2_RELAY_STATE_DIR` | `~/.c3-relay` | `--state-dir` |
+| `C2_RELAY_INSECURE_PLAINTEXT` | `false` | `--insecure-plaintext` |
 | `C2_RELAY_ID` | Generated | `c3 relay --relay-id` |
-| `C2_RELAY_ADVERTISE_URL` | Derived from the actual bind address | `c3 relay --advertise-url` |
-| `C2_RELAY_SEEDS` | Empty | `c3 relay --seeds` / `-s`, comma-separated relay URLs |
+| `C2_RELAY_ADVERTISE_URL` | Derived from the active listener and transport | `c3 relay --advertise-url` |
+| `C2_RELAY_SEEDS` | Empty | `c3 relay --seeds` / `-s`, comma-separated loopback HTTP URLs or iroh seed addresses |
+| `C2_RELAY_BRIDGE` | Unset | `c3 relay --bridge`, private HTTPS bridge URL |
+| `C2_RELAY_BRIDGE_TOKEN` | Unset | `c3 relay --bridge-token`, required with a bridge |
+| `C2_RELAY_CLUSTER_SECRET` | Unset | `c3 relay --cluster-secret`, required with iroh |
+| `C2_BRIDGE_BIND` | `0.0.0.0:8443` | `c3 bridge --bind`, HTTPS listen address |
+| `C2_BRIDGE_QUIC_BIND` | `0.0.0.0:7842` | `c3 bridge --quic-bind`, set to `off` to disable QUIC address discovery |
+| `C2_BRIDGE_TLS_CERT`, `C2_BRIDGE_TLS_KEY` | Generated self-signed identity | `c3 bridge --tls-cert`, `--tls-key`. Supply both for an explicit certificate and key. |
+| `C2_BRIDGE_STATE_DIR` | `~/.c3-bridge` | `c3 bridge --state-dir` |
+| `C2_BRIDGE_TOKEN` | Generated and persisted | `c3 bridge --token`, printable ASCII without whitespace |
 | `C2_RELAY_USE_PROXY` | `false` | Opt in to process HTTP proxy settings for relay traffic. Rust `HostOptions::with_relay_use_proxy` can override it. |
 
 When `M == 0`, the role refuses positive memory reservations and all new business calls, including empty calls and streams. An explicit positive `N` with zero `M` is a configuration error. With positive `M`, an explicit `N`, including 0, takes precedence over the derived default. Refusals, releases and shutdown drain can still proceed with admission closed. [Memory policy](memory-policy.md)
@@ -51,6 +65,12 @@ Set the native startup wait with `cc.set_server(startup_timeout=...)` in seconds
 ## Relay and c3
 
 A standalone relay resolves one `relay` domain at startup. Its memory, file spill and call slots cover business forwarding and its upstream IPC storage across physical connections and reconnects. `c3 relay --dry-run` validates and prints the effective `M`, `F` and `N` without listening. `--upstream` (`-u`) accepts a route and its upstream identity on the CLI only. [c3 relay](../../cli/README.md#relay)
+
+The control listener accepts loopback addresses only. The optional edge listener serves discovery and RPC. The edge defaults to persistent self-signed TLS on non-loopback addresses and plaintext on loopback. The explicit certificate and key must be supplied together. Explicit credentials, `--tls-auto` and `--insecure-plaintext` are mutually exclusive. The SAN setting applies to automatic TLS. The state directory holds the generated TLS identity and iroh endpoint key.
+
+`c3 bridge` provides rendezvous and encrypted packet forwarding over HTTPS, with QUIC address discovery on UDP port 7842 by default. It stores its generated certificate `bridge-cert.pem`, key `bridge-key.pem` and `bridge-token` in a private state directory. The bridge token grants access to the bridge. The distinct cluster secret stays on the relay endpoints for mutual authentication. Startup prints the bridge URL and token. Dry-run reports whether credentials were configured and creates no files or sockets. [c3 bridge](../../cli/README.md#bridge)
+
+A bridge URL looks like `https://host:8443?pin=<64-lower-hex>&quic=off`. Pin generated certificates by their SHA-256 leaf DER fingerprint. Omitting the pin uses WebPKI trust. Omitting `quic` selects 7842. Set another port or `off` as needed. A bridge, cluster secret or `iroh://` seed enables iroh. A seed without a bridge needs an `@<ip:port>` hint. The relay stores `mesh-key.ed25519` under `~/.c3-relay` or the configured state directory and derives an ID from the endpoint key unless a relay ID was explicitly configured. iroh control and data requests use independent QUIC connections. Relays use Mesh 9 to join and exchange routes over iroh across machines. Use the printed `iroh://<endpoint-id>` seed with the same bridge, or `iroh://<endpoint-id>@<ip:port>` with a reachable address for direct dialing. HTTP seeds serve loopback meshes. Configure SDKs with an HTTP(S) relay anchor. When discovery returns `proxy_via_anchor: true`, SDKs retain that URL and its TLS trust while the anchor forwards to the route owner. [ADR 0008](../decisions/0008-relay-tls-http2-and-iroh-mesh.md)
 
 ## Fixed transport constants
 

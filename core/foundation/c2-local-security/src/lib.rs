@@ -46,3 +46,6 @@ pub use windows::{
     grant_server_identity_query_access, verify_current_user_pipe_owner,
     verify_server_process_identity,
 };
+
+mod private_file;
+pub use private_file::{create_private_dir, verify_private_file, write_private_file};

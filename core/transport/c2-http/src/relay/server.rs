@@ -21,14 +21,27 @@ use crate::relay::authority::{
 };
 use crate::relay::background::spawn_background_tasks;
 use crate::relay::gossip::{broadcast_route_announce, broadcast_route_withdraw};
+use crate::relay::iroh_transport::{IrohMeshTransport, MeshLane};
 use crate::relay::peer::{PeerEnvelope, PeerMessage};
+use crate::relay::peer_client::PeerHttpClient;
 use crate::relay::router;
 use crate::relay::state::{RegisterCommitResult, RelayState, UnregisterResult};
+use crate::relay::tls::EdgeTls;
+use crate::relay::transport::{HttpListener, ListenerSurface};
 use c2_config::{
     ConfigResolver, ConfigSources, DomainLimitsOverrides, EnvCatalog, LocalEndpointContext,
-    LocalEndpointOptions, RelayConfig,
+    LocalEndpointOptions, RelayBridgeSpec, RelayConfig,
 };
 use c2_ipc::IpcClient;
+
+fn bind_listener(addr: SocketAddr) -> Result<TcpListener, String> {
+    let listener = TcpListener::bind(addr)
+        .map_err(|error| format!("Relay failed to start: Failed to bind {addr}: {error}"))?;
+    listener
+        .set_nonblocking(true)
+        .map_err(|error| format!("Failed to make relay listener nonblocking: {error}"))?;
+    Ok(listener)
+}
 
 const REGISTER_ATTESTATION_CONNECT_ATTEMPTS: usize = 3;
 const REGISTER_ATTESTATION_RETRY_DELAY: Duration = Duration::from_millis(20);
@@ -209,10 +222,26 @@ pub struct RelayShutdownReceipt {
     pub completed: bool,
 }
 
+struct MeshStartup {
+    key: iroh::SecretKey,
+    bridge: Option<RelayBridgeSpec>,
+    #[cfg(test)]
+    relay_only: bool,
+}
+
+struct RelayStartup {
+    config: Arc<RelayConfig>,
+    context: LocalEndpointContext,
+    mesh: Option<MeshStartup>,
+    idle_timeout: Duration,
+}
+
 /// Relay server with a synchronous control API.
 #[allow(dead_code)]
 pub struct RelayServer {
     local_addr: SocketAddr,
+    edge_addr: Option<SocketAddr>,
+    edge_cert_sha256: Option<[u8; 32]>,
     cmd_tx: Option<mpsc::Sender<Command>>,
     thread: Option<std::thread::JoinHandle<()>>,
     thread_stopped: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
@@ -225,6 +254,35 @@ impl RelayServer {
     /// The actual HTTP listener address, available after startup succeeds.
     pub fn local_addr(&self) -> SocketAddr {
         self.local_addr
+    }
+
+    /// The actual business-edge listener address, if configured.
+    pub fn edge_local_addr(&self) -> Option<SocketAddr> {
+        self.edge_addr
+    }
+
+    /// SHA-256 of the DER-encoded edge leaf certificate.
+    pub fn edge_cert_sha256(&self) -> Option<[u8; 32]> {
+        self.edge_cert_sha256
+    }
+
+    /// Stable identity of the encrypted mesh endpoint.
+    pub fn iroh_endpoint_id(&self) -> Option<iroh::EndpointId> {
+        self.iroh_transport().map(IrohMeshTransport::endpoint_id)
+    }
+
+    /// Current address hints for the encrypted mesh endpoint.
+    pub fn iroh_endpoint_addr(&self) -> Option<iroh::EndpointAddr> {
+        self.iroh_transport().map(IrohMeshTransport::endpoint_addr)
+    }
+
+    pub fn iroh_transport(&self) -> Option<&IrohMeshTransport> {
+        self.state.peer_client().iroh().map(Arc::as_ref)
+    }
+
+    /// The configured or derived business data-plane URL.
+    pub fn advertise_url(&self) -> String {
+        self.state.config().effective_advertise_url()
     }
 
     #[cfg(test)]
@@ -288,7 +346,9 @@ impl RelayServer {
 
     #[cfg(feature = "test-support")]
     #[doc(hidden)]
-    pub fn pause_next_topic_confirm_for_test(&self) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
+    pub fn pause_next_topic_confirm_for_test(
+        &self,
+    ) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
         let (entered_tx, entered_rx) = oneshot::channel();
         let (release_tx, release_rx) = oneshot::channel();
         assert!(
@@ -355,7 +415,13 @@ impl RelayServer {
         config: RelayConfig,
         context: LocalEndpointContext,
     ) -> Result<Self, String> {
-        Self::start_with_idle_timeout(config, context, c2_config::IDLE_CONNECTION_TIMEOUT)
+        Self::start_with_idle_timeout(
+            config,
+            context,
+            c2_config::IDLE_CONNECTION_TIMEOUT,
+            #[cfg(test)]
+            false,
+        )
     }
 
     #[cfg(feature = "test-support")]
@@ -365,28 +431,43 @@ impl RelayServer {
         context: LocalEndpointContext,
         idle_timeout: Duration,
     ) -> Result<Self, String> {
-        Self::start_with_idle_timeout(config, context, idle_timeout)
+        Self::start_with_idle_timeout(
+            config,
+            context,
+            idle_timeout,
+            #[cfg(test)]
+            false,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn start_relay_only_for_test(
+        config: RelayConfig,
+        context: LocalEndpointContext,
+    ) -> Result<Self, String> {
+        Self::start_with_idle_timeout(config, context, c2_config::IDLE_CONNECTION_TIMEOUT, true)
     }
 
     fn start_with_idle_timeout(
         mut config: RelayConfig,
         context: LocalEndpointContext,
         idle_timeout: Duration,
+        #[cfg(test)] relay_only: bool,
     ) -> Result<Self, String> {
-        config
-            .validate()
+        let bridge = config
+            .validate_with_bridge_spec()
             .map_err(|e| format!("Invalid relay config: {e}"))?;
 
-        let addr: SocketAddr = config
-            .bind
-            .parse()
-            .map_err(|e| format!("Invalid bind address '{}': {e}", config.bind))?;
-        let listener = TcpListener::bind(addr)
-            .map_err(|error| format!("Relay failed to start: Failed to bind {addr}: {error}"))?;
-        let local_addr = listener
-            .local_addr()
-            .map_err(|error| format!("Failed to read relay listener address: {error}"))?;
+        let listener = bind_listener(config.local_bind_addr().expect("validated --bind"))?;
+        let local_addr = listener.local_addr().map_err(|error| error.to_string())?;
         config.bind = local_addr.to_string();
+        let edge_listener = config.edge_bind_addr().map(bind_listener).transpose()?;
+        let edge_addr = edge_listener
+            .as_ref()
+            .map(TcpListener::local_addr)
+            .transpose()
+            .map_err(|error| error.to_string())?;
+        config.edge_bind = edge_addr.map(|addr| addr.to_string());
         let effective_advertise_url = config.effective_advertise_url();
         if !crate::valid_relay_url(&effective_advertise_url) {
             return Err(format!(
@@ -394,28 +475,35 @@ impl RelayServer {
                 effective_advertise_url
             ));
         }
-        listener
-            .set_nonblocking(true)
-            .map_err(|error| format!("Failed to make relay listener nonblocking: {error}"))?;
+        let edge_tls = EdgeTls::load(&config)?;
+        let edge_cert_sha256 = edge_tls.as_ref().map(|tls| tls.leaf_sha256);
+        let edge = edge_listener.map(|listener| (listener, edge_tls.map(|tls| tls.acceptor)));
 
-        let domain_budget = c2_mem::DomainBudget::from_limits(&config.domain_limits);
-        let config = Arc::new(config);
-        let disseminator: Arc<dyn crate::relay::disseminator::Disseminator> = Arc::new(
-            crate::relay::disseminator::FullBroadcast::with_proxy_policy(config.use_proxy),
-        );
-        let state = Arc::new(RelayState::new_with_budget(
-            config.clone(),
-            disseminator,
+        let mesh_key = config
+            .iroh_enabled()
+            .then(|| IrohMeshTransport::load_identity(&config))
+            .transpose()?;
+        if let Some(key) = &mesh_key
+            && !config.relay_id_explicit
+        {
+            config.relay_id = RelayConfig::derive_iroh_relay_id(key.public().as_bytes());
+        }
+        let startup = RelayStartup {
+            config: Arc::new(config),
             context,
-            domain_budget,
+            mesh: mesh_key.map(|key| MeshStartup {
+                key,
+                bridge,
+                #[cfg(test)]
+                relay_only,
+            }),
             idle_timeout,
-        ));
+        };
 
         let (cmd_tx, cmd_rx) = mpsc::channel::<Command>(64);
-        let (ready_tx, ready_rx) = oneshot::channel::<Result<(), String>>();
+        let (ready_tx, ready_rx) = oneshot::channel();
         let (thread_done, thread_stopped) = std::sync::mpsc::channel();
 
-        let server_state = state.clone();
         let cancel = CancellationToken::new();
         let cancel_clone = cancel.clone();
 
@@ -429,15 +517,7 @@ impl RelayServer {
                     .expect("Failed to create tokio runtime");
 
                 rt.block_on(async move {
-                    Self::run(
-                        listener,
-                        server_state,
-                        cmd_rx,
-                        ready_tx,
-                        cancel_clone,
-                        idle_timeout,
-                    )
-                    .await;
+                    Self::run(listener, edge, startup, cmd_rx, ready_tx, cancel_clone).await;
                 });
             })
             .map_err(|e| format!("Failed to spawn relay thread: {e}"))?;
@@ -447,13 +527,18 @@ impl RelayServer {
             .blocking_recv()
             .map_err(|_| "Relay thread exited before ready".to_string())
             .and_then(|result| result.map_err(|e| format!("Relay failed to start: {e}")));
-        if let Err(error) = readiness {
-            let _ = thread.join();
-            return Err(error);
-        }
+        let state = match readiness {
+            Ok(state) => state,
+            Err(error) => {
+                let _ = thread.join();
+                return Err(error);
+            }
+        };
 
         Ok(Self {
             local_addr,
+            edge_addr,
+            edge_cert_sha256,
             cmd_tx: Some(cmd_tx),
             thread: Some(thread),
             thread_stopped: std::sync::Mutex::new(thread_stopped),
@@ -571,18 +656,86 @@ impl RelayServer {
 
     async fn run(
         listener: TcpListener,
-        state: Arc<RelayState>,
+        edge: Option<(TcpListener, Option<tokio_rustls::TlsAcceptor>)>,
+        startup: RelayStartup,
         mut cmd_rx: mpsc::Receiver<Command>,
-        ready_tx: oneshot::Sender<Result<(), String>>,
+        ready_tx: oneshot::Sender<Result<Arc<RelayState>, String>>,
         cancel: CancellationToken,
-        idle_timeout: Duration,
     ) {
-        let app = router::build_router(state.clone());
-
-        let listener = match tokio::net::TcpListener::from_std(listener) {
-            Ok(l) => l,
-            Err(e) => {
-                let _ = ready_tx.send(Err(format!("Failed to adopt relay listener: {e}")));
+        let RelayStartup {
+            config,
+            context,
+            mesh,
+            idle_timeout,
+        } = startup;
+        let memory_budget = config.domain_limits.memory_budget_bytes;
+        let (iroh, bridge) = match mesh {
+            Some(mesh) => {
+                let result = IrohMeshTransport::bind_with(
+                    &config,
+                    mesh.key,
+                    mesh.bridge.clone(),
+                    #[cfg(test)]
+                    mesh.relay_only,
+                )
+                .await;
+                match result {
+                    Ok(transport) => (Some(Arc::new(transport)), mesh.bridge),
+                    Err(error) => {
+                        let _ = ready_tx
+                            .send(Err(format!("Failed to bind iroh mesh endpoint: {error}")));
+                        return;
+                    }
+                }
+            }
+            None => (None, None),
+        };
+        let peer_client = match PeerHttpClient::new(&config, iroh.clone(), bridge.as_ref()) {
+            Ok(client) => Arc::new(client),
+            Err(error) => {
+                let _ = ready_tx.send(Err(format!("Failed to build relay peer client: {error}")));
+                return;
+            }
+        };
+        let disseminator = Arc::new(crate::relay::disseminator::FullBroadcast::new(
+            peer_client.clone(),
+        ));
+        let domain_budget = c2_mem::DomainBudget::from_limits(&config.domain_limits);
+        let state = Arc::new(RelayState::new_with_peer_client(
+            config,
+            disseminator,
+            peer_client,
+            context,
+            domain_budget,
+            idle_timeout,
+        ));
+        let listeners = (|| {
+            let mut listeners = vec![(
+                tokio::net::TcpListener::from_std(listener)?,
+                HttpListener {
+                    app: router::build_local_router(state.clone()),
+                    surface: ListenerSurface::LocalControl,
+                    tls: None,
+                    memory_budget,
+                },
+            )];
+            if let Some((listener, tls)) = edge {
+                listeners.push((
+                    tokio::net::TcpListener::from_std(listener)?,
+                    HttpListener {
+                        app: router::build_edge_router(state.clone()),
+                        surface: ListenerSurface::PublicEdge,
+                        tls,
+                        memory_budget,
+                    },
+                ));
+            }
+            Ok::<_, std::io::Error>(listeners)
+        })();
+        let listeners = match listeners {
+            Ok(listeners) => listeners,
+            Err(error) => {
+                let _ = ready_tx.send(Err(format!("Failed to adopt relay listener: {error}")));
                 return;
             }
         };
@@ -590,27 +743,27 @@ impl RelayServer {
         // Native cleanup observation must exist before readiness or commands.
         let clients = state.clients.clone();
         let client_observer = tokio::spawn(async move { clients.run().await });
-        let _ = ready_tx.send(Ok(()));
 
-        // Spawn background tasks (heartbeat, failure detection, anti-entropy, etc.)
+        let http_stop = CancellationToken::new();
+        let mut http_servers = tokio::task::JoinSet::new();
+        for (listener, driver) in listeners {
+            http_servers.spawn(driver.serve(listener, http_stop.clone()));
+        }
+        if let Some(iroh) = iroh {
+            let control = router::build_mesh_router(state.clone(), MeshLane::Control);
+            let data = router::build_mesh_router(state.clone(), MeshLane::Data);
+            let stop = http_stop.clone();
+            http_servers.spawn(async move { iroh.serve(control, data, stop).await });
+        }
+        let _ = ready_tx.send(Ok(state.clone()));
         let bg_handles = spawn_background_tasks(state.clone(), cancel.clone());
-
-        let (http_stop, http_stopped) = oneshot::channel();
-        let server = axum::serve(
-            crate::relay::connection::RelayListener(listener),
-            app.into_make_service_with_connect_info::<crate::relay::connection::ConnectionInfo>(),
-        )
-        .with_graceful_shutdown(async {
-            let _ = http_stopped.await;
-        });
-        let mut server = tokio::spawn(std::future::IntoFuture::into_future(server));
         let sweeper = Self::idle_sweeper(state.clone(), idle_timeout);
 
-        let http_finished = tokio::select! {
-            _ = &mut server => true,
-            _ = Self::command_loop(state.clone(), &mut cmd_rx) => false,
-            _ = sweeper => false,
-        };
+        tokio::select! {
+            _ = http_servers.join_next() => {}
+            _ = Self::command_loop(state.clone(), &mut cmd_rx) => {}
+            _ = sweeper => {}
+        }
 
         // Fence admission and observe native forwarding before the runtime can
         // destroy tasks/IPC futures. Waiter disappearance never counts as drain.
@@ -620,14 +773,8 @@ impl RelayServer {
         // Registration handlers can be waiting for control publication. Fence
         // it before awaiting HTTP handlers, so graceful drain has no cycle.
         state.stop_upstream_controls().await;
-        // The HTTP task keeps polling existing responses and token cancellation
-        // while native forwarding drains. New business admission is closed.
-        let _ = http_stop.send(());
-        if !http_finished {
-            let _ = server.await;
-        }
-
-        // Shutdown: broadcast leave, cancel background tasks
+        // Send leave while the authenticated mesh transport is still open.
+        cancel.cancel();
         let leave = PeerEnvelope::new(
             state.relay_id(),
             PeerMessage::RelayLeave {
@@ -639,7 +786,8 @@ impl RelayServer {
         if let Some(h) = leave_handle {
             let _ = tokio::time::timeout(Duration::from_secs(2), h).await;
         }
-        cancel.cancel();
+        http_stop.cancel();
+        http_servers.join_all().await;
         for handle in bg_handles {
             let _ = handle.await;
         }
@@ -1163,7 +1311,7 @@ mod tests {
     #[test]
     fn bound_address_nonzero_port_keeps_existing_advertise_derivation() {
         let (_root, context) = port_test_context();
-        for bind in ["127.0.0.1:0", "0.0.0.0:0"] {
+        for bind in ["127.0.0.1:0", "localhost:0"] {
             let mut relay = RelayServer::start_with_context(
                 RelayConfig {
                     bind: bind.into(),
@@ -1518,12 +1666,12 @@ mod tests {
             PeerMessage::RouteAnnounce {
                 name,
                 relay_id,
-                relay_url,
+                address,
                 ..
             } => {
                 assert_eq!(name, "grid");
                 assert_eq!(relay_id, "relay-a");
-                assert_eq!(relay_url, "http://relay-a:8080");
+                assert_eq!(address.display_target(), "http://relay-a:8080");
             }
             other => panic!("expected RouteAnnounce, got {other:?}"),
         }

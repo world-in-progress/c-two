@@ -83,17 +83,25 @@ pub(crate) async fn reserve_payload(
     deadline: Option<Instant>,
     phase: &str,
 ) -> Result<MemoryReservation, HttpError> {
+    reserve_payload_with_window(budget, bytes, 0, 0, deadline, phase).await
+}
+
+pub(crate) async fn reserve_payload_with_window(
+    budget: &DomainBudget,
+    fixed_bytes: u64,
+    min_window: u64,
+    max_window: u64,
+    deadline: Option<Instant>,
+    phase: &str,
+) -> Result<MemoryReservation, HttpError> {
+    let reserve = budget.reserve_memory_with_window(fixed_bytes, min_window, max_window);
     if let Some(deadline) = deadline {
-        tokio::time::timeout_at(
-            tokio::time::Instant::from_std(deadline),
-            budget.reserve_memory(bytes),
-        )
-        .await
-        .map_err(|_| payload_budget_error(PayloadBufferError::DeadlineExceeded, phase))?
-        .map_err(|error| payload_budget_error(error, phase))
+        tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), reserve)
+            .await
+            .map_err(|_| payload_budget_error(PayloadBufferError::DeadlineExceeded, phase))?
+            .map_err(|error| payload_budget_error(error, phase))
     } else {
-        budget
-            .reserve_memory(bytes)
+        reserve
             .await
             .map_err(|error| payload_budget_error(error, phase))
     }

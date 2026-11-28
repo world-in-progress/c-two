@@ -830,3 +830,56 @@ fn reserve_vec_claims_warm_buffer_before_admission_eviction() {
     assert_eq!(reservation.bytes(), size as u64);
     drop(reservation.into_buffer(reused));
 }
+
+#[test]
+fn reserve_memory_with_window_uses_fair_share_and_wakes_on_min() {
+    let budget = domain(128, 0, 0);
+    let wake = Arc::new(CountWake(AtomicUsize::new(0)));
+    let waker = Waker::from(wake);
+    let mut cx = Context::from_waker(&waker);
+
+    // Abundant headroom (>= 2 * max_window) claims full max_window.
+    let mut full = Box::pin(budget.reserve_memory_with_window(8, 2, 32));
+    let Poll::Ready(Ok(full)) = full.as_mut().poll(&mut cx) else {
+        panic!("expected full window reservation");
+    };
+    assert_eq!(full.bytes(), 40);
+    drop(full);
+
+    // Contended budget (< 2 * max_window) claims fair share (avail / 2) and leaves room.
+    let held = budget.try_reserve_memory(16).unwrap();
+    let mut first = Box::pin(budget.reserve_memory_with_window(8, 2, 128));
+    let Poll::Ready(Ok(first)) = first.as_mut().poll(&mut cx) else {
+        panic!("expected fair-share reservation alongside held bytes");
+    };
+    // avail_window = 128 - 16 - 8 = 104 -> window = 52 -> claim = 60.
+    assert_eq!(first.bytes(), 60);
+    let mut second = Box::pin(budget.reserve_memory_with_window(0, 2, 128));
+    let Poll::Ready(Ok(second)) = second.as_mut().poll(&mut cx) else {
+        panic!("expected second concurrent fair-share reservation");
+    };
+    // avail = 128 - 16 - 60 = 52 -> window = 26.
+    assert_eq!(second.bytes(), 26);
+
+    // Exhaust below fixed + min_window -> waits, then wakes as soon as min fits.
+    let filler = budget.try_reserve_memory(26).unwrap();
+    assert_eq!(budget.snapshot().memory.used_bytes, 128);
+    let mut waiting = Box::pin(budget.reserve_memory_with_window(4, 2, 64));
+    assert!(matches!(waiting.as_mut().poll(&mut cx), Poll::Pending));
+    drop(filler);
+    let Poll::Ready(Ok(woken)) = waiting.as_mut().poll(&mut cx) else {
+        panic!("expected waiter to wake once fixed + min_window became available");
+    };
+    // avail_window = 26 - 4 = 22 -> window = 11 -> claim = 15.
+    assert_eq!(woken.bytes(), 15);
+
+    // fixed + min_window > limit rejects immediately.
+    let mut too_large = Box::pin(budget.reserve_memory_with_window(127, 2, 64));
+    assert!(matches!(
+        too_large.as_mut().poll(&mut cx),
+        Poll::Ready(Err(PayloadBufferError::TooLarge { requested: 129, limit: 128 }))
+    ));
+
+    drop((woken, second, first, held));
+    assert_eq!(budget.snapshot().memory.used_bytes, 0);
+}

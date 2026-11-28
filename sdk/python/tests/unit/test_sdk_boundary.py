@@ -840,11 +840,14 @@ def test_route_table_direct_mutations_validate_tombstones_and_private_identity()
     compact = _rust_compact(source)
     _rust_function(source, 'valid_tombstone')
     _rust_function(source, 'valid_server_instance_id')
-    assert 'use crate::valid_relay_url;' in source
     _rust_function((route_table.parents[1] / 'lib.rs').read_text(encoding='utf-8'), 'valid_relay_url')
+    address_source = (route_table.parent / 'types.rs').read_text(encoding='utf-8')
+    address_validation = _rust_compact(_rust_function(address_source, 'is_valid'))
+    assert 'http_url.as_deref().is_none_or(crate::valid_relay_url)' in address_validation
+    assert 'bridge_url.as_deref().is_none_or(crate::valid_relay_url)' in address_validation
     assert 'self.valid_tombstone(&tombstone)' in compact
-    assert 'valid_relay_url(&entry.relay_url)' in compact
-    assert 'valid_relay_url(&url)' in compact
+    assert 'entry.address.is_valid()' in compact
+    assert 'address.is_valid()' in _rust_compact(_rust_function(source, 'record_peer_join'))
     assert 'letremoved=self.routes.get(&key).cloned();' in compact
     assert 'if!self.apply_tombstone(tombstone)' in compact
     # A guard elsewhere in this module cannot excuse an unchecked mutation.

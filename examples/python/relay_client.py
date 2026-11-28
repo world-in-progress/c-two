@@ -6,7 +6,7 @@ same endpoint namespace selects local IPC.
 Usage (3-terminal workflow):
 
     # Terminal 1 — start the relay
-    c3 relay -b 0.0.0.0:8300
+    c3 relay -b 127.0.0.1:8300
 
     # Terminal 2 — start the Grid CRM and register it with the relay
     uv run python examples/python/relay_resource.py --relay-url http://127.0.0.1:8300
