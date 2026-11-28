@@ -48,8 +48,9 @@ SOURCE_SHA = "a" * 40
 OTHER_SHA = "b" * 40
 C_TWO_VERSION = "0.6.0"
 C3_VERSION = "0.2.0"
-FASTDB_VERSION = "0.3.0"
-FASTDB_CORE_VERSION = "0.3.0"
+JAVA_VERSION = "0.13.0-rc.2"
+FASTDB_VERSION = "0.4.0"
+FASTDB_CORE_VERSION = "0.4.0"
 FASTDB_SOURCE_REV = promote.FASTDB_SOURCE_REV
 CLI_TARGETS = promote.CLI_TARGETS
 WINDOWS_TARGET = "x86_64-pc-windows-msvc"
@@ -193,6 +194,7 @@ class CandidateBuilder:
         self.sdist: list[dict[str, Any]] = []
         self.fastdb_proof: list[dict[str, Any]] = []
         self.installers: list[dict[str, Any]] = []
+        self.java: list[dict[str, Any]] = []
         self.receipts: list[dict[str, Any]] = {}
         self.receipt_order: list[dict[str, Any]] = []
         self.wheel_by_row: dict[str, str] = {}
@@ -269,6 +271,20 @@ class CandidateBuilder:
         ):
             self.installers.append(self._put(name, data))
 
+        for name in promote.rc_helper.java_filenames(JAVA_VERSION):
+            self.java.append(self._put(name, name.encode()))
+        java_identity = {"source_commit_sha": SOURCE_SHA, "version": JAVA_VERSION,
+                         "fastdb_version": FASTDB_VERSION, "status": "passed"}
+        self._record_receipt("java-inspect.json", {
+            **java_identity, "schema": promote.rc_helper.JAVA_INSPECT_SCHEMA,
+            "files": {entry["name"]: entry["sha256"] for entry in self.java},
+        })
+        for platform in promote.rc_helper.JAVA_NATIVE_LIBRARIES:
+            self._record_receipt(f"java-smoke-{platform}.json", {
+                **java_identity, "schema": promote.rc_helper.JAVA_SMOKE_SCHEMA,
+                "platform": platform, "jar_sha256": self.java[0]["sha256"],
+            })
+
         self._record_receipt("rc-context.json", {
             "schema": "c-two.release-candidate.context.v2",
             "source_commit_sha": SOURCE_SHA,
@@ -277,6 +293,7 @@ class CandidateBuilder:
             "pull_request_head_sha": None,
             "c_two_version": self.c_two_version,
             "c3_version": self.c3_version,
+            "java_version": JAVA_VERSION,
             "fastdb_version": FASTDB_VERSION,
             "fastdb_source_rev": FASTDB_SOURCE_REV,
         })
@@ -458,6 +475,7 @@ class CandidateBuilder:
             "meta": {
                 "c_two_version": self.c_two_version,
                 "c3_version": self.c3_version,
+                "java_version": JAVA_VERSION,
                 "fastdb_version": FASTDB_VERSION,
                 "fastdb_source_rev": FASTDB_SOURCE_REV,
                 "fastdb_sdist_sha256": _sha(self.fastdb_sdist_data),
@@ -466,12 +484,14 @@ class CandidateBuilder:
             "counts": {
                 "cli": len(self.cli), "wheels": len(self.wheels),
                 "sdist": len(self.sdist), "fastdb_proof": len(self.fastdb_proof),
+                "java": len(self.java),
                 "installers": len(self.installers),
                 "receipts_by_prefix": dict(promote.EXPECTED_RECEIPT_PREFIX_COUNTS),
                 "receipts": len(receipts),
             },
             "cli": self.cli,
             "wheels": self.wheels,
+            "java": self.java,
             "sdist": self.sdist,
             "fastdb_proof": self.fastdb_proof,
             "installers": self.installers,
@@ -1158,6 +1178,7 @@ def test_happy_path_github_release_plan(tmp_path: Path, environment) -> None:
     plan = json.loads(plan_path.read_text())
     assert plan["schema"] == "c-two.release-promotion-plan.v1"
     assert plan["versions"] == {"c_two_version": C_TWO_VERSION, "c3_version": C3_VERSION,
+                                "java_version": JAVA_VERSION,
                                 "fastdb_version": FASTDB_VERSION,
                                 "fastdb_source_rev": FASTDB_SOURCE_REV}
     release = plan["github_release"]
@@ -1229,20 +1250,23 @@ def test_fastdb_provisioning_missing_wheel_with_null_digest_is_rejected(
     assert "not a distinct retained wheel" in capsys.readouterr().err
 
 
-@pytest.mark.parametrize("core_version, accepted", [("0.3.0", True), ("0.2.1", False)])
-def test_python_fastdb_version_is_independent_of_native_core(
-    tmp_path: Path, environment, monkeypatch, core_version, accepted,
+@pytest.mark.parametrize("python_version, core_version, accepted", [
+    ("0.4.0", "0.4.0", True), ("0.2.2", "0.4.0", False), ("0.4.0", "0.2.1", False),
+])
+def test_promotion_requires_pinned_python_and_native_fastdb(
+    tmp_path: Path, environment, monkeypatch, python_version, core_version, accepted,
 ) -> None:
-    monkeypatch.setitem(globals(), "FASTDB_VERSION", "0.2.2")
+    monkeypatch.setitem(globals(), "FASTDB_VERSION", python_version)
     monkeypatch.setitem(globals(), "FASTDB_CORE_VERSION", core_version)
     environment(_default_world())
     code, plan_path, body_path = run_prepare(tmp_path)
     assert code == (0 if accepted else 1)
     if accepted:
-        assert json.loads(plan_path.read_text())["versions"]["fastdb_version"] == "0.2.2"
+        assert json.loads(plan_path.read_text())["versions"]["fastdb_version"] == "0.4.0"
         body = body_path.read_text()
-        assert "Native FastDB Core: `0.3.0`" in body
-        assert "Optional Python FastDB: `fastdb4py==0.2.2`" in body
+        assert "Native FastDB Core: `0.4.0`" in body
+        assert "Optional Python FastDB: `fastdb4py==0.4.0`" in body
+        assert f"Java SDK candidate: `io.github.world-in-progress:c-two-sdk:{JAVA_VERSION}`" in body
 
 
 def test_free_threaded_wheel_rows_use_real_tag_pairs(tmp_path: Path, environment) -> None:
@@ -2275,3 +2299,49 @@ def test_sdist_proof_rejects_unnormalized_isolated_wheel_filename_spelling(
     assert code == 1
     assert not plan_path.exists()
     assert "isolated_wheel" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("existing, expected", [
+    ("none", "upload"),
+    ("all", "noop"),
+    ("partial", "partially published"),
+    ("mismatch", "differs from the retained candidate"),
+])
+def test_maven_promotion_stages_exact_candidate_bytes(tmp_path, environment, monkeypatch, existing, expected):
+    world = _default_world()
+    environment(world)
+    files = {entry["name"]: entry["sha256"] for entry in world.candidate.java}
+    main = world.candidate.java[0]["name"]
+    remote = {"none": {}, "all": files, "partial": {main: files[main]}, "mismatch": {main: "f" * 64}}[existing]
+    monkeypatch.setattr(promote.maven_publish, "remote_digest", lambda version, name: remote.get(name))
+    if expected not in {"upload", "noop"}:
+        with pytest.raises(promote.PromotionError, match=expected):
+            promote.maven_central_state(
+                tmp_path, world.candidate.java, tmp_path / "staging/maven",
+                tmp_path, JAVA_VERSION, None,
+            )
+        return
+
+    status, plan_path, _ = run_prepare(tmp_path, target="maven-central")
+    assert status == 0
+    plan = json.loads(plan_path.read_text())
+    assert plan["maven_central"]["action"] == expected
+    staging = tmp_path / "candidate-download/staging/maven"
+    if expected == "noop":
+        assert not staging.exists()
+    else:
+        assert {path.name: path.read_bytes() for path in staging.iterdir()} == {
+            name: world.candidate.members[name] for name in files
+        }
+
+
+def test_promotion_rejects_java_smoke_for_different_jar(tmp_path, environment, capsys):
+    builder = CandidateBuilder()
+    name = "java-smoke-linux-x86_64.json"
+    receipt = json.loads(builder.members[name])
+    receipt["jar_sha256"] = "f" * 64
+    builder._rewrite_json(name, receipt)
+    environment(World(builder))
+    status, _, _ = run_prepare(tmp_path)
+    assert status == 1
+    assert f"{name} does not bind the retained main JAR" in capsys.readouterr().err

@@ -1,0 +1,12 @@
+{
+  "schema": "fastdb.payload.v1",
+  "profile": "record.v1",
+  "entries": [
+    {"id": "text", "cardinality": "one", "type": {"kind": "str"}},
+    {"id": "byte", "cardinality": "one", "type": {"kind": "u8"}},
+    {"id": "count", "cardinality": "one", "type": {"kind": "u32"}},
+    {"id": "scale", "cardinality": "one", "type": {"kind": "f64"}},
+    {"id": "data", "cardinality": "one", "type": {"kind": "bytes"}}
+  ],
+  "components": []
+}

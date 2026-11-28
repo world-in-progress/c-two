@@ -48,6 +48,21 @@ def test_python_codegen_projects_the_shared_rust_artifact_set() -> None:
         assert artifact.owner in {"c-two", "fastdb-core"}
 
 
+def test_java_codegen_projects_both_owners_deterministically() -> None:
+    descriptor = FIXTURE.read_bytes()
+    result = cc.contract.compile_artifacts(descriptor, target="java")
+    assert result == cc.contract.compile_artifacts(descriptor, target="java")
+
+    java_sources = "java/src/main/java"
+    contract = result.get(f"{java_sources}/io/ctwo/generated/test/contract_release/PortableContract.java")
+    assert contract is not None and contract.owner == "c-two"
+    assert any(
+        artifact.relative_path.startswith(f"{java_sources}/io/fastdb/payload/generated/")
+        and artifact.owner == "fastdb-core"
+        for artifact in result.artifacts
+    )
+
+
 def test_python_codegen_preserves_structured_fastdb_error_fields() -> None:
     descriptor = json.loads(FIXTURE.read_text())
     descriptor["methods"][1]["bindings"]["input"]["spec"] = {"schema": "wrong"}
@@ -90,7 +105,8 @@ def test_python_codegen_non_fastdb_errors_have_explicit_empty_cause_fields() -> 
     assert error.limit is None
     assert error.observed is None
     assert error.message == str(error)
-    assert "unsupported contract codegen target" in error.message
+    assert 'unsupported contract codegen target "cpp"' in error.message
+    assert error.message.endswith("expected rust, python, typescript, or java")
 
 
 def test_python_codegen_projects_typed_contract_admission_fields() -> None:

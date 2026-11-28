@@ -70,9 +70,10 @@ Generate one complete project tree at an absent destination:
 c3 contract codegen rust echo.contract.json --out-dir generated-rust
 c3 contract codegen python echo.contract.json --out-dir generated-python
 c3 contract codegen typescript echo.contract.json --out-dir generated-typescript
+c3 contract codegen java echo.contract.json --out-dir generated-java
 ```
 
-The output contains C-Two contract/release/composition metadata, the target-specific C-Two adapter, and FastDB Core-owned payload modules. All three targets generate server-stream methods. The TypeScript target generates clients only: `method_{index}_{name}` returns a `C2ResponseStream`, and `hold_method_{index}_{name}` yields each item as a `C2HeldResult`. Generation is fail-closed: invalid or colliding paths, hash mismatches, FastDB errors, and existing destinations produce no partial winning tree. There is no separate payload sidecar input.
+The output contains C-Two contract/release/composition metadata, the target-specific C-Two adapter, and FastDB Core-owned payload modules. All four targets generate server-stream methods. TypeScript generates client bindings where `method_{index}_{name}` returns a `C2ResponseStream` and `hold_method_{index}_{name}` yields each item as a `C2HeldResult`. Java generates service and client bindings for JDK 17. Add `generated-java/java/src/main/java` as one source root and compile with the [C-Two Java SDK](../sdk/java/README.md) and FastDB Java 0.4.0. The Java source root contains both the C-Two adapter and the FastDB Core payload classes. Invalid or colliding paths, hash mismatches, FastDB errors, and existing destinations leave the destination unpublished. The descriptor supplies the nested FastDB specifications.
 
 `c3 contract export` and `c3 contract diagnose` accept `--python` (resolved in order `--python` → process environment `C2_PYTHON` → `python3`), repeatable `--method` filters, `--out` (default stdout) and `--pretty`; `release-ref` also accepts `--pretty`, and `validate`, `release-ref` and `codegen` accept `-` as the descriptor path to read JSON from stdin.
 

@@ -5,7 +5,7 @@ Uses only public C-Two, FastDB, NumPy, and (optional) Ray APIs under C-Two's
 current single-owner copy-then-release semantics (ADR 0001).
 
 Suites:
-  - stages:   Single-process FastDB 0.3.0 ExternalBytes plan / direct execute /
+  - stages:   Single-process FastDB 0.4.0 ExternalBytes plan / direct execute /
               memoryview / open_external / open_copy / view-reduce decomposition
               (256 KiB, 4 MiB, 32 MiB).
   - coupling: Bidirectional small-packet coupling exchange (1, 4, 16, 64 KiB on
@@ -93,7 +93,7 @@ RAY_OBJECT_STORE_BYTES = 1536 * MIB     # Safe below macOS 2 GiB Ray plasma cap
 SIMULATED_STEP_MS = (5.0, 20.0, 50.0, 100.0)
 _NO_PROXY_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
-# Single-direction full-payload copy lower bounds on SHM path (fastdb4py 0.3.0 +
+# Single-direction full-payload copy lower bounds on SHM path (fastdb4py 0.4.0 +
 # C-Two WritableSlab direct SHM, excluding kernel/page-zeroing/metadata/initial
 # array construction/client reduction).
 COPY_LEDGER_SHM_UNARY = {

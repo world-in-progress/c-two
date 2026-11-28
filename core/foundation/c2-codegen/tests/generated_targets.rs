@@ -7,6 +7,8 @@ use std::process::Command;
 
 const DESCRIPTOR: &str =
     include_str!("../../../../tests/fixtures/contracts/portable-release.contract.json");
+const JAVA_MODULE: &str =
+    "java/src/main/java/io/ctwo/generated/test/contract_release/PortableContract.java";
 
 fn compile_contract_artifacts(
     descriptor_json: &[u8],
@@ -41,6 +43,7 @@ fn every_target_contains_a_c_two_owned_contract_module() {
             ContractCodegenTarget::TypeScript,
             "typescript/c_two_contract.ts",
         ),
+        (ContractCodegenTarget::Java, JAVA_MODULE),
     ] {
         let set =
             compile_contract_artifacts(DESCRIPTOR.as_bytes(), target, &Default::default()).unwrap();
@@ -109,6 +112,7 @@ fn target_method_symbols_include_the_stable_index_before_sanitized_names() {
             ContractCodegenTarget::TypeScript,
             "typescript/c_two_contract.ts",
         ),
+        (ContractCodegenTarget::Java, JAVA_MODULE),
     ] {
         let set = compile_contract_artifacts(
             descriptor.as_bytes(),
@@ -152,6 +156,74 @@ fn target_modules_are_deterministic_and_composed_with_core_payload_artifacts() {
 }
 
 #[test]
+fn java_composes_unmodified_fastdb_sources_under_the_standard_source_root() {
+    let options = ContractCodegenOptions::default();
+    let set =
+        compile_contract_artifacts(DESCRIPTOR.as_bytes(), ContractCodegenTarget::Java, &options)
+            .unwrap();
+    assert_eq!(
+        set,
+        compile_contract_artifacts(DESCRIPTOR.as_bytes(), ContractCodegenTarget::Java, &options)
+            .unwrap()
+    );
+    let manifest: serde_json::Value = serde_json::from_slice(
+        set.get("metadata/composition-manifest.json")
+            .unwrap()
+            .bytes(),
+    )
+    .unwrap();
+    assert_eq!(manifest["target"], "java");
+    assert_eq!(manifest["bindings"].as_array().unwrap().len(), 2);
+    assert_eq!(manifest["payloads"].as_array().unwrap().len(), 1);
+    let payload = &manifest["payloads"][0];
+    let spec =
+        fastdb::CompiledSpec::compile(payload["canonical_spec"].to_string().as_bytes()).unwrap();
+    let generated = spec
+        .generate(fastdb::CodegenTarget::Java, &options.fastdb_codegen)
+        .unwrap();
+    assert_eq!(generated.len().unwrap(), 1);
+    let core = generated.artifact(0).unwrap();
+    let path = format!("java/src/main/java/{}", core.relative_path);
+    let artifact = set.get(&path).unwrap();
+    assert_eq!(artifact.bytes(), core.bytes);
+    assert_eq!(artifact.sha256(), &core.sha256);
+    assert_eq!(payload["artifacts"][0]["path"], path);
+    assert_eq!(payload["artifacts"][0]["core_path"], core.relative_path);
+    assert_eq!(payload["artifacts"][0]["sha256"], artifact.sha256_hex());
+    let adapter = std::str::from_utf8(set.get(JAVA_MODULE).unwrap().bytes()).unwrap();
+    assert_eq!(adapter.matches(".compileSpec()").count(), 1);
+}
+
+#[test]
+fn java_names_allow_javac_to_write_nested_class_files() {
+    let mut descriptor: serde_json::Value = serde_json::from_str(DESCRIPTOR).unwrap();
+    descriptor["crm"]["name"] = format!("9{}", "a".repeat(254)).into();
+    descriptor["crm"]["namespace"] = "9-x.class.con.._".into();
+    let fingerprints =
+        c2_contract::derive_contract_fingerprints_json(descriptor.to_string().as_bytes()).unwrap();
+    descriptor["fingerprints"]["abi_hash"] = fingerprints.abi_hash().into();
+    descriptor["fingerprints"]["signature_hash"] = fingerprints.signature_hash().into();
+    let set = compile_contract_artifacts(
+        descriptor.to_string().as_bytes(),
+        ContractCodegenTarget::Java,
+        &Default::default(),
+    )
+    .unwrap();
+    let stem = set
+        .artifacts()
+        .iter()
+        .find_map(|artifact| {
+            artifact
+                .relative_path()
+                .strip_prefix("java/src/main/java/io/ctwo/generated/_9_x/class_/con_/__/__/")
+                .and_then(|file| file.strip_suffix(".java"))
+        })
+        .expect("Java contract module in the sanitized package");
+    assert!(stem.starts_with("_9a") && stem.ends_with("Contract"));
+    assert!(format!("{stem}$RegistrationTopics.class").len() <= 255);
+}
+
+#[test]
 fn no_payload_contract_still_has_a_real_c_two_target_module() {
     let mut descriptor: serde_json::Value = serde_json::from_str(DESCRIPTOR).unwrap();
     descriptor["methods"].as_array_mut().unwrap().truncate(1);
@@ -169,6 +241,7 @@ fn no_payload_contract_still_has_a_real_c_two_target_module() {
             ContractCodegenTarget::TypeScript,
             "typescript/c_two_contract.ts",
         ),
+        (ContractCodegenTarget::Java, JAVA_MODULE),
     ] {
         let set = compile_contract_artifacts(
             descriptor.to_string().as_bytes(),
@@ -177,11 +250,10 @@ fn no_payload_contract_still_has_a_real_c_two_target_module() {
         )
         .unwrap();
         assert!(set.get(module_path).is_some());
-        assert!(
-            !set.artifacts()
-                .iter()
-                .any(|artifact| { artifact.relative_path().contains("/payloads/") })
-        );
+        assert!(!set.artifacts().iter().any(|artifact| {
+            artifact.relative_path().contains("/payloads/")
+                || artifact.relative_path().contains("/io/fastdb/")
+        }));
     }
 }
 
@@ -233,7 +305,7 @@ publish = false
 
 [dependencies]
 c-two = {{ version = "0.1.0", path = {c_two:?} }}
-fastdb = "=0.3.0"
+fastdb = "=0.4.0"
 c2-ipc = {{ path = {ipc:?} }}
 c2-mem = {{ path = {mem:?} }}
 c2-wire = {{ path = {wire:?} }}

@@ -36,7 +36,7 @@ PORTABLE = (
     f"{SDK}/integration/test_portable_payload_matrix.py",
 )
 TYPESCRIPT = f"{SDK}/integration/test_typescript_real_calls.py"
-FASTDB_SHA = "ff097cca9c29cadc289e2a437f4720ecc56015c4"
+FASTDB_SHA = "af2790068d87d34f19061cb02f4d1c0e7ba224d0"
 PLUGIN = "tools.dev.test_python"
 
 
@@ -227,8 +227,8 @@ def capture(command: list[str], environment: dict[str, str]) -> str:
 
 def preflight(options: argparse.Namespace, environment: dict[str, str]) -> dict:
     info = json.loads(capture([options.python, "-c", PROBE], environment).splitlines()[-1])
-    if info["versions"]["fastdb4py"] != "0.3.0":
-        raise RunnerError("需要固定fastdb4py==0.3.0")
+    if info["versions"]["fastdb4py"] != "0.4.0":
+        raise RunnerError("需要固定fastdb4py==0.4.0")
     if not options.c3.is_file():
         raise RunnerError(f"预建c3不存在：{options.c3}")
     if not options.route_scope_attestor.is_file():

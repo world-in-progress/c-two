@@ -337,7 +337,7 @@ fn validate_artifact_path(path: &str) -> Result<(), CodegenError> {
     Ok(())
 }
 
-fn is_windows_reserved_name(segment: &str) -> bool {
+pub(crate) fn is_windows_reserved_name(segment: &str) -> bool {
     let stem = segment.split('.').next().unwrap_or(segment);
     let upper = stem.to_ascii_uppercase();
     matches!(upper.as_str(), "CON" | "PRN" | "AUX" | "NUL")

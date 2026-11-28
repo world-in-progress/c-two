@@ -5,6 +5,8 @@ use c2_contract::{MethodAccess, MethodMode, ValidatedContractDescriptor};
 use serde_json::Value;
 use std::collections::BTreeSet;
 
+mod java;
+
 const TYPESCRIPT_TRANSPORT_SOURCE: &str = include_str!("../assets/typescript_transport.ts");
 
 pub(crate) struct TargetMethod<'a> {
@@ -30,17 +32,18 @@ pub(crate) fn render_target_artifacts(
 ) -> Result<Vec<ContractArtifact>, CodegenError> {
     let (path, source) = match target {
         ContractCodegenTarget::Rust => (
-            "rust/c_two_contract.rs",
+            "rust/c_two_contract.rs".to_string(),
             render_rust(descriptor, methods, topics),
         ),
         ContractCodegenTarget::Python => (
-            "python/c_two_contract.py",
+            "python/c_two_contract.py".to_string(),
             render_python(descriptor, methods, topics),
         ),
         ContractCodegenTarget::TypeScript => (
-            "typescript/c_two_contract.ts",
+            "typescript/c_two_contract.ts".to_string(),
             render_typescript(descriptor, methods, topics),
         ),
+        ContractCodegenTarget::Java => java::render_java(descriptor, methods, topics),
     };
     Ok(vec![ContractArtifact::new(
         path,

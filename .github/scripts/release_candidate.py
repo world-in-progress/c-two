@@ -33,6 +33,8 @@ import json
 import re
 import sys
 import tarfile
+import xml.etree.ElementTree as ET
+import zipfile
 from pathlib import Path, PurePosixPath
 
 MANIFEST_SCHEMA = "c-two.release-candidate.v1"
@@ -45,6 +47,16 @@ INSTALLER_NAMES = ("install-c3.sh", "install-c3.ps1",
                    "c3-installer.sh", "c3-installer.ps1")
 FASTDB_PROOF_NAMES = ("fastdb-LICENSE", "fastdb-THIRD_PARTY_NOTICES.txt")
 PASSING_RECEIPT_STATUSES = ("passed", "executed")
+MAVEN_GROUP = "io.github.world-in-progress"
+JAVA_ARTIFACT = "c-two-sdk"
+JAVA_NATIVE_LIBRARIES = {
+    "linux-x86_64": "libc2_java.so",
+    "macos-arm64": "libc2_java.dylib",
+    "windows-x86_64": "c2_java.dll",
+}
+JAVA_INSPECT_SCHEMA = "c-two.release-candidate.java-inspection.v1"
+JAVA_SMOKE_SCHEMA = "c-two.release-candidate.java-smoke.v1"
+POM_NAMESPACE = {"m": "http://maven.apache.org/POM/4.0.0"}
 
 
 class HelperError(RuntimeError):
@@ -119,8 +131,37 @@ def validate_c_two_version(value: str) -> bool:
     return bool(parsed.is_prerelease)
 
 
-def read_repo_versions(root: Path) -> tuple[str, str]:
-    """Read and validate c-two and c3 versions from repository TOML manifests."""
+def validate_java_version(value: str) -> bool:
+    """Validate the Java version and return whether it is a pre-release."""
+    if not isinstance(value, str) or not C3_VERSION_PATTERN.fullmatch(value):
+        raise HelperError(f"Java version {value!r} must match X.Y.Z or X.Y.Z-{{alpha,beta,rc}}.N")
+    return "-" in value
+
+
+def read_pom(path: Path) -> ET.Element:
+    try:
+        project = ET.parse(path).getroot()
+    except (ET.ParseError, OSError) as error:
+        raise HelperError(f"cannot read Maven POM {path.name}: {error}") from error
+    if project.tag != f"{{{POM_NAMESPACE['m']}}}project":
+        raise HelperError(f"{path.name} is missing the Maven project namespace")
+    return project
+
+
+def verify_fastdb_java(project: ET.Element, version: str) -> None:
+    dependencies = project.findall("m:dependencies/m:dependency", POM_NAMESPACE)
+    fastdb = [dependency for dependency in dependencies
+              if dependency.findtext("m:groupId", namespaces=POM_NAMESPACE) == MAVEN_GROUP
+              and dependency.findtext("m:artifactId", namespaces=POM_NAMESPACE) == "fastdb-java"]
+    if (len(fastdb) != 1
+            or fastdb[0].findtext("m:version", namespaces=POM_NAMESPACE) != version
+            or fastdb[0].findtext("m:scope", "compile", POM_NAMESPACE) != "compile"
+            or (fastdb[0].findtext("m:optional", "false", POM_NAMESPACE) or "false").strip().lower() != "false"):
+        raise HelperError(f"POM must declare exactly one non-optional compile dependency on {MAVEN_GROUP}:fastdb-java:{version}")
+
+
+def read_repo_versions(root: Path) -> tuple[str, str, str]:
+    """Read and validate the Python, CLI and Java versions from repository manifests."""
     import tomllib
 
     pyproject = tomllib.loads((root / "sdk" / "python" / "pyproject.toml").read_text(encoding="utf-8"))
@@ -129,7 +170,9 @@ def read_repo_versions(root: Path) -> tuple[str, str]:
     c3_version = cargo.get("package", {}).get("version")
     validate_c_two_version(c_two_version)
     validate_c3_version(c3_version)
-    return c_two_version, c3_version
+    java_version = read_pom(root / "sdk/java/pom.xml").findtext("m:version", namespaces=POM_NAMESPACE)
+    validate_java_version(java_version)
+    return c_two_version, c3_version, java_version
 
 
 def sha256_file(path: Path) -> str:
@@ -382,6 +425,110 @@ def command_inspect_sdist(options: argparse.Namespace) -> int:
                                         encoding="utf-8")
     print(json.dumps({key: report[key] for key in ("status", "missing", "errors")}, indent=2))
     return 0 if report["status"] == "passed" else 1
+
+
+def java_filenames(version: str) -> tuple[str, str, str, str]:
+    validate_java_version(version)
+    prefix = f"{JAVA_ARTIFACT}-{version}"
+    return tuple(f"{prefix}{suffix}" for suffix in (".jar", "-sources.jar", "-javadoc.jar", ".pom"))
+
+
+def verify_java_native_header(archive: zipfile.ZipFile, platform: str, member: str) -> None:
+    with archive.open(member) as stream:
+        header = stream.read(64)
+        if platform == "linux-x86_64":
+            matches = (len(header) == 64 and header[:6] == b"\x7fELF\x02\x01"
+                       and int.from_bytes(header[18:20], "little") == 62)
+        elif platform == "macos-arm64":
+            matches = (len(header) >= 32 and header[:4] == b"\xcf\xfa\xed\xfe"
+                       and int.from_bytes(header[4:8], "little") == 0x0100000c)
+        else:
+            matches = False
+            if len(header) == 64 and header[:2] == b"MZ":
+                offset = int.from_bytes(header[60:64], "little")
+                if 64 <= offset <= archive.getinfo(member).file_size - 24:
+                    stream.seek(offset)
+                    matches = stream.read(6) == b"PE\0\0\x64\x86"
+    if not matches:
+        raise HelperError(f"{member} has an invalid {platform} binary header")
+
+
+def inspect_java(root: Path, version: str, fastdb_version: str, source_sha: str) -> dict:
+    main, sources, javadoc, pom = (root / name for name in java_filenames(version))
+    if not re.fullmatch(r"[0-9a-f]{40}", source_sha):
+        raise HelperError("Java inspection requires an exact source commit SHA")
+    library_members = {platform: f"META-INF/native/{platform}/{library}"
+                       for platform, library in JAVA_NATIVE_LIBRARIES.items()}
+    try:
+        for path, required in (
+            (main, {"io/ctwo/Runtime.class", "META-INF/LICENSE", *library_members.values()}),
+            (sources, {"io/ctwo/Runtime.java", "META-INF/LICENSE"}),
+            (javadoc, {"index.html"}),
+        ):
+            with zipfile.ZipFile(path) as archive:
+                names = archive.namelist()
+                if len(names) != len(set(names)):
+                    raise HelperError(f"{path.name} has duplicate members")
+                missing = required - set(names)
+                if missing:
+                    raise HelperError(f"{path.name} is missing {sorted(missing)}")
+                if path == sources and any(name.startswith("META-INF/native/") for name in names):
+                    raise HelperError("sources JAR contains META-INF/native/ entries")
+                if path == main:
+                    for platform, member in library_members.items():
+                        verify_java_native_header(archive, platform, member)
+    except (OSError, zipfile.BadZipFile) as error:
+        raise HelperError(f"cannot inspect Java packages: {error}") from error
+
+    project = read_pom(pom)
+    for field, expected in (("groupId", MAVEN_GROUP), ("artifactId", JAVA_ARTIFACT), ("version", version)):
+        if project.findtext(f"m:{field}", namespaces=POM_NAMESPACE) != expected:
+            raise HelperError(f"POM {field} must be {expected!r}")
+    verify_fastdb_java(project, fastdb_version)
+    return {
+        "schema": JAVA_INSPECT_SCHEMA,
+        "source_commit_sha": source_sha,
+        "version": version,
+        "fastdb_version": fastdb_version,
+        "files": {path.name: sha256_file(path) for path in (main, sources, javadoc, pom)},
+        "status": "passed",
+    }
+
+
+def command_inspect_java(options: argparse.Namespace) -> int:
+    report = inspect_java(Path(options.root), options.version, options.expect_fastdb_version, options.source_sha)
+    Path(options.output).write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    print(f"inspected Java packages for {options.version}")
+    return 0
+
+
+def verify_java_receipts(java: list[dict], receipts: dict, meta: dict, source_sha: str) -> None:
+    version = meta.get("java_version")
+    filenames = java_filenames(version)
+    hashes = {entry["name"]: entry["sha256"] for entry in java}
+    if len(java) != len(hashes) or set(hashes) != set(filenames):
+        raise HelperError(f"Java inventory must contain exactly {list(filenames)}")
+    expected_receipts = {"java-inspect.json", *(f"java-smoke-{platform}.json" for platform in JAVA_NATIVE_LIBRARIES)}
+    if {name for name in receipts if name.startswith(("java-inspect", "java-smoke-"))} != expected_receipts:
+        raise HelperError(f"Java evidence must contain exactly {sorted(expected_receipts)}")
+
+    def require_receipt(name: str, schema: str) -> dict:
+        receipt = receipts.get(name)
+        if (not isinstance(receipt, dict) or receipt.get("schema") != schema
+                or receipt.get("status") != "passed"
+                or receipt.get("source_commit_sha") != source_sha
+                or receipt.get("version") != version
+                or receipt.get("fastdb_version") != meta.get("fastdb_version")):
+            raise HelperError(f"{name} does not bind the passing Java and FastDB versions to {source_sha}")
+        return receipt
+
+    if require_receipt("java-inspect.json", JAVA_INSPECT_SCHEMA).get("files") != hashes:
+        raise HelperError("java-inspect.json SHA-256 inventory differs from the retained Java files")
+    for platform in JAVA_NATIVE_LIBRARIES:
+        name = f"java-smoke-{platform}.json"
+        receipt = require_receipt(name, JAVA_SMOKE_SCHEMA)
+        if receipt.get("platform") != platform or receipt.get("jar_sha256") != hashes[filenames[0]]:
+            raise HelperError(f"{name} does not bind the retained main JAR SHA-256 and platform")
 
 
 def _python_abi_pair(python: str) -> tuple[str, str]:
@@ -675,6 +822,7 @@ def command_manifest(options: argparse.Namespace) -> int:
 
     cli: list[dict] = []
     wheels: list[dict] = []
+    java: list[dict] = []
     sdist: list[dict] = []
     fastdb_proof: list[dict] = []
     installers: list[dict] = []
@@ -696,6 +844,10 @@ def command_manifest(options: argparse.Namespace) -> int:
             # Verbatim upstream license evidence for the statically linked
             # FastDB core; dependency proof, not a C-Two publishable.
             fastdb_proof.append(artifact_entry(path))
+        elif name.startswith(f"{JAVA_ARTIFACT}-") and name.endswith((".jar", ".pom")):
+            if options.java_prefix and not name.startswith(options.java_prefix):
+                problems.append(f"unexpected Java name {name}, expected prefix {options.java_prefix}")
+            java.append(artifact_entry(path))
         elif name.endswith(".whl"):
             if options.wheel_prefix and not name.startswith(options.wheel_prefix):
                 problems.append(f"unexpected wheel name {name}, expected prefix {options.wheel_prefix}")
@@ -712,10 +864,10 @@ def command_manifest(options: argparse.Namespace) -> int:
             problems.append(f"unclassified candidate file {path.relative_to(root)}")
 
     expected_counts = {"cli": options.expect_cli, "wheels": options.expect_wheels,
-                       "sdist": options.expect_sdist,
+                       "sdist": options.expect_sdist, "java": options.expect_java,
                        "fastdb_proof": options.expect_fastdb_proof,
                        "installers": options.expect_installers}
-    actual_counts = {"cli": len(cli), "wheels": len(wheels), "sdist": len(sdist),
+    actual_counts = {"cli": len(cli), "wheels": len(wheels), "sdist": len(sdist), "java": len(java),
                      "fastdb_proof": len(fastdb_proof), "installers": len(installers)}
     for kind, expected in expected_counts.items():
         if expected is not None and actual_counts[kind] != expected:
@@ -796,6 +948,13 @@ def command_manifest(options: argparse.Namespace) -> int:
                     f"sdist-inspect.json project {project!r} does not match "
                     f"c-two {meta['c_two_version']!r}"
                 )
+    if java or options.expect_java_version or "java_version" in meta:
+        if options.expect_java_version and meta.get("java_version") != options.expect_java_version:
+            problems.append("meta java_version differs from --expect-java-version")
+        try:
+            verify_java_receipts(java, parsed_receipts, meta, options.source_sha)
+        except HelperError as error:
+            problems.append(str(error))
     if "c3_version" in meta:
         try:
             validate_c3_version(meta["c3_version"])
@@ -821,6 +980,7 @@ def command_manifest(options: argparse.Namespace) -> int:
                    "receipts": len(receipts)},
         "cli": cli,
         "wheels": wheels,
+        "java": java,
         "sdist": sdist,
         "fastdb_proof": fastdb_proof,
         "installers": installers,
@@ -829,7 +989,7 @@ def command_manifest(options: argparse.Namespace) -> int:
     output.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     sidecar_for(output).write_text(f"{sha256_file(output)}  {output.name}\n", encoding="utf-8")
     print(f"manifest {output} cli={len(cli)} wheels={len(wheels)} sdist={len(sdist)} "
-          f"fastdb_proof={len(fastdb_proof)} installers={len(installers)} receipts={len(receipts)}")
+          f"java={len(java)} fastdb_proof={len(fastdb_proof)} installers={len(installers)} receipts={len(receipts)}")
     return 0
 
 
@@ -852,6 +1012,14 @@ def main(argv: list[str] | None = None) -> int:
                          help="Stamp the sealed source sha into the inspection report")
     inspect.set_defaults(handler=command_inspect_sdist)
 
+    inspect_java_parser = commands.add_parser("inspect-java", help="Validate the Java Maven packages")
+    inspect_java_parser.add_argument("--root", required=True)
+    inspect_java_parser.add_argument("--version", required=True)
+    inspect_java_parser.add_argument("--expect-fastdb-version", required=True)
+    inspect_java_parser.add_argument("--source-sha", required=True)
+    inspect_java_parser.add_argument("--output", required=True)
+    inspect_java_parser.set_defaults(handler=command_inspect_java)
+
     manifest = commands.add_parser("manifest", help="Aggregate the promotion manifest")
     manifest.add_argument("--root", required=True)
     manifest.add_argument("--output", required=True)
@@ -862,6 +1030,9 @@ def main(argv: list[str] | None = None) -> int:
                           help="key=value provenance such as c_two_version=0.6.0")
     manifest.add_argument("--expect-cli", type=int, default=None)
     manifest.add_argument("--expect-wheels", type=int, default=None)
+    manifest.add_argument("--expect-java", type=int, default=None)
+    manifest.add_argument("--java-prefix", default=None)
+    manifest.add_argument("--expect-java-version", default=None)
     manifest.add_argument("--expect-sdist", type=int, default=None)
     manifest.add_argument("--expect-fastdb-proof", type=int, default=None)
     manifest.add_argument("--expect-installers", type=int, default=None)

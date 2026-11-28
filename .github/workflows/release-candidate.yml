@@ -2,7 +2,7 @@ name: Release Candidate
 
 # BUILD-AND-VALIDATE ONLY release-candidate pipeline (step 1 of the release
 # plan). It never publishes: no secrets, no registry upload, read-only
-# contents permission. It retains the exact CLI binaries, wheels, and sdist
+# contents permission. It retains the exact CLI binaries, wheels, sdist and Java packages
 # with SHA-256 sidecars plus source-bound receipts (rc-manifest.json) so a
 # later exact-run promotion can reuse the tested bytes without rebuilding.
 #
@@ -53,6 +53,7 @@ jobs:
       source_sha: ${{ steps.versions.outputs.source_sha }}
       c_two_version: ${{ steps.versions.outputs.c_two_version }}
       c3_version: ${{ steps.versions.outputs.c3_version }}
+      java_version: ${{ steps.versions.outputs.java_version }}
       fastdb_version: ${{ steps.fastdb.outputs.version }}
       fastdb_source_rev: ${{ steps.fastdb.outputs.source_rev }}
       fastdb_sdist_sha256: ${{ steps.listing.outputs.sdist_sha256 }}
@@ -74,13 +75,15 @@ jobs:
           set -euxo pipefail
           python -m pip install --quiet packaging
           python - <<'PY'
-          import os, pathlib, re, tomllib
+          import os, pathlib, re, sys, tomllib
+          sys.path.insert(0, ".github/scripts")
+          import release_candidate
           project = tomllib.loads(pathlib.Path("sdk/python/pyproject.toml").read_text(encoding="utf-8"))
           extra = project["project"]["optional-dependencies"]["fastdb"]
-          assert extra == ["fastdb4py==0.3.0"], extra
-          version = "0.3.0"
-          core_version = "0.3.0"
-          source_rev = "ff097cca9c29cadc289e2a437f4720ecc56015c4"
+          assert extra == ["fastdb4py==0.4.0"], extra
+          version = "0.4.0"
+          core_version = "0.4.0"
+          source_rev = "af2790068d87d34f19061cb02f4d1c0e7ba224d0"
           codegen = pathlib.Path("core/foundation/c2-codegen/Cargo.toml").read_text(encoding="utf-8")
           pin = re.search(r'^fastdb\s*=\s*"=(?P<version>[0-9][0-9.]*)"$', codegen, re.MULTILINE)
           assert pin is not None, "c2-codegen no longer pins an exact fastdb version"
@@ -92,6 +95,8 @@ jobs:
               assert rev is not None, f"{path} no longer patches fastdb-sys to a pinned rev"
               revs.append(rev.group(1))
           assert revs == [source_rev, source_rev], revs
+          release_candidate.verify_fastdb_java(
+              release_candidate.read_pom(pathlib.Path("sdk/java/pom.xml")), version)
           with open(os.environ["GITHUB_OUTPUT"], "a") as output:
               output.write(f"version={version}\n")
               output.write(f"source_rev={source_rev}\n")
@@ -157,7 +162,7 @@ jobs:
           import json, os, pathlib, sys
           sys.path.insert(0, ".github/scripts")
           import release_candidate
-          c_two_version, cli_version = release_candidate.read_repo_versions(pathlib.Path("."))
+          c_two_version, cli_version, java_version = release_candidate.read_repo_versions(pathlib.Path("."))
           source_sha = os.environ["GITHUB_SHA"]
           context = {
               "schema": "c-two.release-candidate.context.v2",
@@ -166,6 +171,7 @@ jobs:
               "ref": os.environ.get("GITHUB_REF", ""),
               "c_two_version": c_two_version,
               "c3_version": cli_version,
+              "java_version": java_version,
               "fastdb_version": os.environ["FASTDB_VERSION"],
               "fastdb_source_rev": os.environ["FASTDB_SOURCE_REV"],
           }
@@ -174,7 +180,8 @@ jobs:
           with open(os.environ["GITHUB_OUTPUT"], "a") as output:
               output.write(f"source_sha={source_sha}\n")
               output.write(f"c_two_version={context['c_two_version']}\n")
-              output.write(f"c3_version={context['c3_version']}\n")
+              output.write(f"c3_version={cli_version}\n")
+              output.write(f"java_version={java_version}\n")
           print(f"source sha {source_sha}")
           PY
 
@@ -282,9 +289,136 @@ jobs:
       fastdb-mode: ${{ matrix.fastdb-mode }}
       manylinux-image: ${{ matrix.manylinux-image }}
 
+  java-native:
+    needs: context
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {runner: ubuntu-24.04, platform: linux-x86_64, library: libc2_java.so}
+          - {runner: macos-15, platform: macos-arm64, library: libc2_java.dylib}
+          - {runner: windows-2025, platform: windows-x86_64, library: c2_java.dll}
+    env:
+      CARGO_TARGET_DIR: ${{ github.workspace }}/core/target
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.context.outputs.source_sha }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: ilammy/msvc-dev-cmd@v1
+        if: runner.os == 'Windows'
+        with:
+          arch: x64
+      - run: cargo build --manifest-path sdk/java/native/Cargo.toml --locked --release
+      - uses: actions/upload-artifact@v4
+        with:
+          name: java-native-${{ matrix.platform }}
+          path: core/target/release/${{ matrix.library }}
+          if-no-files-found: error
+
+  java-package:
+    needs: [context, java-native]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      JAVA_VERSION: ${{ needs.context.outputs.java_version }}
+      FASTDB_VERSION: ${{ needs.context.outputs.fastdb_version }}
+      SOURCE_SHA: ${{ needs.context.outputs.source_sha }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.context.outputs.source_sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: maven
+          cache-dependency-path: sdk/java/pom.xml
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: java-native-*
+          path: java-native
+      - name: Package the SDK and inspect its Maven files
+        run: |
+          set -euo pipefail
+          cmp -s LICENSE sdk/java/src/main/resources/META-INF/LICENSE
+          root="sdk/java/target/native-resources/META-INF/native"
+          install -D java-native/java-native-linux-x86_64/libc2_java.so "$root/linux-x86_64/libc2_java.so"
+          install -D java-native/java-native-macos-arm64/libc2_java.dylib "$root/macos-arm64/libc2_java.dylib"
+          install -D java-native/java-native-windows-x86_64/c2_java.dll "$root/windows-x86_64/c2_java.dll"
+          mvn -f sdk/java/pom.xml -B package source:jar-no-fork javadoc:jar -DskipTests
+          base="c-two-sdk-$JAVA_VERSION"
+          mkdir java-package
+          cp "sdk/java/target/$base.jar" "sdk/java/target/$base-sources.jar" "sdk/java/target/$base-javadoc.jar" java-package/
+          cp sdk/java/pom.xml "java-package/$base.pom"
+          python .github/scripts/release_candidate.py inspect-java --root java-package \
+            --version "$JAVA_VERSION" --expect-fastdb-version "$FASTDB_VERSION" \
+            --source-sha "$SOURCE_SHA" --output java-package/java-inspect.json
+          python .github/scripts/release_candidate.py checksum java-package/*
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rc-java-package
+          path: java-package/
+          if-no-files-found: error
+
+  java-smoke:
+    needs: [context, java-package]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {runner: ubuntu-24.04, platform: linux-x86_64}
+          - {runner: macos-15, platform: macos-arm64}
+          - {runner: windows-2025, platform: windows-x86_64}
+    env:
+      JAVA_VERSION: ${{ needs.context.outputs.java_version }}
+      FASTDB_VERSION: ${{ needs.context.outputs.fastdb_version }}
+      SOURCE_SHA: ${{ needs.context.outputs.source_sha }}
+      PLATFORM: ${{ matrix.platform }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.context.outputs.source_sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: actions/download-artifact@v4
+        with:
+          name: rc-java-package
+          path: java-package
+      - name: Consume the candidate JAR using its classpath native libraries
+        shell: bash
+        run: |
+          receipt="java-smoke-$PLATFORM.json"
+          python .github/scripts/java_package_smoke.py --package-dir java-package \
+            --version "$JAVA_VERSION" --fastdb-version "$FASTDB_VERSION" \
+            --platform "$PLATFORM" --source-sha "$SOURCE_SHA" --output "$receipt"
+          python .github/scripts/release_candidate.py checksum "$receipt"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rc-java-smoke-${{ matrix.platform }}
+          path: |
+            java-smoke-${{ matrix.platform }}.json
+            java-smoke-${{ matrix.platform }}.json.sha256
+          if-no-files-found: error
+
   # ── Immutable source-bound manifest for exact-run promotion ────────────────
   manifest:
-    needs: [context, native, linux]
+    needs: [context, native, linux, java-smoke]
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -330,12 +464,16 @@ jobs:
             --ref "${{ github.ref }}" \
             --meta "c_two_version=${{ needs.context.outputs.c_two_version }}" \
             --meta "c3_version=${{ needs.context.outputs.c3_version }}" \
+            --meta "java_version=${{ needs.context.outputs.java_version }}" \
             --meta "fastdb_version=${{ needs.context.outputs.fastdb_version }}" \
             --meta "fastdb_source_rev=${{ needs.context.outputs.fastdb_source_rev }}" \
             --meta "fastdb_sdist_sha256=${{ needs.context.outputs.fastdb_sdist_sha256 }}" \
             --expect-cli 6 \
             --expect-wheels 35 \
             --expect-sdist 1 \
+            --expect-java 4 \
+            --java-prefix "c-two-sdk-${{ needs.context.outputs.java_version }}" \
+            --expect-java-version "${{ needs.context.outputs.java_version }}" \
             --expect-fastdb-proof 9 \
             --expect-installers 2 \
             --require-cli-name c3-x86_64-unknown-linux-gnu \
@@ -357,6 +495,8 @@ jobs:
             --require-source-sha-prefix abi- \
             --require-source-sha-prefix smoke- \
             --require-source-sha-prefix sdist- \
+            --require-source-sha-prefix java-inspect \
+            --require-source-sha-prefix java-smoke- \
             --expect-json-prefix rc-context \
             --expect-json-prefix rc-fastdb-public \
             --expect-json-prefix fastdb- \
@@ -364,12 +504,16 @@ jobs:
             --expect-json-prefix abi- \
             --expect-json-prefix standard-user- \
             --expect-json-prefix sdist- \
+            --expect-json-prefix java-inspect \
+            --expect-json-prefix java-smoke- \
             --expect-json-count rc-context=1 \
             --expect-json-count rc-fastdb-public=1 \
             --expect-json-count fastdb-=7 \
             --expect-json-count smoke-=6 \
             --expect-json-count abi-=35 \
             --expect-json-count standard-user-=4 \
+            --expect-json-count java-inspect=1 \
+            --expect-json-count java-smoke-=3 \
             --expect-json-count sdist-=2
 
       - uses: actions/upload-artifact@v4

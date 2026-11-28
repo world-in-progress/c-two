@@ -1,0 +1,185 @@
+{
+  "schema": "c-two.contract.v2",
+  "crm": {
+    "name": "Acceptance",
+    "namespace": "test.java",
+    "version": "0.1.0"
+  },
+  "fingerprints": {
+    "abi_hash": "601790b73f853c6585ae23020bd472464b42bfdef5fae3e8eb87d3d717984a23",
+    "signature_hash": "a81781c8c812718a481417c8527f2df2929ecfc31b697785bee37fdcab5e2917"
+  },
+  "methods": [
+    {
+      "name": "ping",
+      "access": "read",
+      "parameters": [],
+      "return": {
+        "kind": "none"
+      },
+      "bindings": {
+        "input": null,
+        "output": null
+      }
+    },
+    {
+      "name": "echo",
+      "access": "write",
+      "parameters": [
+        {
+          "name": "input",
+          "kind": "POSITIONAL_OR_KEYWORD",
+          "default": {
+            "kind": "missing"
+          },
+          "type": {
+            "kind": "payload"
+          }
+        }
+      ],
+      "return": {
+        "kind": "payload"
+      },
+      "bindings": {
+        "input": {
+          "kind": "fastdb",
+          "spec": {
+            "schema": "fastdb.payload.v1",
+            "profile": "record.v1",
+            "entries": [
+              {
+                "id": "value",
+                "cardinality": "one",
+                "type": {
+                  "kind": "bytes"
+                }
+              }
+            ],
+            "components": []
+          }
+        },
+        "output": {
+          "kind": "fastdb",
+          "spec": {
+            "schema": "fastdb.payload.v1",
+            "profile": "record.v1",
+            "entries": [
+              {
+                "id": "value",
+                "cardinality": "one",
+                "type": {
+                  "kind": "bytes"
+                }
+              }
+            ],
+            "components": []
+          }
+        }
+      }
+    },
+    {
+      "name": "scan",
+      "access": "read",
+      "mode": "server_stream",
+      "parameters": [
+        {
+          "name": "input",
+          "kind": "POSITIONAL_OR_KEYWORD",
+          "default": {
+            "kind": "missing"
+          },
+          "type": {
+            "kind": "payload"
+          }
+        }
+      ],
+      "return": {
+        "kind": "payload"
+      },
+      "bindings": {
+        "input": {
+          "kind": "fastdb",
+          "spec": {
+            "schema": "fastdb.payload.v1",
+            "profile": "record.v1",
+            "entries": [
+              {
+                "id": "value",
+                "cardinality": "one",
+                "type": {
+                  "kind": "bytes"
+                }
+              }
+            ],
+            "components": []
+          }
+        },
+        "output": {
+          "kind": "fastdb",
+          "spec": {
+            "schema": "fastdb.payload.v1",
+            "profile": "record.v1",
+            "entries": [
+              {
+                "id": "value",
+                "cardinality": "one",
+                "type": {
+                  "kind": "bytes"
+                }
+              }
+            ],
+            "components": []
+          }
+        }
+      }
+    }
+  ],
+  "topics": [
+    {
+      "name": "state",
+      "output": {
+        "kind": "payload"
+      },
+      "binding": {
+        "kind": "fastdb",
+        "spec": {
+          "schema": "fastdb.payload.v1",
+          "profile": "record.v1",
+          "entries": [
+            {
+              "id": "value",
+              "cardinality": "one",
+              "type": {
+                "kind": "bytes"
+              }
+            }
+          ],
+          "components": []
+        }
+      }
+    },
+    {
+      "name": "ticks",
+      "output": {
+        "kind": "payload"
+      },
+      "binding": {
+        "kind": "fastdb",
+        "spec": {
+          "schema": "fastdb.payload.v1",
+          "profile": "record.v1",
+          "entries": [
+            {
+              "id": "value",
+              "cardinality": "one",
+              "type": {
+                "kind": "bytes"
+              }
+            }
+          ],
+          "components": []
+        }
+      }
+    }
+  ]
+}

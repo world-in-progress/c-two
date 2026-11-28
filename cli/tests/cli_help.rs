@@ -70,3 +70,13 @@ fn bridge_help_lists_supported_options() {
         result = result.stdout(predicate::str::contains(flag));
     }
 }
+
+#[test]
+fn c3_contract_codegen_help_lists_java_target() {
+    Command::cargo_bin("c3")
+        .unwrap()
+        .args(["contract", "codegen", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("java"));
+}

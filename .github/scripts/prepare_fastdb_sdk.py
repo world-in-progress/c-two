@@ -24,11 +24,11 @@ import sys
 import tarfile
 import urllib.request
 
-RELEASE_VERSION = "0.3.0"
-EXPECTED_SOURCE_SHA = "ff097cca9c29cadc289e2a437f4720ecc56015c4"
+RELEASE_VERSION = "0.4.0"
+EXPECTED_SOURCE_SHA = "af2790068d87d34f19061cb02f4d1c0e7ba224d0"
 RELEASE_MANIFEST_NAME = "release-manifest.json"
 RELEASE_MANIFEST_SHA256 = (
-    "866a56302d2495db510f10760d4c256b50e5dd74be9deed12e563962bc78acc4"
+    "3cd45cff112e545006293986d9d52b51df6587c6b7fcdd74de8778d9a6444dc2"
 )
 RELEASE_REPOSITORY = "world-in-progress/fastdb"
 RELEASE_MANIFEST_SCHEMA = "fastdb.release-manifest.v1"

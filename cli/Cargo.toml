@@ -1,6 +1,6 @@
 [package]
 name = "c2-cli"
-version = "0.9.0-rc.1"
+version = "0.9.0-rc.2"
 edition = "2024"
 rust-version = "1.95"
 license = "MIT"
@@ -39,7 +39,7 @@ libc = "0.2"
 # Deployable c3 builds statically link the FastDB payload Core from the official
 # FastDB repository checkout instead of requiring a system-installed libfastdb.
 # The safe fastdb crate itself still comes from crates.io; this patch reroutes
-# only the raw fastdb-sys bindings to the immutable v0.3.0 source at this rev,
+# only the raw fastdb-sys bindings to the immutable v0.4.0 source at this rev,
 # whose checkout layout lets its build script drive source-mode CMake builds.
 [patch.crates-io]
-fastdb-sys = { git = "https://github.com/world-in-progress/fastdb", rev = "ff097cca9c29cadc289e2a437f4720ecc56015c4" }
+fastdb-sys = { git = "https://github.com/world-in-progress/fastdb", rev = "af2790068d87d34f19061cb02f4d1c0e7ba224d0" }

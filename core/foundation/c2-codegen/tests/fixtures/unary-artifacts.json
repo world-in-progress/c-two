@@ -2,9 +2,9 @@
   {
     "artifacts": [
       {
-        "bytes": 2298,
+        "bytes": 2305,
         "path": "metadata/composition-manifest.json",
-        "sha256": "7b3e7022042d318ce7cbf1c671794f262a6c1e113206d701805954008c27ce81"
+        "sha256": "e284c4455599e6a8b5c46c73ea3d660ad888012c0f31e66fa76295a3a7026a5a"
       },
       {
         "bytes": 247,
@@ -33,9 +33,9 @@
   {
     "artifacts": [
       {
-        "bytes": 2302,
+        "bytes": 2309,
         "path": "metadata/composition-manifest.json",
-        "sha256": "df4fcf328faff3b72f83af885924f2a3048778d28601a392413c9ca4056828db"
+        "sha256": "43d51d1dd6b2f8110d37f3255711a965d7f78214e6c70b34bea7be09cd114d22"
       },
       {
         "bytes": 247,
@@ -64,9 +64,9 @@
   {
     "artifacts": [
       {
-        "bytes": 2310,
+        "bytes": 2317,
         "path": "metadata/composition-manifest.json",
-        "sha256": "638d7f50d6203114eeaa6033acc06e721c4f069415c63d7da780d4adb589a5c8"
+        "sha256": "05f6c0a480346892fbac596050c3e6efd44062ad843013fcf24a67f501ac9c00"
       },
       {
         "bytes": 247,
@@ -173,9 +173,9 @@
   {
     "artifacts": [
       {
-        "bytes": 4928,
+        "bytes": 4935,
         "path": "metadata/composition-manifest.json",
-        "sha256": "23e10b37be66d8b7616e518e9c7f84e77785a00f6ead5065064486a4a1bc364f"
+        "sha256": "707522250af22350fb019a90eb0e352ee3f8c406f470094592e8631d97fcb874"
       },
       {
         "bytes": 262,
@@ -204,9 +204,9 @@
   {
     "artifacts": [
       {
-        "bytes": 4932,
+        "bytes": 4939,
         "path": "metadata/composition-manifest.json",
-        "sha256": "026a83ec8dfb20931a2b6359c3ba710c2a1696d247ceb5beef757a22e481783f"
+        "sha256": "606b8866cc41bb03134bc831399b99ec87c73e745b793ad9e3b9440a4db702bc"
       },
       {
         "bytes": 262,
@@ -235,9 +235,9 @@
   {
     "artifacts": [
       {
-        "bytes": 4940,
+        "bytes": 4947,
         "path": "metadata/composition-manifest.json",
-        "sha256": "41e17adf20e6e397ec10b1b6511f75c30ff3a52de7ff2b4d36b3f704f9b216d3"
+        "sha256": "0afd238305490c9a5b5c5b8a4618c88656ac5a8dc6937e1a69b3e084c689f1be"
       },
       {
         "bytes": 262,
@@ -266,9 +266,9 @@
   {
     "artifacts": [
       {
-        "bytes": 6368,
+        "bytes": 6375,
         "path": "metadata/composition-manifest.json",
-        "sha256": "de378698350ed5bf133aaf5b7a97031e92d878c219f012e8cd29c61e6dab1e2b"
+        "sha256": "722e5a165ba660005c19940eefe401f57df0e6d388c262b67d782b7f90d22c80"
       },
       {
         "bytes": 273,
@@ -297,9 +297,9 @@
   {
     "artifacts": [
       {
-        "bytes": 6372,
+        "bytes": 6379,
         "path": "metadata/composition-manifest.json",
-        "sha256": "04a0986d7b532120a26bd7410c2ada5aff40e5789529ebae11363496a322a120"
+        "sha256": "2835df49d698916374855bc39b0252114cdb2878f410666a438b3a691de1f195"
       },
       {
         "bytes": 273,
@@ -328,9 +328,9 @@
   {
     "artifacts": [
       {
-        "bytes": 6380,
+        "bytes": 6387,
         "path": "metadata/composition-manifest.json",
-        "sha256": "affec7aea6e2ede8e89f90a2af33aabc8104185e57f1fbdda54729434f75ff97"
+        "sha256": "e60be86f858d6cacf0889915405a6d6d331e678c3cab9888f68283764d0e962c"
       },
       {
         "bytes": 273,

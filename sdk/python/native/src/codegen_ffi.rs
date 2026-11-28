@@ -47,10 +47,11 @@ fn parse_target(py: Python<'_>, target: &str) -> PyResult<ContractCodegenTarget>
         "rust" => Ok(ContractCodegenTarget::Rust),
         "python" => Ok(ContractCodegenTarget::Python),
         "typescript" => Ok(ContractCodegenTarget::TypeScript),
+        "java" => Ok(ContractCodegenTarget::Java),
         _ => Err(public_error(
             py,
             format!(
-                "unsupported contract codegen target {target:?}; expected rust, python, or typescript"
+                "unsupported contract codegen target {target:?}; expected rust, python, typescript, or java"
             ),
             ErrorFields::None,
         )),

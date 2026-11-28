@@ -24,7 +24,7 @@ C-Two 是为有状态资源设计的 RPC 框架，主要用于分布式科学计
 
 **CRM 契约**声明可调用的方法以及 namespace、version；**resource** 是实现这些方法并持有状态的普通类；**client** 通过 `cc.connect(...)` 获得类型化代理。一个进程可以同时承载多个资源，并连接其他资源。名字取自 *CRM to Call*（Core Resource Model to Call），意思是有状态的资源通过它的 CRM 被其他进程和机器调用。
 
-**C-Two 0.12.0** 支持 Python 3.10+。普通调用无 Python 运行时依赖；FastDB 载荷使用 `c-two[fastdb]`（`fastdb4py==0.3.0`）。本版本升级到 IPC **17**、SHM **4**、C/FFI ABI **9** 与 relay mesh **7**，引入资源归属的发布/订阅主题（同机封存 SHM 扇出与单跳/两级 `c3 relay` HTTP 扇出）以及统一的 `WritableSlab` + FastDB `0.3.0` 零拷贝载荷通道（单向 SHM 拷贝下界降至 2 次）。见 [0.12.0 更新与迁移说明](docs/releases/0.12.0.md)。
+当前源码支持 Python 3.10+，`c-two[fastdb]` 扩展固定使用 `fastdb4py==0.4.0`。普通 Python 调用无需运行时依赖。[Java 17 SDK](sdk/java/README.md) 使用 FastDB Java 0.4.0，可用 `c3 contract codegen java` 从可移植契约生成 Java 客户端与资源适配器。已发布的 Python 版本见 [0.12.0 更新与迁移说明](docs/releases/0.12.0.md)。
 
 ## 有状态 RPC 有什么不同
 
@@ -43,9 +43,9 @@ C-Two 是为有状态资源设计的 RPC 框架，主要用于分布式科学计
 - **本地与远程调用**：同进程直接传递 Python 对象，同机 IPC 使用 Unix domain socket 或 Windows Named Pipe，跨机器经 HTTP relay。Relay 会拒绝已由 mesh 持有的同名重复注册；若分区恢复或并发注册留下多个活跃持有者，新的获取在派发前报 `RouteConflict`（719）。Relay 发现把路由名解析到经过验证的本机 IPC 路径或 HTTP 目标，显式 IPC 连接独立于 relay 发现。
 - **状态与并发**：资源在调用之间保留状态。`@cc.read`、`@cc.write` 声明访问语义，默认采用写访问；原生路由调度统一约束本地和远程调用的并发与排队数量。
 - **载荷与内存**：`@cc.transfer(...)` 绑定 FastDB `Payload` 规格，Python 之间也可以直接传递普通 Python 值。IPC 通过按需 buddy 池、独占共享内存、检查过的分片传输和文件溢出传输大载荷，并受内存预算约束。经远程传输时，`cc.hold()` 保留响应的本地副本，注册时可以为方法选择借用输入；两者都只保留本地副本，释放时先让载荷所有者和 checked view 失效。详见[内存策略](docs/reference/memory-policy.md)与 [Python 载荷用法](docs/reference/python-usage.zh-CN.md)。
-- **服务端流**：标了 `@cc.stream` 的方法对一份输入返回零条或多条条目。Python 与 Rust 资源一步一步产出条目，只在一步之内持有路由许可；客户端可以迭代、hold 或关闭这条流。流可以在同一进程内、经 IPC 以及（对 Rust 与 Python 客户端）经 relay HTTP 转发使用；生成的 TypeScript 客户端支持直接 IPC 与 relay 发现后选中的本机 IPC，选到 relay HTTP 时在派发前以 `UnsupportedCallMode` 拒绝。详见 [Python 服务端流](docs/reference/python-usage.zh-CN.md#服务端流)。
+- **服务端流**：标了 `@cc.stream` 的方法对一份输入返回零条或多条条目。Python、Rust 与 Java 资源一步一步产出条目，只在一步之内持有路由许可；客户端可以迭代、hold 或关闭这条流。流可以在同一进程内、经 IPC 以及（对 Rust、Python 与 Java 客户端）经 relay HTTP 转发使用；生成的 TypeScript 客户端支持直接 IPC 与 relay 发现后选中的本机 IPC，选到 relay HTTP 时在派发前以 `UnsupportedCallMode` 拒绝。详见 [Python 服务端流](docs/reference/python-usage.zh-CN.md#服务端流)。
 - **发布/订阅主题**：标了 `@cc.topic` 的成员把有状态资源的不可变帧发布给任意数量的本地与远端订阅者。注册返回 `Registration`，其发布句柄绝不阻塞在慢订阅者上；同机订阅者共享一块封存共享内存帧，relay 在 HTTP 上扇出单份预算副本。每条交付携带序号与跳过的帧数；落后且采用严格策略的订阅以 `SubscriptionLagged`（720）结束。详见 [Python 主题](docs/reference/python-usage.zh-CN.md#发布订阅主题)与 [pubsub 示例](examples/python/pubsub.py)。
-- **跨语言契约**：契约工具验证可移植描述符，并生成 Python、Rust、TypeScript 绑定；客户端会匹配路由名称、CRM 身份和契约哈希。Python 与 Rust 共用同一个 Rust core 的路由、传输、内存、错误和生命周期机制。
+- **跨语言契约**：契约工具验证可移植描述符，并生成 Python、Rust、Java、TypeScript 绑定；客户端会匹配路由名称、CRM 身份和契约哈希。Python、Rust 与 Java 共用同一个 Rust core 的路由、传输、内存、错误和生命周期机制。
 - **relay、工具与生命周期**：原生 c3 CLI 在 Linux、macOS、Windows x64 / ARM64 上提供 relay 与 relay mesh、契约工具和端点维护。`cc.observe.connection_events()` 把客户端和服务端的物理 IPC 连接汇总给一个可关闭的消费者，原因只描述连接事实，不能证明进程已经退出。原生 shutdown 与路由注销让已发出的一元调用跑完；开着的服务端流在两步之间结束，先交付已产出的条目，再以 `CallCancelled` 结束。限定范围的端点维护会清理已确认退出的端点，详见[生命周期指南](docs/reference/local-endpoint-lifecycle.md)。
 
 ## 安装

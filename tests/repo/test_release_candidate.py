@@ -891,7 +891,7 @@ def test_target_workflows_keep_the_complete_abi_inventory_and_local_dependencies
     expected = {(target, version) for target in targets for version in versions
                 if (target, version) != ("aarch64-pc-windows-msvc", "3.10")}
     assert len(rows) == 35 and set(rows) == expected
-    assert set(root["jobs"]["manifest"]["needs"]) == {"context", "native", "linux"}
+    assert set(root["jobs"]["manifest"]["needs"]) == {"context", "native", "linux", "java-smoke"}
 
 
 def test_provisioning_receipt_cannot_change_its_sdist_derivation(rc, tmp_path, capsys):
@@ -995,7 +995,7 @@ def test_c3_version_sort_key_orders_prereleases_before_stable(rc):
     assert sorted(reversed(ordered), key=rc.c3_version_sort_key) == ordered
 
 
-def test_read_repo_versions_uses_toml_tables_and_ignores_dependency_versions(rc, tmp_path):
+def test_read_repo_versions_uses_project_versions_in_all_three_manifests(rc, tmp_path):
     (tmp_path / "sdk" / "python").mkdir(parents=True)
     (tmp_path / "cli").mkdir(parents=True)
     (tmp_path / "sdk" / "python" / "pyproject.toml").write_text(
@@ -1007,7 +1007,14 @@ def test_read_repo_versions_uses_toml_tables_and_ignores_dependency_versions(rc,
         '[package]\nname = "c3"\nversion = "0.9.0-rc.1"\n',
         encoding="utf-8",
     )
-    assert rc.read_repo_versions(tmp_path) == ("0.13.0rc1", "0.9.0-rc.1")
+    java = tmp_path / "sdk/java"
+    java.mkdir()
+    (java / "pom.xml").write_text(
+        '<project xmlns="http://maven.apache.org/POM/4.0.0">'
+        '<parent><version>9.9.9</version></parent><version>0.13.0-rc.1</version></project>',
+        encoding="utf-8",
+    )
+    assert rc.read_repo_versions(tmp_path) == ("0.13.0rc1", "0.9.0-rc.1", "0.13.0-rc.1")
 
 
 def test_manifest_accepts_prerelease_versions_and_rejects_invalid_meta_versions(rc, tmp_path, capsys):

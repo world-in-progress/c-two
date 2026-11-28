@@ -1,0 +1,23 @@
+[package]
+name = "c2-java-native"
+version = "0.13.0-rc.2"
+edition = "2024"
+rust-version = "1.95"
+license = "MIT"
+repository = "https://github.com/World-in-Progress/c-two"
+description = "JNI projection of the C-Two runtime"
+
+[lib]
+name = "c2_java"
+crate-type = ["cdylib", "lib"]
+
+[dependencies]
+c2-core = { path = "../../../core/runtime/c2-core" }
+c2-config = { path = "../../../core/foundation/c2-config" }
+c2-contract = { path = "../../../core/foundation/c2-contract" }
+c2-error = { path = "../../../core/foundation/c2-error" }
+c2-mem = { path = "../../../core/foundation/c2-mem" }
+c2-wire = { path = "../../../core/protocol/c2-wire" }
+jni = "0.21"
+parking_lot = "0.13"
+serde_json = "1"

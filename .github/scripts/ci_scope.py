@@ -18,6 +18,8 @@ def needs_source(paths: list[str], *, truncated: bool = False) -> bool:
     for path in paths:
         if not path or PurePosixPath(path).is_absolute() or ".." in PurePosixPath(path).parts:
             return True
+        if path == "tools/ci/test_java.py":
+            return True
         if path.startswith((".github/", "tests/repo/", "tools/ci/", "tools/local_rc/", "docs/")):
             continue
         if path in {"README.md", "README.zh-CN.md", "AGENTS.md", "CHANGELOG.md", "LICENSE"}:

@@ -9,7 +9,7 @@ from . import _native
 from ._native import CodegenError
 from .crm.descriptor import export_descriptor, release_ref, diagnostics
 
-CodegenTarget = Literal["rust", "python", "typescript"]
+CodegenTarget = Literal["rust", "python", "typescript", "java"]
 
 
 @dataclass(frozen=True, slots=True)

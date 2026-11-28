@@ -20,6 +20,7 @@ pub enum ContractCodegenTarget {
     Rust,
     Python,
     TypeScript,
+    Java,
 }
 
 impl ContractCodegenTarget {
@@ -28,6 +29,7 @@ impl ContractCodegenTarget {
             Self::Rust => "rust",
             Self::Python => "python",
             Self::TypeScript => "typescript",
+            Self::Java => "java",
         }
     }
 
@@ -36,6 +38,7 @@ impl ContractCodegenTarget {
             Self::Rust => FastDbCodegenTarget::Rust,
             Self::Python => FastDbCodegenTarget::Python,
             Self::TypeScript => FastDbCodegenTarget::TypeScript,
+            Self::Java => FastDbCodegenTarget::Java,
         }
     }
 }
@@ -274,12 +277,16 @@ fn compile_binding(
         let kind = match artifact.kind {
             FastDbArtifactKind::Source => ArtifactKind::Source,
         };
-        let final_path = format!(
-            "{}/payloads/{}/{}",
-            target.as_str(),
-            digest_hex,
-            artifact.relative_path
-        );
+        let final_path = if target == ContractCodegenTarget::Java {
+            format!("java/src/main/java/{}", artifact.relative_path)
+        } else {
+            format!(
+                "{}/payloads/{}/{}",
+                target.as_str(),
+                digest_hex,
+                artifact.relative_path
+            )
+        };
         let provenance = ArtifactProvenance::new(
             "fastdb-core",
             format!("{}#{digest_hex}", nested.outer_path()),

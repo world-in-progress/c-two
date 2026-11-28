@@ -290,12 +290,12 @@ class MatrixArtifacts:
         if candidate_cargo_home:
             dependencies = """\
 c-two = "=0.1.0"
-fastdb = "=0.3.0"
+fastdb = "=0.4.0"
 """
         else:
             dependencies = f"""\
 c-two = {{ version = "0.1.0", path = {_path_dependency(REPOSITORY / "sdk/rust")} }}
-fastdb = "=0.3.0"
+fastdb = "=0.4.0"
 """
         manifest = f"""\
 [package]

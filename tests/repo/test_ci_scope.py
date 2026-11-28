@@ -19,6 +19,7 @@ SCRIPT = ROOT / ".github/scripts/ci_scope.py"
     (["README.md", "docs/releases/0.7.6.md"], False),
     ([".github/scripts/promote_release_candidate.py", "tests/repo/test_ci_scope.py"], False),
     (["tools/ci/source_validation.py"], False),
+    (["tools/ci/test_java.py"], True),
     (["README.md", "core/transport/c2-ipc/src/pool.rs"], True),
     (["core/moved.rs", "docs/moved.rs"], True),
     (["sdk/python/pyproject.toml"], True),
