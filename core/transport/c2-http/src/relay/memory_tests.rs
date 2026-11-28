@@ -715,10 +715,11 @@ async fn exercise_http_upload(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn actual_http_incomplete_upload_and_completed_call_refund_after_idle_close() {
-    let charge = DedicatedSegment::required_shm_size(PAYLOAD_LEN).unwrap() as u64
-        + 2 * PAYLOAD_LEN as u64
-        + c2_config::CHUNK_SIZE;
-    let state = state(charge, REPLY_LEN as u64);
+    let dedicated = DedicatedSegment::required_shm_size(PAYLOAD_LEN).unwrap() as u64;
+    let budget_limit = dedicated + 2 * PAYLOAD_LEN as u64 + c2_config::CHUNK_SIZE;
+    let fair_window = (budget_limit - PAYLOAD_LEN as u64) / 2;
+    let charge = dedicated + PAYLOAD_LEN as u64 + fair_window;
+    let state = state(budget_limit, REPLY_LEN as u64);
     let upstream = Upstream::start(&state, "http", 113, true).await;
     // Keep the original acquired client so an unnoticed eviction/replacement
     // cannot masquerade as survival of the HTTP upload's connection.

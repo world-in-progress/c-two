@@ -21,6 +21,7 @@ use crate::{
     OUTCOME_PATH,
     http_wire::{MAX_CONTROL_ERROR_BYTES, single_header},
     outcome_wire::{CALL_ID_HEADER, MAX_OUTCOME_JSON_BYTES, OutcomeJson},
+    send_budget::{SendBufferPlan, SendBuffers, reserve_send_buffers},
     stream_wire::{self, HttpStreamRecordKind, HttpStreamStatus},
 };
 
@@ -314,30 +315,25 @@ impl Upload {
                 body
             };
             let limit = budget.snapshot().memory.limit_bytes;
-            let upload = length.min(COPY_CAP).min((limit / 2).max(1));
-            let download = COPY_CAP.min(limit.saturating_sub(upload));
-            if download == 0 {
-                return Err(forwarding_capacity_response(
-                    &call.route.name,
-                    "no peer forwarding window",
-                ));
-            }
-            let mut reservation =
-                budget
-                    .reserve_memory(upload + download)
-                    .await
-                    .map_err(|error| {
-                        forwarding_capacity_response(&call.route.name, error.to_string())
-                    })?;
-            let upload = reservation
-                .split_off(upload)
-                .expect("atomic peer forwarding reservation");
+            let plan = SendBufferPlan::streaming(limit, length.min(COPY_CAP), COPY_CAP)
+                .map_err(|error| forwarding_capacity_response(&call.route.name, error.to_string()))?;
+            let SendBuffers {
+                input,
+                upload,
+                download,
+            } = reserve_send_buffers(budget, plan, None)
+                .await
+                .map_err(|error| {
+                    forwarding_capacity_response(&call.route.name, error.to_string())
+                })?;
+            drop(input);
             let body = if length == 0 {
+                drop(upload);
                 body
             } else {
                 windowed_body(body, Some(length), upload.into_reusable_window(), None)
             };
-            (length, body, reservation)
+            (length, body, download)
         } else {
             let Some(prepared) = read_unknown_length_body(
                 &call.route.name,

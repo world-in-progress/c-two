@@ -166,7 +166,12 @@ pub(super) async fn handle_peer_join(
     {
         return StatusCode::FORBIDDEN.into_response();
     }
-    if !state.with_route_table_mut(|rt| rt.record_peer_join(relay_id, address)) {
+    if !state.with_route_table_mut(|rt| rt.record_peer_join(relay_id.clone(), address.clone())) {
+        tracing::warn!(
+            relay_id = %relay_id,
+            target = %address.display_target(),
+            "rejected peer join: relay_id is already bound to a different endpoint identity (run `c3 registry force-leave` to retire the old peer)"
+        );
         return StatusCode::FORBIDDEN.into_response();
     }
     Json(current_full_sync_envelope(&state)).into_response()

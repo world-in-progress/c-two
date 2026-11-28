@@ -317,8 +317,16 @@ async fn tiny_memory_budget_recycles_download_window_while_a_second_call_waits()
             RESPONSE_BYTES.to_string()
         );
         let snapshot = state.domain_snapshot();
-        assert_eq!(snapshot.memory.used_bytes, memory);
+        let first_window = snapshot.memory.used_bytes;
+        assert!(first_window > 0 && first_window < memory);
         assert!(snapshot.file_spill.used_bytes >= RESPONSE_BYTES as u64);
+        // Occupy the remaining fair-share slack so the second call genuinely
+        // waits on shared memory while the first call recycles its window.
+        let _slack = state
+            .forwarding
+            .budget()
+            .try_reserve_memory(memory - first_window)
+            .unwrap();
 
         let mut second =
             Box::pin(app.oneshot(call_request("/_c2/calls/call?route=output&method=produce")));
@@ -329,6 +337,7 @@ async fn tiny_memory_budget_recycles_download_window_while_a_second_call_waits()
         let second = second.await.unwrap();
         assert_eq!(second.status(), StatusCode::OK);
         collect_output(second.into_body().into_data_stream(), memory as usize).await;
+        drop(_slack);
         let snapshot = state.domain_snapshot();
         assert_eq!(snapshot.memory.peak_bytes, memory);
         assert_eq!(snapshot.memory.used_bytes, 0);

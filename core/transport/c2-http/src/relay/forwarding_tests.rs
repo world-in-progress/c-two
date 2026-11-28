@@ -88,14 +88,41 @@ fn concurrent_forwarding_budget(input_len: usize) -> u64 {
     2 * (input_len as u64 + input_len.min(copy_cap as usize) as u64 + copy_cap)
 }
 
-// The forwarding admission plan splits B into input + upload + download with
-// the upload copy capped at the input length and half the remainder; the
-// download window keeps whatever budget is left (SendBufferPlan).
+// The forwarding admission plan retains input and claims a fair-share window
+// for upload + download (full cap when 2x headroom exists, else half of the
+// remaining available budget).
+fn fair_share_window(budget: u64, input: u64) -> (u64, u64) {
+    let copy_cap = c2_config::REMOTE_PAYLOAD_CHUNK_SIZE.min(c2_config::CHUNK_SIZE);
+    let upload_cap = input.min(copy_cap);
+    let upload_min = u64::from(upload_cap != 0);
+    let avail = budget - input;
+    let max_window = upload_cap.saturating_add(copy_cap).min(avail);
+    let window = if avail >= max_window.saturating_mul(2) {
+        max_window
+    } else {
+        (avail / 2).clamp(upload_min + 1, max_window)
+    };
+    let upload = if upload_min == 0 {
+        0
+    } else {
+        upload_cap
+            .min(
+                (window / 2)
+                    .max(upload_min)
+                    .max(window.saturating_sub(copy_cap)),
+            )
+            .min(window - 1)
+    };
+    (upload, window - upload)
+}
+
+fn initial_forwarding_charge(budget: u64, input: u64) -> u64 {
+    let (upload, download) = fair_share_window(budget, input);
+    input + upload + download
+}
+
 fn download_window(carrier: Carrier, input_len: usize) -> u64 {
-    let budget = forwarding_budget(carrier, input_len);
-    let input = input_len as u64;
-    let upload = input.min((budget - input) / 2).max(u64::from(input != 0));
-    budget - input - upload
+    fair_share_window(forwarding_budget(carrier, input_len), input_len as u64).1
 }
 
 // A domain sized so the derived response pool keeps its buddy tiers (pooled
@@ -2065,9 +2092,11 @@ async fn h1_partial_upload_source_fault_refunds_without_dispatch_or_withdrawal()
             } else {
                 bounded(upload.write_all(&[7; 8])).await.unwrap();
             }
-            // Both framings admit the input plus both direction windows
-            // atomically; with this fixture's budget that is the whole B.
-            let expected_charge = forwarding_budget(Carrier::Inline, INPUT_LEN);
+            // Both framings admit the input plus both fair-share direction
+            // windows atomically.
+            let first_input = if unknown { 8 } else { INPUT_LEN as u64 };
+            let expected_charge =
+                initial_forwarding_charge(forwarding_budget(Carrier::Inline, INPUT_LEN), first_input);
             eventually(|| {
                 fixture
                     .state
@@ -2300,7 +2329,7 @@ enum WriterPausePoint {
 // cannot be mistaken for a cancelled waiter in either regression.
 async fn disconnect_during_ipc_write_preserves_same_client(pause_point: WriterPausePoint) {
     const LEN: usize = 32;
-    let mut fixture = Fixture::start_with_input_len(Carrier::Inline, 1, 3 * LEN as u64, LEN).await;
+    let mut fixture = Fixture::start_with_input_len(Carrier::Inline, 1, 5 * LEN as u64, LEN).await;
     let client = fixture.client.clone();
     let binding = fixture.binding.clone();
     let mut other = tokio::spawn(async move {
@@ -2344,8 +2373,9 @@ async fn disconnect_during_ipc_write_preserves_same_client(pause_point: WriterPa
         let held = fixture.state.forwarding.snapshot();
         assert_eq!(held.used_operations, 1);
         let held_payload = fixture.state.forwarding.budget().clone().snapshot().memory;
-        assert_eq!(held_payload.used_bytes, 2 * LEN as u64, "upload and download windows stay charged while the native writer is parked");
-        assert_eq!(held_payload.peak_bytes, 3 * LEN as u64, "input and both direction windows are atomically charged under B");
+        let (expected_upload, expected_download) = fair_share_window(5 * LEN as u64, LEN as u64);
+        assert_eq!(held_payload.used_bytes, expected_upload + expected_download, "upload and download windows stay charged while the native writer is parked");
+        assert_eq!(held_payload.peak_bytes, LEN as u64 + expected_upload + expected_download, "input and both direction windows are atomically charged under B");
         assert_eq!(fixture.client.pending_len_for_test(), 2);
         assert!(fixture.client.is_connected(), "waiter departure must preserve the started IPC write");
         let rejected = fixture.request_capacity_rejection(LEN).await;
@@ -2357,10 +2387,10 @@ async fn disconnect_during_ipc_write_preserves_same_client(pause_point: WriterPa
         other_joined = true;
         assert_eq!(other_result.unwrap().unwrap().into_owned_bytes().unwrap(), vec![0; 32], "already-dispatched RID must finish before the target writer resumes");
         assert!(fixture.client.is_connected());
-        assert_eq!((fixture.state.forwarding.snapshot().used_operations, fixture.state.forwarding.budget().clone().snapshot().memory.used_bytes), (1, 2 * LEN as u64));
+        assert_eq!((fixture.state.forwarding.snapshot().used_operations, fixture.state.forwarding.budget().clone().snapshot().memory.used_bytes), (1, expected_upload + expected_download));
         write_release.take().unwrap().send(()).unwrap();
         bounded(fixture.probe.entered[1].notified()).await;
-        eventually(|| fixture.state.forwarding.budget().clone().snapshot().memory.used_bytes == LEN as u64).await;
+        eventually(|| fixture.state.forwarding.budget().clone().snapshot().memory.used_bytes == expected_download).await;
         assert_eq!(fixture.state.forwarding.snapshot().used_operations, 1, "reply is still blocked with only its download window charged");
         assert_eq!(fixture.probe.calls[1].load(Ordering::SeqCst), 1, "complete input reaches real upstream callback once after the writer resumes");
         fixture.release(1);
@@ -2411,7 +2441,7 @@ async fn unary_body_last_bytes_reference_refunds_download_window() {
     use tower::ServiceExt;
 
     const LEN: usize = 32;
-    let mut fixture = Fixture::start_with_input_len(Carrier::Inline, 1, 3 * LEN as u64, LEN).await;
+    let mut fixture = Fixture::start_with_input_len(Carrier::Inline, 1, 5 * LEN as u64, LEN).await;
     fixture.release(1);
     let budget = fixture.state.forwarding.budget().clone();
     let result = AssertUnwindSafe(async {
@@ -2625,7 +2655,7 @@ async fn h1_admitted_unknown_upload_can_finish_after_operation_admission_closes(
                 .snapshot()
                 .memory
                 .used_bytes
-                == forwarding_budget(Carrier::Inline, INPUT_LEN)
+                == initial_forwarding_charge(forwarding_budget(Carrier::Inline, INPUT_LEN), 8)
         })
         .await;
         assert_eq!(fixture.state.forwarding.snapshot().used_operations, 1);
@@ -2665,7 +2695,7 @@ async fn h1_admitted_unknown_upload_can_finish_after_operation_admission_closes(
                 .snapshot()
                 .memory
                 .used_bytes
-                == download_window(Carrier::Inline, INPUT_LEN)
+                == fair_share_window(forwarding_budget(Carrier::Inline, INPUT_LEN), 8).1
         })
         .await;
         fixture.release(1);
@@ -2679,15 +2709,17 @@ async fn h1_admitted_unknown_upload_can_finish_after_operation_admission_closes(
         eventually(|| fixture.state.forwarding.budget().clone().snapshot().memory.used_bytes == 0).await;
         let refunded = fixture.state.forwarding.snapshot();
         let refunded_payload = fixture.state.forwarding.budget().clone().snapshot().memory;
+        let expected_peak = initial_forwarding_charge(forwarding_budget(Carrier::Inline, INPUT_LEN), 8)
+            + 2 * (INPUT_LEN as u64 - 8);
         assert_eq!(
             (
                 refunded.used_operations,
                 refunded_payload.used_bytes,
                 refunded_payload.peak_bytes
             ),
-            // First-segment admission reserves input and both direction
-            // windows atomically, which under B is the whole budget.
-            (0, 0, forwarding_budget(Carrier::Inline, INPUT_LEN))
+            // First-segment admission takes input plus fair-share windows, then
+            // remaining input bytes and upload-window widening reserve from slack.
+            (0, 0, expected_peak)
         );
         assert_eq!(
             fixture.state.forwarding.source_faults(true),

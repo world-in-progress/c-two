@@ -448,7 +448,32 @@ impl DomainBudget {
     pub fn reserve_memory(&self, bytes: u64) -> ReserveFuture<'_> {
         ReserveFuture {
             budget: self,
-            bytes,
+            fixed_bytes: bytes,
+            min_window: 0,
+            max_window: 0,
+            waiter: None,
+        }
+    }
+
+    /// Waits for `fixed_bytes + min_window` of capacity and atomically claims
+    /// `fixed_bytes` plus a fair share of the remaining available capacity
+    /// within `min_window..=max_window`.
+    ///
+    /// When the remaining available capacity is at least `2 * max_window`,
+    /// claims the full `max_window`; under contention it claims
+    /// `(remaining / 2).clamp(min_window, max_window)` so long-lived streams,
+    /// topic hubs and concurrent calls cannot starve one another.
+    pub fn reserve_memory_with_window(
+        &self,
+        fixed_bytes: u64,
+        min_window: u64,
+        max_window: u64,
+    ) -> ReserveFuture<'_> {
+        ReserveFuture {
+            budget: self,
+            fixed_bytes,
+            min_window,
+            max_window: max_window.max(min_window),
             waiter: None,
         }
     }
@@ -664,7 +689,9 @@ impl DomainObserverWeak {
 #[must_use = "poll or await the reservation before allocating storage"]
 pub struct ReserveFuture<'a> {
     budget: &'a DomainBudget,
-    bytes: u64,
+    fixed_bytes: u64,
+    min_window: u64,
+    max_window: u64,
     waiter: Option<u64>,
 }
 
@@ -675,14 +702,24 @@ impl Future for ReserveFuture<'_> {
         let this = self.get_mut();
         let waker = cx.waker().clone();
         let mut state = this.budget.shared.lock();
-        let (result, evicted) = match state.memory.check_memory_request(this.bytes.into()) {
+        let min_total = u128::from(this.fixed_bytes) + u128::from(this.min_window);
+        let (result, evicted) = match state.memory.check_memory_request(min_total) {
             Err(error) => (Err(error), Vec::new()),
-            Ok(()) if this.bytes <= state.memory.available() => {
-                state.memory.admit(this.bytes);
+            Ok(()) if min_total <= u128::from(state.memory.available()) => {
+                let avail_window = state.memory.available() - this.fixed_bytes;
+                let window = if this.min_window == this.max_window {
+                    this.min_window
+                } else if avail_window >= this.max_window.saturating_mul(2) {
+                    this.max_window
+                } else {
+                    (avail_window / 2).clamp(this.min_window, this.max_window)
+                };
+                let claim = this.fixed_bytes + window;
+                state.memory.admit(claim);
                 (
                     Ok(MemoryReservation {
                         shared: Arc::clone(&this.budget.shared),
-                        bytes: this.bytes,
+                        bytes: claim,
                     }),
                     state.evict_for_admission(),
                 )

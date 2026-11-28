@@ -1512,15 +1512,33 @@ async fn slow_reader_records_real_tcp_stall_and_producer_distance() {
     })).unwrap()).unwrap();
 }
 
-// The forwarding admission plan splits B into input + upload + download; the
-// download window takes the remainder up to the fixed copy cap and stays
-// charged while any of its response Bytes survive.
+// The forwarding admission plan retains input and takes a fair-share window
+// for upload + download (full copy cap when 2x headroom exists, else half of
+// the remaining available budget), keeping the download window charged while
+// any of its response Bytes survive.
 fn download_window(budget_bytes: u64, input_len: u64) -> u64 {
-    let upload = input_len
-        .min((budget_bytes - input_len) / 2)
-        .max(u64::from(input_len != 0));
-    (budget_bytes - input_len - upload)
-        .min(c2_config::REMOTE_PAYLOAD_CHUNK_SIZE.min(c2_config::CHUNK_SIZE))
+    let copy_cap = c2_config::REMOTE_PAYLOAD_CHUNK_SIZE.min(c2_config::CHUNK_SIZE);
+    let upload_cap = input_len.min(copy_cap);
+    let upload_min = u64::from(upload_cap != 0);
+    let avail = budget_bytes - input_len;
+    let max_window = upload_cap.saturating_add(copy_cap).min(avail);
+    let window = if avail >= max_window.saturating_mul(2) {
+        max_window
+    } else {
+        (avail / 2).clamp(upload_min + 1, max_window)
+    };
+    let upload = if upload_min == 0 {
+        0
+    } else {
+        upload_cap
+            .min(
+                (window / 2)
+                    .max(upload_min)
+                    .max(window.saturating_sub(copy_cap)),
+            )
+            .min(window - 1)
+    };
+    window - upload
 }
 
 async fn wait_for_admission(state: &RelayState) {
@@ -1969,9 +1987,12 @@ async fn cancelled_stream_terminal_is_delivered_while_another_http_response_fill
         32 * 1024
     );
     let budget = fixture.state.forwarding.budget().clone();
-    // Both download windows are fully charged; only the two calls' refunded
-    // input and upload copies (64 bytes) are missing from B.
-    assert_eq!(budget.snapshot().memory.used_bytes, 2 * 128 * 1024);
+    // Fill any fair-share slack so relay B is genuinely 100% full when the
+    // cancellation terminal is delivered.
+    let _full_b = budget
+        .try_reserve_memory(fixture.budget_bytes - budget.snapshot().memory.used_bytes)
+        .unwrap();
+    assert_eq!(budget.snapshot().memory.used_bytes, fixture.budget_bytes);
 
     let cancel = Request::builder()
         .method("DELETE")
@@ -1999,7 +2020,8 @@ async fn cancelled_stream_terminal_is_delivered_while_another_http_response_fill
     assert_eq!(terminal.status, HttpStreamStatus::Failed);
     assert_eq!(terminal.complete_items, Some(1));
     assert_eq!(terminal.error.unwrap().code, ErrorCode::CallCancelled);
-    assert_eq!(budget.snapshot().memory.used_bytes, 2 * 128 * 1024);
+    assert_eq!(budget.snapshot().memory.used_bytes, fixture.budget_bytes);
+    drop(_full_b);
     assert!(
         retained
             .iter()

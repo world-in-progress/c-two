@@ -622,3 +622,116 @@ async fn streams_and_topics_work_with_direct_iroh_paths() {
 async fn streams_and_topics_work_via_private_bridge_without_ip_transports() {
     run_mesh_streams(true).await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn tight_128k_anchor_serves_unary_alongside_open_topics_and_stream() {
+    let files = tempfile::tempdir().unwrap();
+    let bridge = within(
+        "private bridge startup",
+        BridgeServer::start(BridgeConfig {
+            bind: "127.0.0.1:0".into(),
+            quic_bind: Some("127.0.0.1:0".into()),
+            state_dir: Some(files.path().join("bridge")),
+            ..BridgeConfig::default()
+        }),
+    )
+    .await
+    .unwrap();
+    #[cfg(unix)]
+    let local_root = super::test_support::EndpointTestRoot::new();
+    #[cfg(unix)]
+    let context = local_root.context();
+    #[cfg(windows)]
+    let context = LocalEndpointContext::default_for_platform().unwrap();
+
+    let id = format!("mesh-tight-128k-{}", std::process::id());
+    let address = format!("ipc://{id}");
+    let host = Host::start(&context, &id, &address).await;
+    let base = RelayConfig {
+        bind: "127.0.0.1:0".into(),
+        bridge: Some(bridge.bridge_url_template()),
+        bridge_token: Some(bridge.token().to_owned()),
+        cluster_secret: Some("mesh-tight-128k".into()),
+        seed_retry_interval: Duration::from_millis(200),
+        heartbeat_interval: Duration::from_secs(1),
+        ..RelayConfig::default()
+    };
+    let start = |config: RelayConfig| {
+        tokio::task::block_in_place(|| RelayServer::start_resolved(config, context.clone()))
+            .unwrap()
+    };
+    let mut origin = start(RelayConfig {
+        state_dir: Some(files.path().join("origin")),
+        ..base.clone()
+    });
+    tokio::task::block_in_place(|| origin.register_upstream(ROUTE, &id, &address)).unwrap();
+    let origin_id = hex::encode(origin.iroh_endpoint_id().unwrap().as_bytes());
+    let mut anchor = start(RelayConfig {
+        state_dir: Some(files.path().join("anchor")),
+        seeds: vec![format!("iroh://{origin_id}")],
+        domain_limits: c2_config::DomainLimits {
+            memory_budget_bytes: 128 * 1024,
+            file_spill_budget_bytes: 0,
+            max_outstanding_calls: 16,
+        },
+        ..base
+    });
+
+    let client = AnchorClient {
+        http: reqwest::Client::builder().no_proxy().build().unwrap(),
+        url: format!("http://{}", anchor.local_addr()),
+        expected: host.expected.clone(),
+    };
+    client.wait_for_route().await;
+
+    let publisher = host.topics.publisher(TOPIC).unwrap();
+    let mut first = client.subscribe("first", 0).await;
+    assert_eq!(publisher.publish(b"initial-frame".to_vec()).unwrap(), 1);
+    expect_topic(&mut first, 1, b"initial-frame").await;
+    let mut second = client.subscribe("second", 1).await;
+    let (_, mut open_stream) = client.stream("open").await;
+    let _ = within("first open stream item", open_stream.recv())
+        .await
+        .unwrap();
+
+    // Anchor has memory_budget_bytes == COPY_CAP (128 KiB), an active TopicHub
+    // retaining a frame, and an open server stream; unary forwarding must still
+    // admit and complete immediately via fair-share windowing.
+    let reply = within(
+        "unary ping alongside open topics and stream",
+        client
+            .with_contract(client.http.post(format!(
+                "{}/_c2/calls/call?route={ROUTE}&method=ping",
+                client.url
+            )))
+            .body(b"hi".to_vec())
+            .send(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(reply.status(), 200);
+    assert_eq!(reply.bytes().await.unwrap().as_ref(), b"");
+
+    assert_eq!(publisher.publish(b"second-frame".to_vec()).unwrap(), 2);
+    expect_topic(&mut first, 2, b"second-frame").await;
+    expect_topic(&mut second, 2, b"second-frame").await;
+
+    open_stream.cancel();
+    let _ = within("open stream cancel", open_stream.completion_after_cancel())
+        .await
+        .unwrap();
+    first.cancel();
+    expect_topic_cancel(&mut first, "consumer_cancelled", 2).await;
+    second.cancel();
+    expect_topic_cancel(&mut second, "consumer_cancelled", 1).await;
+
+    tokio::task::block_in_place(|| {
+        assert!(anchor.shutdown_and_wait(WAIT).unwrap().completed);
+        assert!(origin.shutdown_and_wait(WAIT).unwrap().completed);
+    });
+    assert_eq!(anchor.domain_snapshot().memory.used_bytes, 0);
+    host.stop().await;
+    within("private bridge shutdown", bridge.stop())
+        .await
+        .unwrap();
+}
