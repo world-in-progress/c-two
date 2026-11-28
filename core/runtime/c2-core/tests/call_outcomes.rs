@@ -214,6 +214,16 @@ fn outcome_query_bypasses_all_three_busy_unary_slots() {
     let outcome = client.query_call("busy").unwrap();
     assert_eq!(outcome.status, CallOutcomeStatus::Succeeded);
     assert!(outcome.result_available);
+    let settle_deadline = Instant::now() + WAIT;
+    while host.call_execution_snapshot().server.used_operations != Some(0)
+        || relay.domain_snapshot().operations.used_operations != 0
+    {
+        assert!(
+            Instant::now() < settle_deadline,
+            "Host and relay N=1 slots did not settle before recovery"
+        );
+        std::thread::yield_now();
+    }
     assert_eq!(client.recover_unary_call("echo", "busy").unwrap(), payload);
     registration.close().unwrap();
     host.shutdown();
@@ -455,7 +465,23 @@ fn verify_ipc_outcomes(same_runtime: bool) {
     );
     let observation = client.connection_observation().unwrap();
     let counters = caller.path_counters();
-    let keyed_reply = |id, payload: &[u8]| client.call_unary_with_call_id("echo", payload, id);
+    // With `max_outstanding_calls(1)`, wait for the server's terminal write
+    // task to drop the previous operation permit before issuing the next
+    // sequential call so kernel UDS delivery cannot overtake permit release.
+    let wait_server_idle = || {
+        let deadline = Instant::now() + WAIT;
+        while host.call_execution_snapshot().server.used_operations != Some(0) {
+            assert!(
+                Instant::now() < deadline,
+                "server operation slot did not settle before next N=1 call"
+            );
+            std::thread::yield_now();
+        }
+    };
+    let keyed_reply = |id, payload: &[u8]| {
+        wait_server_idle();
+        client.call_unary_with_call_id("echo", payload, id)
+    };
     assert_eq!(keyed_reply("stable", b"one").unwrap(), b"one");
     assert_eq!(keyed_reply("stable", b"one").unwrap(), b"one");
     assert_eq!(invocations.load(Ordering::SeqCst), 1);
@@ -465,6 +491,7 @@ fn verify_ipc_outcomes(same_runtime: bool) {
         ErrorCode::CallIdConflict,
         pre_dispatch,
     );
+    wait_server_idle();
     assert_eq!(
         client
             .recover_unary_call_held("echo", "stable")
@@ -472,6 +499,7 @@ fn verify_ipc_outcomes(same_runtime: bool) {
             .bytes(),
         b"one"
     );
+    wait_server_idle();
     assert_semantic(
         client.recover_unary_call("echo", "absent").unwrap_err(),
         ErrorCode::CallOutcomeUnknown,
@@ -480,6 +508,7 @@ fn verify_ipc_outcomes(same_runtime: bool) {
     assert_eq!(invocations.load(Ordering::SeqCst), 1);
 
     // Build directly into the negotiated slab and publish that same owner as KeyedUnary.
+    wait_server_idle();
     let mut prepared = client.begin_keyed_call("echo", "large").unwrap();
     let mut slab = prepared
         .try_alloc_request_slab(80 * 1024)
@@ -488,6 +517,7 @@ fn verify_ipc_outcomes(same_runtime: bool) {
     slab.as_mut_slice().fill(83);
     let held = prepared.encode_slab(slab).unwrap().call_held().unwrap();
     assert_eq!(held.bytes(), vec![83; 80 * 1024]);
+    wait_server_idle();
     let error = client.recover_unary_call("echo", "large").unwrap_err();
     assert_eq!(
         assert_semantic(error, ErrorCode::CallResultUnavailable, None).details["outcome"],
@@ -508,6 +538,7 @@ fn verify_ipc_outcomes(same_runtime: bool) {
         observation.connection_id()
     );
 
+    wait_server_idle();
     let pending = std::thread::spawn({
         let client = client.clone();
         move || {
@@ -550,6 +581,7 @@ fn verify_ipc_outcomes(same_runtime: bool) {
         client.query_call("busy").unwrap().status,
         CallOutcomeStatus::Succeeded
     );
+    wait_server_idle();
     assert_eq!(client.recover_unary_call("echo", "busy").unwrap(), b"busy");
     assert!(observation.snapshot().is_none());
     assert_eq!(caller.path_counters(), counters);
