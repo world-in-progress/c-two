@@ -1,9 +1,9 @@
-use crate::valid_relay_url;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use c2_contract::{ExpectedRouteContract, MAX_WIRE_TEXT_BYTES};
 
+use crate::relay::peer::PeerSender;
 use crate::relay::types::*;
 
 /// Route table — owns all route entries and peer info.
@@ -77,14 +77,10 @@ impl RouteTable {
         }
     }
 
-    pub fn relay_id(&self) -> &str {
-        &self.relay_id
-    }
-
     fn valid_route_entry(&self, entry: &RouteEntry) -> bool {
         if !valid_route_name(&entry.name)
             || !valid_relay_id(&entry.relay_id)
-            || !valid_relay_url(&entry.relay_url)
+            || !entry.address.is_valid()
             || !valid_crm_tag(&entry.crm_ns, &entry.crm_name, &entry.crm_ver)
             || c2_contract::validate_contract_hash("abi_hash", &entry.abi_hash).is_err()
             || c2_contract::validate_contract_hash("signature_hash", &entry.signature_hash).is_err()
@@ -392,13 +388,14 @@ impl RouteTable {
         self.routes.values().any(|current| {
             current.name == entry.name
                 && current.relay_id == entry.relay_id
-                && current.relay_url == entry.relay_url
+                && current.address.same_identity(&entry.address)
                 && current.registered_at == entry.registered_at
                 && current.crm_ns == entry.crm_ns
                 && current.crm_name == entry.crm_name
                 && current.crm_ver == entry.crm_ver
                 && current.abi_hash == entry.abi_hash
                 && current.signature_hash == entry.signature_hash
+                && current.max_payload_size == entry.max_payload_size
                 && current.locality == Locality::Peer
                 && entry.locality == Locality::Peer
         })
@@ -411,7 +408,7 @@ impl RouteTable {
     pub(crate) fn registration_info(&self, entry: &RouteEntry) -> RouteRegistrationInfo {
         RouteRegistrationInfo {
             relay_id: entry.relay_id.clone(),
-            relay_url: entry.relay_url.clone(),
+            relay_url: entry.address.display_target(),
             registered_at: entry.registered_at,
             relay_status: if entry.locality == Locality::Local {
                 PeerStatus::Alive
@@ -616,21 +613,27 @@ impl RouteTable {
     #[cfg(test)]
     pub fn register_peer(&mut self, info: PeerInfo) {
         let relay_id = info.relay_id.clone();
-        let url = info.url.clone();
+        let address = info.address.clone();
         self.note_peer_liveness_change(&relay_id, info.status);
         self.peers.insert(relay_id.clone(), info);
-        self.sync_peer_route_urls(&relay_id, &url);
+        self.sync_peer_route_addresses(&relay_id, &address);
     }
 
-    pub fn record_peer_join(&mut self, relay_id: String, url: String) -> bool {
-        if !valid_relay_id(&relay_id) || relay_id == self.relay_id || !valid_relay_url(&url) {
+    pub fn record_peer_join(&mut self, relay_id: String, address: PeerAddress) -> bool {
+        if !valid_relay_id(&relay_id)
+            || relay_id == self.relay_id
+            || !address.is_valid()
+            || self
+                .get_peer(&relay_id)
+                .is_some_and(|peer| peer.address.endpoint_id_str() != address.endpoint_id_str())
+        {
             return false;
         }
         self.note_peer_liveness_change(&relay_id, PeerStatus::Alive);
         let now = Instant::now();
         match self.peers.get_mut(&relay_id) {
             Some(peer) => {
-                peer.url = url.clone();
+                peer.address = address.clone();
                 peer.last_heartbeat = now;
                 peer.status = PeerStatus::Alive;
             }
@@ -639,7 +642,7 @@ impl RouteTable {
                     relay_id.clone(),
                     PeerInfo {
                         relay_id: relay_id.clone(),
-                        url: url.clone(),
+                        address: address.clone(),
                         route_count: 0,
                         last_heartbeat: now,
                         status: PeerStatus::Alive,
@@ -647,7 +650,7 @@ impl RouteTable {
                 );
             }
         }
-        self.sync_peer_route_urls(&relay_id, &url);
+        self.sync_peer_route_addresses(&relay_id, &address);
         true
     }
 
@@ -685,6 +688,16 @@ impl RouteTable {
         self.peers.contains_key(relay_id)
     }
 
+    pub(super) fn matches_sender(&self, sender: PeerSender<'_>, require_alive: bool) -> bool {
+        sender.relay_id != self.relay_id
+            && self.get_peer(sender.relay_id).is_some_and(|peer| {
+                sender
+                    .endpoint_id
+                    .is_none_or(|id| peer.address.endpoint_id() == Some(id))
+                    && (!require_alive || peer.status == PeerStatus::Alive)
+            })
+    }
+
     pub fn peer_is_alive(&self, relay_id: &str) -> bool {
         self.peers
             .get(relay_id)
@@ -700,6 +713,13 @@ impl RouteTable {
     }
 
     pub(crate) fn record_peer_heartbeat(&mut self, relay_id: &str, route_count: u32) {
+        if self
+            .peers
+            .get(relay_id)
+            .is_none_or(|peer| peer.status == PeerStatus::Dead)
+        {
+            return;
+        }
         self.set_peer_status(relay_id, PeerStatus::Alive);
         if let Some(peer) = self.peers.get_mut(relay_id) {
             peer.last_heartbeat = Instant::now();
@@ -707,11 +727,20 @@ impl RouteTable {
         }
     }
 
-    pub(crate) fn record_peer_probe_success(&mut self, relay_id: &str) {
-        self.set_peer_status(relay_id, PeerStatus::Alive);
-        if let Some(peer) = self.peers.get_mut(relay_id) {
-            peer.last_heartbeat = Instant::now();
+    pub(crate) fn record_peer_probe_success(
+        &mut self,
+        relay_id: &str,
+        pinned_address: &PeerAddress,
+    ) -> bool {
+        let Some(peer) = self.get_peer(relay_id) else {
+            return false;
+        };
+        if !peer.address.same_identity(pinned_address) {
+            return false;
         }
+        self.set_peer_status(relay_id, PeerStatus::Alive);
+        self.peers.get_mut(relay_id).unwrap().last_heartbeat = Instant::now();
+        true
     }
 
     pub fn list_peers(&self) -> Vec<&PeerInfo> {
@@ -732,10 +761,10 @@ impl RouteTable {
             .collect()
     }
 
-    fn sync_peer_route_urls(&mut self, relay_id: &str, url: &str) {
+    fn sync_peer_route_addresses(&mut self, relay_id: &str, address: &PeerAddress) {
         for entry in self.routes.values_mut() {
             if entry.locality == Locality::Peer && entry.relay_id == relay_id {
-                entry.relay_url = url.to_string();
+                entry.address = address.clone();
             }
         }
     }
@@ -751,7 +780,7 @@ impl RouteTable {
                 .values()
                 .map(|p| PeerSnapshot {
                     relay_id: p.relay_id.clone(),
-                    url: p.url.clone(),
+                    address: p.address.clone(),
                     route_count: p.route_count,
                     status: p.status,
                 })
@@ -763,12 +792,20 @@ impl RouteTable {
     /// Static fields and peer-only ownership were admitted by ValidatedFullSync.
     /// Build the replacement set against current owner state before mutation;
     /// preserve LOCAL routes.
-    pub(crate) fn merge_validated_snapshot(&mut self, sync: ValidatedFullSync) {
+    pub(crate) fn merge_validated_snapshot(&mut self, sync: ValidatedFullSync) -> bool {
         let FullSync {
             routes,
             tombstones,
             peers,
         } = sync.into_inner();
+
+        if peers.iter().any(|snapshot| {
+            self.get_peer(&snapshot.relay_id).is_some_and(|peer| {
+                peer.address.endpoint_id_str() != snapshot.address.endpoint_id_str()
+            })
+        }) {
+            return false;
+        }
 
         let peer_snapshots: HashMap<_, _> = peers
             .iter()
@@ -782,9 +819,9 @@ impl RouteTable {
                 continue; // Don't overwrite our own LOCAL routes.
             }
             let Some(peer) = peer_snapshots.get(&entry.relay_id) else {
-                return;
+                return false;
             };
-            entry.relay_url = peer.url.clone();
+            entry.address = peer.address.clone();
             let key = (entry.name.clone(), entry.relay_id.clone());
             replacement_routes.insert(key, entry);
         }
@@ -837,25 +874,26 @@ impl RouteTable {
                 continue; // Don't add ourselves.
             }
             let relay_id = ps.relay_id.clone();
-            let url = ps.url.clone();
+            let address = ps.address.clone();
             if !self.has_peer(&relay_id) {
                 self.note_peer_liveness_change(&relay_id, ps.status);
             }
             self.peers
                 .entry(ps.relay_id.clone())
                 .and_modify(|existing| {
-                    existing.url = ps.url.clone();
+                    existing.address = address.clone();
                     existing.route_count = ps.route_count;
                 })
                 .or_insert_with(|| PeerInfo {
                     relay_id: ps.relay_id,
-                    url: ps.url,
+                    address: ps.address,
                     route_count: ps.route_count,
                     last_heartbeat: Instant::now(),
                     status: ps.status,
                 });
-            self.sync_peer_route_urls(&relay_id, &url);
+            self.sync_peer_route_addresses(&relay_id, &address);
         }
+        true
     }
 
     /// Route digest for anti-entropy: (name, relay_id) → hash of fields that
@@ -906,7 +944,7 @@ impl RouteTable {
             .map(|entry| crate::relay::peer::DigestDiffEntry::Active {
                 name: entry.name.clone(),
                 relay_id: entry.relay_id.clone(),
-                relay_url: entry.relay_url.clone(),
+                address: entry.address.clone(),
                 crm_ns: entry.crm_ns.clone(),
                 crm_name: entry.crm_name.clone(),
                 crm_ver: entry.crm_ver.clone(),
@@ -1012,6 +1050,7 @@ fn current_epoch_millis() -> u64 {
 mod tests {
     use super::*;
     use crate::relay::peer::PROTOCOL_VERSION;
+    use crate::valid_relay_url;
     use std::time::Instant;
 
     #[test]
@@ -1041,7 +1080,7 @@ mod tests {
         RouteEntry {
             name: name.into(),
             relay_id: relay_id.into(),
-            relay_url: format!("http://{relay_id}:8080"),
+            address: PeerAddress::http(format!("http://{relay_id}:8080")),
             server_id: Some(format!("server-{name}-{relay_id}")),
             server_instance_id: Some(format!("inst-{name}-{relay_id}")),
             ipc_address: Some(format!("ipc://{name}_{relay_id}")),
@@ -1062,7 +1101,7 @@ mod tests {
         RouteEntry {
             name: name.into(),
             relay_id: relay_id.into(),
-            relay_url: format!("http://{relay_id}:8080"),
+            address: PeerAddress::http(format!("http://{relay_id}:8080")),
             server_id: None,
             server_instance_id: None,
             ipc_address: None,
@@ -1143,6 +1182,7 @@ mod tests {
     ) -> Result<(), FullSyncValidationError> {
         let validated = ValidatedFullSync::try_from(FullSyncEnvelope {
             protocol_version: PROTOCOL_VERSION,
+            sender_relay_id: "relay-seed".into(),
             snapshot: FullSyncSnapshot::from_internal(snapshot),
         })?;
         table.merge_validated_snapshot(validated);
@@ -1174,7 +1214,7 @@ mod tests {
     fn register_alive_peer(rt: &mut RouteTable, relay_id: &str) {
         rt.register_peer(PeerInfo {
             relay_id: relay_id.into(),
-            url: format!("http://{relay_id}:8080"),
+            address: PeerAddress::http(format!("http://{relay_id}:8080")),
             route_count: 0,
             last_heartbeat: Instant::now(),
             status: PeerStatus::Alive,
@@ -1239,7 +1279,7 @@ mod tests {
         let active_digest = active_table.route_digest();
         assert_eq!(
             active_digest.get(&("grid".to_string(), "relay-a".to_string(), false)),
-            Some(&"041751786968419cef9940d98f60c292ae4a22c92166a51bc55c87f6e0601a18".to_string())
+            Some(&"00550a6731d1750b4ff30d0485b8710434bd3d4eaa1098df5582113d48b90789".to_string())
         );
 
         let mut deleted_table = RouteTable::new("relay-a".into());
@@ -1355,7 +1395,7 @@ mod tests {
         let mut rt = RouteTable::new("relay-a".into());
         rt.register_peer(PeerInfo {
             relay_id: "relay-b".into(),
-            url: "http://relay-b:8080".into(),
+            address: PeerAddress::http("http://relay-b:8080"),
             route_count: 1,
             last_heartbeat: Instant::now(),
             status: PeerStatus::Dead,
@@ -1374,7 +1414,7 @@ mod tests {
         let mut rt = RouteTable::new("relay-a".into());
         rt.register_peer(PeerInfo {
             relay_id: "relay-b".into(),
-            url: "http://relay-b:8080".into(),
+            address: PeerAddress::http("http://relay-b:8080"),
             route_count: 1,
             last_heartbeat: Instant::now(),
             status: PeerStatus::Alive,
@@ -1505,7 +1545,7 @@ mod tests {
         rt_a.register_route(peer_entry("net", "relay-b", 1000.0));
         rt_a.register_peer(PeerInfo {
             relay_id: "relay-b".into(),
-            url: "http://relay-b:8080".into(),
+            address: PeerAddress::http("http://relay-b:8080"),
             route_count: 1,
             last_heartbeat: Instant::now(),
             status: PeerStatus::Alive,
@@ -1514,7 +1554,7 @@ mod tests {
         let mut snapshot = rt_a.full_snapshot();
         snapshot.peers.push(PeerSnapshot {
             relay_id: "relay-a".into(),
-            url: "http://relay-a:8080".into(),
+            address: PeerAddress::http("http://relay-a:8080"),
             route_count: 1,
             status: PeerStatus::Alive,
         });
@@ -1530,7 +1570,10 @@ mod tests {
             .into_iter()
             .collect::<Vec<_>>();
         assert_eq!(resolved.len(), 1);
-        assert_eq!(resolved[0].relay_url, "http://relay-a:8080");
+        assert_eq!(
+            resolved[0].relay_url.as_deref(),
+            Some("http://relay-a:8080")
+        );
         assert!(resolved[0].ipc_address.is_none());
         let routes = rt_c.list_routes();
         let imported = routes.iter().find(|route| route.name == "grid").unwrap();
@@ -1565,7 +1608,7 @@ mod tests {
         rt.register_route(local_entry("grid", "relay-a"));
         let d1 = rt.route_digest();
         let mut entry = local_entry("grid", "relay-a");
-        entry.relay_url = "http://changed:9090".into();
+        entry.address = PeerAddress::http("http://changed:9090");
         rt.register_route(entry);
         let d2 = rt.route_digest();
         let key = ("grid".to_string(), "relay-a".to_string(), false);
@@ -1604,7 +1647,10 @@ mod tests {
             .into_iter()
             .collect::<Vec<_>>();
         assert_eq!(resolved.len(), 1);
-        assert_eq!(resolved[0].relay_url, "http://relay-a:8080");
+        assert_eq!(
+            resolved[0].relay_url.as_deref(),
+            Some("http://relay-a:8080")
+        );
     }
 
     #[test]
@@ -1714,7 +1760,7 @@ mod tests {
         assert!(rt.list_routes().is_empty());
 
         let mut bad_relay_url = peer_entry("bad-relay-url", "relay-b", 1000.0);
-        bad_relay_url.relay_url = "not a url".into();
+        bad_relay_url.address = PeerAddress::http("not a url");
         assert!(!rt.register_route(bad_relay_url));
         assert!(rt.list_routes().is_empty());
     }
@@ -1844,7 +1890,10 @@ mod tests {
     fn record_peer_join_rejects_invalid_relay_id_without_peer_mutation() {
         let mut rt = RouteTable::new("relay-a".into());
 
-        assert!(!rt.record_peer_join("bad/relay".into(), "http://bad-relay:8080".into()));
+        assert!(!rt.record_peer_join(
+            "bad/relay".into(),
+            PeerAddress::http("http://bad-relay:8080")
+        ));
         assert!(!rt.has_peer("bad/relay"));
         assert!(rt.list_peers().is_empty());
     }
@@ -1889,7 +1938,7 @@ mod tests {
         let mut rt = RouteTable::new("relay-b".into());
         rt.register_peer(PeerInfo {
             relay_id: "relay-a".into(),
-            url: "http://relay-a:8080".into(),
+            address: PeerAddress::http("http://relay-a:8080"),
             route_count: 1,
             last_heartbeat: Instant::now(),
             status: PeerStatus::Alive,
@@ -1902,7 +1951,7 @@ mod tests {
                 tombstones: vec![],
                 peers: vec![PeerSnapshot {
                     relay_id: "relay-a".into(),
-                    url: "http://relay-a-new:8080".into(),
+                    address: PeerAddress::http("http://relay-a-new:8080"),
                     route_count: 99,
                     status: PeerStatus::Alive,
                 }],
@@ -1911,7 +1960,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            rt.get_peer("relay-a").unwrap().url,
+            rt.get_peer("relay-a").unwrap().address.display_target(),
             "http://relay-a-new:8080"
         );
         assert_eq!(rt.get_peer("relay-a").unwrap().route_count, 99);
@@ -1919,8 +1968,9 @@ mod tests {
             rt.resolve_matching(&expected_contract("grid"))
                 .unwrap()
                 .unwrap()
-                .relay_url,
-            "http://relay-a-new:8080"
+                .relay_url
+                .as_deref(),
+            Some("http://relay-a-new:8080")
         );
     }
 
@@ -1935,7 +1985,7 @@ mod tests {
                 tombstones: vec![],
                 peers: vec![PeerSnapshot {
                     relay_id: "relay-a".into(),
-                    url: "http://relay-a:8080".into(),
+                    address: PeerAddress::http("http://relay-a:8080"),
                     route_count: 99,
                     status: PeerStatus::Alive,
                 }],
@@ -1943,13 +1993,17 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(rt.get_peer("relay-a").unwrap().url, "http://relay-a:8080");
+        assert_eq!(
+            rt.get_peer("relay-a").unwrap().address.display_target(),
+            "http://relay-a:8080"
+        );
         assert_eq!(
             rt.resolve_matching(&expected_contract("grid"))
                 .unwrap()
                 .unwrap()
-                .relay_url,
-            "http://relay-a:8080"
+                .relay_url
+                .as_deref(),
+            Some("http://relay-a:8080")
         );
     }
 
@@ -2016,7 +2070,7 @@ mod tests {
                 }],
                 peers: vec![PeerSnapshot {
                     relay_id: "relay-a".into(),
-                    url: "http://relay-a:8080".into(),
+                    address: PeerAddress::http("http://relay-a:8080"),
                     route_count: 0,
                     status: PeerStatus::Alive,
                 }],
@@ -2045,7 +2099,7 @@ mod tests {
                 }],
                 peers: vec![PeerSnapshot {
                     relay_id: "relay-a".into(),
-                    url: "http://relay-a:8080".into(),
+                    address: PeerAddress::http("http://relay-a:8080"),
                     route_count: 1,
                     status: PeerStatus::Alive,
                 }],
@@ -2068,7 +2122,7 @@ mod tests {
                 tombstones: vec![],
                 peers: vec![PeerSnapshot {
                     relay_id: "relay-a".into(),
-                    url: "http://relay-a:8080".into(),
+                    address: PeerAddress::http("http://relay-a:8080"),
                     route_count: 1,
                     status: PeerStatus::Dead,
                 }],
@@ -2092,7 +2146,7 @@ mod tests {
         let mut rt = RouteTable::new("relay-c".into());
         rt.register_peer(PeerInfo {
             relay_id: "relay-a".into(),
-            url: "http://relay-a:8080".into(),
+            address: PeerAddress::http("http://relay-a:8080"),
             route_count: 0,
             last_heartbeat: Instant::now(),
             status: PeerStatus::Dead,
@@ -2105,7 +2159,7 @@ mod tests {
                 tombstones: vec![],
                 peers: vec![PeerSnapshot {
                     relay_id: "relay-a".into(),
-                    url: "http://relay-a:8080".into(),
+                    address: PeerAddress::http("http://relay-a:8080"),
                     route_count: 1,
                     status: PeerStatus::Alive,
                 }],
@@ -2135,7 +2189,7 @@ mod tests {
                 tombstones: vec![],
                 peers: vec![PeerSnapshot {
                     relay_id: "relay-a".into(),
-                    url: "http://relay-a:8080".into(),
+                    address: PeerAddress::http("http://relay-a:8080"),
                     route_count: 1,
                     status: PeerStatus::Alive,
                 }],
@@ -2181,12 +2235,14 @@ mod tests {
             ("invalid second peer", |sync| {
                 sync.peers.push(PeerSnapshot {
                     relay_id: String::new(),
-                    url: "http://blank:8080".into(),
+                    address: PeerAddress::http("http://blank:8080"),
                     route_count: 0,
                     status: PeerStatus::Alive,
                 })
             }),
-            ("peer URL", |sync| sync.peers[0].url = "not a url".into()),
+            ("peer URL", |sync| {
+                sync.peers[0].address = PeerAddress::http("not a url")
+            }),
         ];
         for (case, invalidate) in cases {
             let mut rt = RouteTable::new("relay-b".into());
@@ -2203,7 +2259,7 @@ mod tests {
                 }],
                 peers: vec![PeerSnapshot {
                     relay_id: "relay-c".into(),
-                    url: "http://relay-c:8080".into(),
+                    address: PeerAddress::http("http://relay-c:8080"),
                     route_count: 1,
                     status: PeerStatus::Alive,
                 }],

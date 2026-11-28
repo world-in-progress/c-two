@@ -16,7 +16,7 @@ fn entry(owner: &str, locality: Locality) -> RouteEntry {
     RouteEntry {
         name: "grid".into(),
         relay_id: owner.into(),
-        relay_url: format!("http://{owner}:8080"),
+        address: PeerAddress::http(format!("http://{owner}:8080")),
         server_id: (locality == Locality::Local).then(|| "server-local".into()),
         server_instance_id: (locality == Locality::Local).then(|| "instance-local".into()),
         ipc_address: (locality == Locality::Local).then(|| "ipc://local".into()),
@@ -35,7 +35,7 @@ fn entry(owner: &str, locality: Locality) -> RouteEntry {
 fn add_peer(state: &super::state::RelayState, status: PeerStatus) {
     state.register_peer(PeerInfo {
         relay_id: "relay-peer".into(),
-        url: "http://relay-peer:8080".into(),
+        address: PeerAddress::http("http://relay-peer:8080"),
         route_count: 1,
         last_heartbeat: Instant::now(),
         status,
@@ -93,7 +93,7 @@ fn relay_leave_and_delayed_announcement_never_leave_an_orphan_registration() {
         PeerMessage::RouteAnnounce {
             name: "grid".into(),
             relay_id: "relay-peer".into(),
-            relay_url: "http://relay-peer:8080".into(),
+            address: PeerAddress::http("http://relay-peer:8080"),
             crm_ns: "test.echo".into(),
             crm_name: "Echo".into(),
             crm_ver: "0.1.0".into(),
@@ -151,11 +151,19 @@ fn relay_leave_and_delayed_announcement_never_leave_an_orphan_registration() {
     assert!(state.list_routes().is_empty());
 
     // An announcement that reaches the owner check after departure is ignored.
-    runtime.block_on(super::peer_handlers::handle_peer_announce(
-        axum::extract::State(state.clone()),
-        super::peer_handlers::PeerRequest(announce),
-    ));
+    runtime
+        .block_on(
+            build_local_router(state.clone()).oneshot(peer_request("/_peer/announce", &announce)),
+        )
+        .unwrap();
     assert!(state.list_routes().is_empty());
+}
+
+fn peer_request(path: &str, message: &super::peer::PeerEnvelope) -> Request<Body> {
+    Request::post(path)
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_vec(message).unwrap()))
+        .unwrap()
 }
 
 async fn resolve(state: Arc<super::state::RelayState>) -> (u16, serde_json::Value) {
@@ -205,17 +213,17 @@ async fn alive_heartbeat_and_metadata_writes_do_not_compare_conflicts() {
     let state = test_state_for_client();
     add_peer(&state, PeerStatus::Alive);
     state.with_route_table(|table| table.take_conflict_comparisons());
-    super::peer_handlers::handle_peer_heartbeat(
-        axum::extract::State(state.clone()),
-        super::peer_handlers::PeerRequest(PeerEnvelope::new(
-            "relay-peer",
-            PeerMessage::Heartbeat {
-                relay_id: "relay-peer".into(),
-                route_count: 23,
-            },
-        )),
-    )
-    .await;
+    let heartbeat = PeerEnvelope::new(
+        "relay-peer",
+        PeerMessage::Heartbeat {
+            relay_id: "relay-peer".into(),
+            route_count: 23,
+        },
+    );
+    build_local_router(state.clone())
+        .oneshot(peer_request("/_peer/heartbeat", &heartbeat))
+        .await
+        .unwrap();
     state.with_route_table_mut(|table| {
         table.next_local_timestamp();
     });
@@ -270,7 +278,10 @@ fn only_online_status_transitions_compare_the_owners_names() {
     });
     state.with_route_table_mut(|table| table.set_peer_status("relay-peer", PeerStatus::Dead));
     state.with_route_table(|table| assert!(table.take_conflict_comparisons().is_empty()));
-    state.with_route_table_mut(|table| table.record_peer_heartbeat("relay-peer", 1));
+    state.with_route_table_mut(|table| {
+        let address = table.get_peer("relay-peer").unwrap().address.clone();
+        assert!(table.record_peer_probe_success("relay-peer", &address));
+    });
     state.with_route_table(|table| {
         assert_eq!(table.take_conflict_comparisons(), ["grid", "grid"]);
     });
@@ -286,7 +297,7 @@ fn conflict_comparison_records_one_before_image_per_transaction() {
     let mut table = RouteTable::new("test-relay".into());
     table.register_peer(PeerInfo {
         relay_id: "relay-peer".into(),
-        url: "http://relay-peer:8080".into(),
+        address: PeerAddress::http("http://relay-peer:8080"),
         route_count: 1,
         last_heartbeat: Instant::now(),
         status: PeerStatus::Alive,
@@ -335,7 +346,7 @@ fn full_sync_keeps_dead_peer_registration_without_recovering_it() {
         tombstones: vec![],
         peers: vec![PeerSnapshot {
             relay_id: "relay-peer".into(),
-            url: "http://relay-peer:8080".into(),
+            address: PeerAddress::http("http://relay-peer:8080"),
             route_count: 1,
             status: PeerStatus::Dead,
         }],
@@ -343,6 +354,7 @@ fn full_sync_keeps_dead_peer_registration_without_recovering_it() {
     state.merge_snapshot(
         ValidatedFullSync::try_from(FullSyncEnvelope {
             protocol_version: super::peer::PROTOCOL_VERSION,
+            sender_relay_id: "relay-peer".into(),
             snapshot: FullSyncSnapshot::from_internal(sync),
         })
         .unwrap(),
@@ -455,7 +467,7 @@ fn full_sync_absence_does_not_withdraw_known_unreachable_registration() {
         tombstones: vec![],
         peers: vec![PeerSnapshot {
             relay_id: "relay-peer".into(),
-            url: "http://relay-peer:8080".into(),
+            address: PeerAddress::http("http://relay-peer:8080"),
             route_count: 0,
             status: PeerStatus::Alive,
         }],
@@ -463,6 +475,7 @@ fn full_sync_absence_does_not_withdraw_known_unreachable_registration() {
     state.merge_snapshot(
         ValidatedFullSync::try_from(FullSyncEnvelope {
             protocol_version: super::peer::PROTOCOL_VERSION,
+            sender_relay_id: "relay-peer".into(),
             snapshot: FullSyncSnapshot::from_internal(sync),
         })
         .unwrap(),

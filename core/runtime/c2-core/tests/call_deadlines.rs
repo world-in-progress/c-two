@@ -886,7 +886,8 @@ async fn http_resolve(State(state): State<RefreshState>) -> Json<Vec<RelayRouteI
 fn http_route(expected: &c2_contract::ExpectedRouteContract, url: &str) -> RelayRouteInfo {
     RelayRouteInfo {
         name: expected.route_name.clone(),
-        relay_url: url.into(),
+        relay_url: Some(url.into()),
+        proxy_via_anchor: false,
         ipc_address: None,
         server_id: None,
         server_instance_id: None,

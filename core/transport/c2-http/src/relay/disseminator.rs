@@ -1,8 +1,9 @@
+use std::sync::Arc;
 use tokio::task::JoinHandle;
 
-use crate::relay::peer::PeerEnvelope;
-use crate::relay::types::PeerSnapshot;
-use crate::relay::url::peer_endpoint_url;
+use crate::relay::peer::{PeerEnvelope, PeerMessage};
+use crate::relay::peer_client::{CONTROL_TIMEOUT, PeerHttpClient};
+use crate::relay::types::{PeerAddress, PeerSnapshot, PeerStatus};
 
 /// Trait for broadcasting gossip messages to peers.
 pub trait Disseminator: Send + Sync {
@@ -15,58 +16,61 @@ pub trait Disseminator: Send + Sync {
 /// Full broadcast — sends to every Alive peer.
 /// Suitable for clusters with <100 relays.
 pub struct FullBroadcast {
-    http_client: reqwest::Client,
+    peer_client: Arc<PeerHttpClient>,
 }
 
 impl FullBroadcast {
-    pub fn with_proxy_policy(use_proxy: bool) -> Self {
-        Self {
-            http_client: crate::relay_client_builder(&c2_config::ResolvedRelayClientConfig {
-                use_proxy: use_proxy,
-                ..Default::default()
-            })
-            .expect("system relay TLS configuration")
-            .timeout(std::time::Duration::from_secs(5))
-            .build()
-            .expect("c-two: failed to build reqwest Client for relay traffic"),
-        }
+    pub(super) fn new(peer_client: Arc<PeerHttpClient>) -> Self {
+        Self { peer_client }
     }
 
-    async fn send_to_peer(client: &reqwest::Client, url: &str, envelope: &PeerEnvelope) {
-        let endpoint = match &envelope.message {
-            crate::relay::peer::PeerMessage::RouteAnnounce { .. } => "/_peer/announce",
-            crate::relay::peer::PeerMessage::RouteWithdraw { .. } => "/_peer/announce",
-            crate::relay::peer::PeerMessage::RelayJoin { .. } => "/_peer/join",
-            crate::relay::peer::PeerMessage::RelayLeave { .. } => "/_peer/leave",
-            crate::relay::peer::PeerMessage::RelayForceLeave { .. } => "/_peer/force-leave",
-            crate::relay::peer::PeerMessage::Heartbeat { .. } => "/_peer/heartbeat",
-            crate::relay::peer::PeerMessage::DigestExchange { .. } => "/_peer/digest",
-            crate::relay::peer::PeerMessage::DigestDiff { .. } => "/_peer/digest",
-            crate::relay::peer::PeerMessage::Unknown => return,
+    #[cfg(test)]
+    pub(super) fn with_proxy_policy(use_proxy: bool) -> Self {
+        let config = c2_config::RelayConfig {
+            use_proxy,
+            ..Default::default()
         };
-        let full_url = peer_endpoint_url(url, endpoint);
-        let _ = client.post(&full_url).json(envelope).send().await;
+        Self::new(Arc::new(
+            PeerHttpClient::new(&config, None, None).expect("test peer client"),
+        ))
+    }
+
+    async fn send_to_peer(client: &PeerHttpClient, address: &PeerAddress, envelope: &PeerEnvelope) {
+        let endpoint = match &envelope.message {
+            PeerMessage::RouteAnnounce { .. } | PeerMessage::RouteWithdraw { .. } => {
+                "/_peer/announce"
+            }
+            PeerMessage::RelayJoin { .. } => "/_peer/join",
+            PeerMessage::RelayLeave { .. } => "/_peer/leave",
+            PeerMessage::RelayForceLeave { .. } => "/_peer/force-leave",
+            PeerMessage::Heartbeat { .. } => "/_peer/heartbeat",
+            PeerMessage::DigestExchange { .. } | PeerMessage::DigestDiff { .. } => "/_peer/digest",
+        };
+        let _ = tokio::time::timeout(
+            CONTROL_TIMEOUT,
+            client.post_control(address, endpoint, envelope),
+        )
+        .await;
     }
 }
 
 impl Disseminator for FullBroadcast {
     fn broadcast(&self, envelope: PeerEnvelope, peers: &[PeerSnapshot]) -> Option<JoinHandle<()>> {
-        use crate::relay::types::PeerStatus;
-        let alive: Vec<String> = peers
+        let alive: Vec<PeerAddress> = peers
             .iter()
             .filter(|p| p.status == PeerStatus::Alive)
-            .map(|p| p.url.clone())
+            .map(|p| p.address.clone())
             .collect();
 
         if alive.is_empty() {
             return None;
         }
 
-        let client = self.http_client.clone();
+        let client = self.peer_client.clone();
         Some(tokio::spawn(async move {
             let futs: Vec<_> = alive
                 .iter()
-                .map(|url| Self::send_to_peer(&client, url, &envelope))
+                .map(|address| Self::send_to_peer(&client, address, &envelope))
                 .collect();
             futures::future::join_all(futs).await;
         }))

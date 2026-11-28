@@ -236,9 +236,10 @@ impl ForwardingDomain {
         }
     }
 
-    pub(crate) fn cancel_stream(&self, token: &str) -> bool {
-        if let Some(control) = self.streams.lock().get(token) {
-            control.cancel(c2_wire::rpc::CancelCause::Consumer);
+    pub(crate) fn cancel_stream(&self, token: &str, cause: c2_wire::rpc::CancelCause) -> bool {
+        let control = self.streams.lock().get(token).cloned();
+        if let Some(control) = control {
+            control.cancel(cause);
             true
         } else {
             false
@@ -333,8 +334,8 @@ mod tests {
         let (second, second_control) = domain.register_stream().unwrap();
         assert_eq!(first.len(), 32);
         assert_ne!(first, second);
-        assert!(!domain.cancel_stream("not-a-call"));
-        assert!(domain.cancel_stream(&first));
+        assert!(!domain.cancel_stream("not-a-call", c2_wire::rpc::CancelCause::Consumer));
+        assert!(domain.cancel_stream(&first, c2_wire::rpc::CancelCause::Consumer));
         assert_eq!(
             first_control.requested().await,
             c2_wire::rpc::CancelCause::Consumer
@@ -349,7 +350,7 @@ mod tests {
             Some(c2_wire::rpc::CancelCause::Consumer)
         );
         domain.remove_stream(&first);
-        assert!(!domain.cancel_stream(&first));
+        assert!(!domain.cancel_stream(&first, c2_wire::rpc::CancelCause::Consumer));
         domain.remove_stream(&second);
         domain.drain().await;
     }

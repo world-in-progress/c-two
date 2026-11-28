@@ -8,24 +8,35 @@
 //! Compatible late joiners share a confirmation when the Host has no
 //! admission hook, otherwise each joiner confirms with its own metadata.
 
+use axum::body::{Body, BodyDataStream};
 use bytes::{Buf, Bytes};
 use c2_config::CallMetadata;
 use c2_contract::ExpectedRouteContract;
 use c2_error::{C2Error, ErrorCode};
 use c2_mem::{WindowChunk, WindowSlice};
 use c2_wire::rpc::CancelCause;
+use futures::StreamExt;
+use http::{Method, StatusCode, header};
 use parking_lot::Mutex;
 use std::collections::BTreeMap;
+use std::sync::Arc;
 use tokio::sync::oneshot;
+use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 
-use crate::client::add_expected_contract_headers;
-use crate::http_wire::{
-    MAX_CONTROL_ERROR_BYTES, add_metadata, read_control_body, single_header, topic_open_headers,
-};
+use crate::http_wire::{MAX_CONTROL_ERROR_BYTES, single_header, topic_open_headers};
 use crate::topic_wire::{self, RecordKind};
 use crate::{TOPIC_CONFIRM_PATH, TOPIC_SUBSCRIBE_PATH, decode_control_error};
 
-pub(crate) const ORIGIN_ONLY_HEADER: &str = "x-c2-relay-origin-only";
+use super::{
+    iroh_transport::MeshLane,
+    peer_client::{CONTROL_TIMEOUT, PeerHttpClient},
+    peer_forward::{
+        contract_headers, origin_request, peer_error, read_control_body, retry_peer_cancellation,
+    },
+    types::PeerAddress,
+};
+
 pub(crate) const REGISTRATION_HEADER: &str = "x-c2-topic-registration";
 pub(crate) const EXPECTED_REGISTRATION_HEADER: &str = "x-c2-expected-registration";
 pub(crate) const UPSTREAM_TOKEN_HEADER: &str = "x-c2-topic-upstream-token";
@@ -82,31 +93,61 @@ pub(crate) fn registration_fingerprint(server_instance_id: &str, route_uid: &str
     hex::encode(hasher.finalize())
 }
 
-/// Relay-to-relay cancellation of one cross-relay topic upstream. The source's
-/// cancel channel is exercised exactly once and promptly, even while this
-/// relay's own downstream readers are stalled.
+/// Cancellation of one pinned cross-relay topic upstream. A later Consumer
+/// request can abandon delivery without replacing the first cause.
 pub(crate) struct HttpUpstreamCancel {
-    client: reqwest::Client,
-    delete_url: String,
-    handle: Option<tokio::runtime::Handle>,
-    sent: std::sync::atomic::AtomicBool,
+    client: Arc<PeerHttpClient>,
+    address: PeerAddress,
+    token: String,
+    handle: tokio::runtime::Handle,
+    dispatched: Mutex<CancelDispatch>,
+    finished: CancellationToken,
+}
+
+enum CancelDispatch {
+    Pending,
+    Lifecycle(JoinHandle<()>),
+    Consumer,
 }
 
 impl HttpUpstreamCancel {
-    pub(crate) fn cancel(&self, _cause: CancelCause) {
-        if self.sent.swap(true, std::sync::atomic::Ordering::AcqRel) {
-            return;
+    pub(crate) fn cancel(&self, cause: CancelCause) {
+        let mut dispatched = self.dispatched.lock();
+        match cause {
+            CancelCause::Lifecycle if matches!(*dispatched, CancelDispatch::Pending) => {
+                *dispatched = CancelDispatch::Lifecycle(self.send(cause, None));
+            }
+            CancelCause::Consumer if !matches!(*dispatched, CancelDispatch::Consumer) => {
+                let previous = match std::mem::replace(&mut *dispatched, CancelDispatch::Consumer) {
+                    CancelDispatch::Lifecycle(request) => Some(request),
+                    _ => None,
+                };
+                drop(self.send(cause, previous));
+            }
+            _ => {}
         }
-        let request = self
-            .client
-            .delete(&self.delete_url)
-            .header(reqwest::header::CONTENT_LENGTH, "0");
-        let Some(handle) = &self.handle else {
-            return;
-        };
-        handle.spawn(async move {
-            let _ = request.send().await;
-        });
+    }
+
+    fn send(&self, cause: CancelCause, previous: Option<JoinHandle<()>>) -> JoinHandle<()> {
+        let client = self.client.clone();
+        let address = self.address.clone();
+        let token = self.token.clone();
+        let finished = self.finished.clone();
+        self.handle.spawn(async move {
+            let send = async {
+                // Submit Lifecycle successfully before sending Consumer so the
+                // source observes the first cause even across HTTP connections.
+                if let Some(previous) = previous {
+                    let _ = previous.await;
+                }
+                retry_peer_cancellation(&client, &address, &token, cause).await;
+            };
+            tokio::select! {
+                biased;
+                _ = finished.cancelled() => {},
+                _ = send => {},
+            }
+        })
     }
 }
 
@@ -114,12 +155,12 @@ impl HttpUpstreamCancel {
 /// an HTTP client consumes. Payload bytes are pulled through caller-charged
 /// windows exactly like the IPC upstream.
 pub(crate) struct HttpTopicUpstream {
-    response: reqwest::Response,
+    response: BodyDataStream,
     pending: Bytes,
     record_remaining: usize,
     ready: Option<u64>,
     terminal: Option<C2Error>,
-    cancel: std::sync::Arc<HttpUpstreamCancel>,
+    cancel: Arc<HttpUpstreamCancel>,
     /// Partial-read progress for the record `next_record` is currently inside.
     /// The relay shutdown select drops `next_record` futures between reads;
     /// keeping the already-copied bytes here lets a resumed read continue at
@@ -127,6 +168,12 @@ pub(crate) struct HttpTopicUpstream {
     partial: Option<PartialRecord>,
     header: [u8; topic_wire::RECORD_HEADER_LEN],
     small: [u8; 16],
+}
+
+impl Drop for HttpTopicUpstream {
+    fn drop(&mut self) {
+        self.cancel.finished.cancel();
+    }
 }
 
 /// The resumable stages of one upstream record: the fixed-length header
@@ -139,7 +186,7 @@ enum PartialRecord {
 }
 
 impl HttpTopicUpstream {
-    pub(crate) fn cancel_handle(&self) -> std::sync::Arc<HttpUpstreamCancel> {
+    pub(crate) fn cancel_handle(&self) -> Arc<HttpUpstreamCancel> {
         self.cancel.clone()
     }
 
@@ -150,7 +197,7 @@ impl HttpTopicUpstream {
     /// is an error. Free of `&mut self` so `next_record` can resume partial
     /// reads kept in this struct's own fields.
     async fn read_unit(
-        response: &mut reqwest::Response,
+        response: &mut BodyDataStream,
         pending: &mut Bytes,
         dst: &mut [u8],
         filled: &mut usize,
@@ -158,8 +205,9 @@ impl HttpTopicUpstream {
         while *filled < dst.len() {
             if pending.is_empty() {
                 match response
-                    .chunk()
+                    .next()
                     .await
+                    .transpose()
                     .map_err(|error| transport(format!("topic upstream read failed: {error}")))?
                 {
                     Some(chunk) if chunk.is_empty() => continue,
@@ -195,7 +243,7 @@ impl HttpTopicUpstream {
     /// stream inside a body is never accepted: its header was consumed, so
     /// the stream truncated inside the record.
     async fn read_body(
-        response: &mut reqwest::Response,
+        response: &mut BodyDataStream,
         pending: &mut Bytes,
         dst: &mut [u8],
         filled: &mut usize,
@@ -346,8 +394,9 @@ impl HttpTopicUpstream {
     pub(crate) async fn completion(&mut self) -> Result<Option<C2Error>, C2Error> {
         while let Some(chunk) = self
             .response
-            .chunk()
+            .next()
             .await
+            .transpose()
             .map_err(|error| transport(format!("topic upstream read failed: {error}")))?
         {
             drop(chunk);
@@ -375,39 +424,32 @@ pub(crate) struct OpenedRemoteUpstream {
 /// The request always carries the one-hop loop-prevention header; the source
 /// relays only local routes for it and never forwards again.
 pub(crate) async fn open_remote_upstream(
-    data_client: reqwest::Client,
-    control_client: reqwest::Client,
-    source_relay_url: &str,
+    client: Arc<PeerHttpClient>,
+    address: &PeerAddress,
     expected: &ExpectedRouteContract,
     topic_name: &str,
     metadata: &CallMetadata,
 ) -> Result<OpenedRemoteUpstream, C2Error> {
-    let base = source_relay_url.trim_end_matches('/');
-    let url = format!("{base}{TOPIC_SUBSCRIBE_PATH}");
-    let request = add_metadata(
-        add_expected_contract_headers(
-            data_client
-                .post(&url)
-                .query(&[
-                    ("route", expected.route_name.as_str()),
-                    ("topic", topic_name),
-                ])
-                .header(reqwest::header::ACCEPT, crate::topic_wire::MEDIA_TYPE)
-                .header("x-c2-topic-start", "latest")
-                .header("x-c2-topic-on-lag", "skip")
-                .header(ORIGIN_ONLY_HEADER, "1")
-                .header(reqwest::header::CONTENT_LENGTH, "0"),
-            expected,
-        ),
+    let request = contract_headers(
+        origin_request(
+            Method::POST,
+            TOPIC_SUBSCRIBE_PATH,
+            &[("route", &expected.route_name), ("topic", topic_name)],
+        )
+        .header(header::ACCEPT, crate::topic_wire::MEDIA_TYPE)
+        .header("x-c2-topic-start", "latest")
+        .header("x-c2-topic-on-lag", "skip")
+        .header(header::CONTENT_LENGTH, "0"),
+        expected,
         metadata,
     )
-    .build()
+    .body(Body::empty())
     .map_err(|error| transport(format!("topic upstream request build failed: {error}")))?;
-    let response = data_client
-        .execute(request)
+    let response = client
+        .send(MeshLane::Data, address, request)
         .await
-        .map_err(|error| transport(format!("topic upstream request failed: {error}")))?;
-    if response.status().as_u16() != 200 {
+        .map_err(peer_error)?;
+    if response.status() != StatusCode::OK {
         return Err(upstream_refusal(response).await);
     }
     if single_header(response.headers(), "content-type") != Some(crate::topic_wire::MEDIA_TYPE) {
@@ -425,19 +467,20 @@ pub(crate) async fn open_remote_upstream(
         .filter(|value| valid_fingerprint(value))
         .ok_or_else(|| protocol("topic upstream response has an invalid registration identity"))?
         .to_owned();
-    let handle = tokio::runtime::Handle::try_current().ok();
     Ok(OpenedRemoteUpstream {
         source: HttpTopicUpstream {
-            response,
+            response: response.into_body().into_data_stream(),
             pending: Bytes::new(),
             record_remaining: 0,
             ready: None,
             terminal: None,
-            cancel: std::sync::Arc::new(HttpUpstreamCancel {
-                client: control_client,
-                delete_url: format!("{base}/_calls/{token}"),
-                handle,
-                sent: std::sync::atomic::AtomicBool::new(false),
+            cancel: Arc::new(HttpUpstreamCancel {
+                client,
+                address: address.clone(),
+                token: token.clone(),
+                handle: tokio::runtime::Handle::current(),
+                dispatched: Mutex::new(CancelDispatch::Pending),
+                finished: CancellationToken::new(),
             }),
             partial: None,
             header: [0; topic_wire::RECORD_HEADER_LEN],
@@ -451,7 +494,7 @@ pub(crate) async fn open_remote_upstream(
 }
 
 /// Read a bounded canonical refusal body from the source relay.
-async fn upstream_refusal(response: reqwest::Response) -> C2Error {
+async fn upstream_refusal(response: http::Response<Body>) -> C2Error {
     let status = response.status();
     let body = read_control_body(response, MAX_CONTROL_ERROR_BYTES).await;
     if let Ok(body) = &body
@@ -488,8 +531,8 @@ struct ConfirmBatches {
 /// leader of a batch immediately starts the next one for everyone that
 /// arrived while the previous request was outstanding.
 pub(crate) struct RemoteConfirm {
-    client: reqwest::Client,
-    confirm_url: String,
+    client: Arc<PeerHttpClient>,
+    address: PeerAddress,
     expected: ExpectedRouteContract,
     topic: String,
     registration: String,
@@ -499,17 +542,16 @@ pub(crate) struct RemoteConfirm {
 
 impl RemoteConfirm {
     pub(crate) fn new(
-        client: reqwest::Client,
-        source_relay_url: &str,
+        client: Arc<PeerHttpClient>,
+        address: &PeerAddress,
         expected: &ExpectedRouteContract,
         topic_name: &str,
         registration: &str,
         token: &str,
     ) -> Self {
-        let base = source_relay_url.trim_end_matches('/');
         Self {
             client,
-            confirm_url: format!("{base}{TOPIC_CONFIRM_PATH}"),
+            address: address.clone(),
             expected: expected.clone(),
             registration: registration.to_string(),
             token: token.to_string(),
@@ -597,39 +639,36 @@ impl RemoteConfirm {
     }
 
     async fn request(&self, metadata: &CallMetadata) -> Result<u64, C2Error> {
-        let request = add_metadata(
-            add_expected_contract_headers(
-                self.client
-                    .post(&self.confirm_url)
-                    .query(&[
-                        ("route", self.expected.route_name.as_str()),
-                        ("topic", &self.topic),
-                    ])
-                    .header(reqwest::header::ACCEPT, "application/json")
-                    .header(ORIGIN_ONLY_HEADER, "1")
-                    .header(EXPECTED_REGISTRATION_HEADER, &self.registration)
-                    .header(UPSTREAM_TOKEN_HEADER, &self.token)
-                    .header(reqwest::header::CONTENT_LENGTH, "0"),
-                &self.expected,
-            ),
+        let request = contract_headers(
+            origin_request(
+                Method::POST,
+                TOPIC_CONFIRM_PATH,
+                &[("route", &self.expected.route_name), ("topic", &self.topic)],
+            )
+            .header(header::ACCEPT, "application/json")
+            .header(EXPECTED_REGISTRATION_HEADER, &self.registration)
+            .header(UPSTREAM_TOKEN_HEADER, &self.token)
+            .header(header::CONTENT_LENGTH, "0"),
+            &self.expected,
             metadata,
         )
-        .build()
+        .body(Body::empty())
         .map_err(|error| transport(format!("topic confirmation build failed: {error}")))?;
-        let response = self
-            .client
-            .execute(request)
-            .await
-            .map_err(|error| transport(format!("topic confirmation failed: {error}")))?;
-        if response.status().as_u16() != 200 {
-            return Err(upstream_refusal(response).await);
-        }
-        // The answer is a tiny JSON control document; read it with the same
-        // bounded control reader as refusals instead of charging the shared
-        // payload budget, which this hub's own latest frame may already hold.
-        let body = read_control_body(response, MAX_CONTROL_ERROR_BYTES)
-            .await
-            .map_err(|error| transport(format!("topic confirmation body read failed: {error}")))?;
+        let body = tokio::time::timeout(CONTROL_TIMEOUT, async {
+            let response = self
+                .client
+                .send(MeshLane::Control, &self.address, request)
+                .await
+                .map_err(peer_error)?;
+            if response.status() != StatusCode::OK {
+                return Err(upstream_refusal(response).await);
+            }
+            read_control_body(response, MAX_CONTROL_ERROR_BYTES)
+                .await
+                .map_err(|error| transport(format!("topic confirmation body read failed: {error}")))
+        })
+        .await
+        .map_err(|_| transport("topic confirmation timed out"))??;
         #[derive(serde::Deserialize)]
         struct Confirmation {
             head_seq: u64,
@@ -671,6 +710,10 @@ impl Drop for ConfirmLead {
 mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    fn peer_client() -> Arc<PeerHttpClient> {
+        Arc::new(PeerHttpClient::new(&c2_config::RelayConfig::default(), None, None).unwrap())
+    }
 
     fn expected_contract() -> c2_contract::ExpectedRouteContract {
         c2_contract::ExpectedRouteContract {
@@ -746,9 +789,8 @@ mod tests {
                 stream.write_all(response.as_bytes()).await.unwrap();
             });
             let error = open_remote_upstream(
-                reqwest::Client::new(),
-                reqwest::Client::new(),
-                &format!("http://{address}"),
+                peer_client(),
+                &PeerAddress::http(format!("http://{address}")),
                 &expected_contract(),
                 "state",
                 &CallMetadata::default(),
@@ -768,7 +810,7 @@ mod tests {
         use axum::http::StatusCode;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
-        let base = format!("http://{address}");
+        let base = PeerAddress::http(format!("http://{address}"));
         let app = axum::Router::new()
             .route(
                 TOPIC_SUBSCRIBE_PATH,
@@ -779,20 +821,13 @@ mod tests {
                 axum::routing::post(|| async { StatusCode::NOT_FOUND }),
             );
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        let client = reqwest::Client::new();
+        let client = peer_client();
         let expected = expected_contract();
         let metadata = CallMetadata::default();
-        let open_error = open_remote_upstream(
-            client.clone(),
-            reqwest::Client::new(),
-            &base,
-            &expected,
-            "state",
-            &metadata,
-        )
-        .await
-        .err()
-        .expect("bare 404 must fail");
+        let open_error = open_remote_upstream(client.clone(), &base, &expected, "state", &metadata)
+            .await
+            .err()
+            .expect("bare 404 must fail");
         let confirm = RemoteConfirm::new(
             client,
             &base,
@@ -839,8 +874,8 @@ mod tests {
         );
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         let confirm = std::sync::Arc::new(RemoteConfirm::new(
-            reqwest::Client::new(),
-            &format!("http://{address}"),
+            peer_client(),
+            &PeerAddress::http(format!("http://{address}")),
             &expected_contract(),
             "state",
             "instance-1",
@@ -901,8 +936,8 @@ mod tests {
         );
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         let confirm = std::sync::Arc::new(RemoteConfirm::new(
-            reqwest::Client::new(),
-            &format!("http://{address}"),
+            peer_client(),
+            &PeerAddress::http(format!("http://{address}")),
             &expected_contract(),
             "state",
             "instance-1",
@@ -946,8 +981,8 @@ mod tests {
         );
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         let confirm = std::sync::Arc::new(RemoteConfirm::new(
-            reqwest::Client::new(),
-            &format!("http://{address}"),
+            peer_client(),
+            &PeerAddress::http(format!("http://{address}")),
             &expected_contract(),
             "state",
             "instance-1",
@@ -994,8 +1029,8 @@ mod tests {
             .try_reserve_memory(snapshot.memory.limit_bytes - snapshot.memory.used_bytes)
             .unwrap();
         let confirm = std::sync::Arc::new(RemoteConfirm::new(
-            reqwest::Client::new(),
-            &format!("http://{address}"),
+            peer_client(),
+            &PeerAddress::http(format!("http://{address}")),
             &expected_contract(),
             "state",
             "instance-1",
@@ -1028,9 +1063,8 @@ mod tests {
             stream.shutdown().await.unwrap();
         });
         let opened = open_remote_upstream(
-            reqwest::Client::new(),
-            reqwest::Client::new(),
-            &format!("http://{address}"),
+            peer_client(),
+            &PeerAddress::http(format!("http://{address}")),
             &expected_contract(),
             "state",
             &CallMetadata::default(),
@@ -1074,9 +1108,8 @@ mod tests {
             stream.shutdown().await.unwrap();
         });
         let opened = open_remote_upstream(
-            reqwest::Client::new(),
-            reqwest::Client::new(),
-            &format!("http://{address}"),
+            peer_client(),
+            &PeerAddress::http(format!("http://{address}")),
             &expected_contract(),
             "state",
             &CallMetadata::default(),
@@ -1116,9 +1149,8 @@ mod tests {
                 .unwrap();
         });
         let opened = open_remote_upstream(
-            reqwest::Client::new(),
-            reqwest::Client::new(),
-            &format!("http://{address}"),
+            peer_client(),
+            &PeerAddress::http(format!("http://{address}")),
             &expected_contract(),
             "state",
             &CallMetadata::default(),

@@ -558,6 +558,12 @@ impl IrohQuicBiStream {
     ) {
         let control = Arc::<ResponseStreamControl>::default();
         let mut io = Self::new(send, recv, Some(control.clone()));
+        let peer_stopped = io.send.stopped();
+        enum StreamEnd {
+            Evicted,
+            PeerStopped,
+            Http(Result<(), hyper::Error>),
+        }
         let run = {
             let request_control = control.clone();
             let service =
@@ -574,23 +580,25 @@ impl IrohQuicBiStream {
             // reset the send half even if Hyper is not polling socket writes.
             tokio::select! {
                 biased;
-                _ = control.aborted() => None,
+                _ = control.aborted() => StreamEnd::Evicted,
                 result = hyper::server::conn::http1::Builder::new()
                     .half_close(true)
                     .keep_alive(false)
-                    .serve_connection(TokioIo::new(&mut io), service) => Some(result),
+                    .serve_connection(TokioIo::new(&mut io), service) => StreamEnd::Http(result),
+                _ = peer_stopped => StreamEnd::PeerStopped,
             }
         };
         match run {
-            None => {
+            StreamEnd::Evicted => {
                 io.evict();
             }
-            Some(Ok(())) => {
+            StreamEnd::Http(Ok(())) => {
                 let _ = io.finish_send();
             }
-            Some(Err(error)) => {
+            StreamEnd::Http(Err(error)) => {
                 tracing::debug!(%error, "iroh HTTP stream ended");
             }
+            StreamEnd::PeerStopped => {}
         }
         // Send the response FIN before stopping any unread request bytes.
         let _ = io.recv.stop(VarInt::from_u32(0));

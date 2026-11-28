@@ -20,7 +20,7 @@ use c_two::{
 use serde_json::{Value, json};
 
 const WAIT: Duration = Duration::from_secs(30);
-const MESH_PROTOCOL_VERSION: u64 = 8;
+const MESH_PROTOCOL_VERSION: u64 = 9;
 static NEXT_DIRECTORY: AtomicUsize = AtomicUsize::new(0);
 const DESCRIPTOR: &[u8] = br#"{
   "schema":"c-two.contract.v2",
@@ -154,7 +154,7 @@ impl Relay {
             .as_array()
             .unwrap()
             .iter()
-            .find(|peer| peer["url"] == relay.url)
+            .find(|peer| peer["address"]["http_url"] == relay.url)
             .unwrap()["relay_id"]
             .as_str()
             .unwrap()
@@ -259,7 +259,7 @@ fn join_and_exchange(a: &Relay, b: &Relay) {
             "/_peer/join",
             &envelope(
                 source,
-                json!({"type":"RelayJoin", "relay_id":source.id, "url":source.url}),
+                json!({"type":"RelayJoin", "relay_id":source.id, "address":{"http_url":source.url}}),
             ),
         );
         assert_eq!(
@@ -309,7 +309,7 @@ fn peer_url(relay: &Relay, peer: &Relay) -> String {
         .unwrap()
         .iter()
         .find(|item| item["relay_id"] == peer.id)
-        .unwrap()["url"]
+        .unwrap()["address"]["http_url"]
         .as_str()
         .unwrap()
         .to_owned()
@@ -750,7 +750,7 @@ fn join_without_reachable_peer_urls(a: &Relay, b: &Relay, name: &str) -> Vec<Tcp
             "/_peer/join",
             &envelope(
                 source,
-                json!({"type":"RelayJoin", "relay_id":source.id, "url":url}),
+                json!({"type":"RelayJoin", "relay_id":source.id, "address":{"http_url":url}}),
             ),
         );
         assert_eq!(
@@ -777,7 +777,7 @@ fn restore_peer_urls(a: &Relay, b: &Relay) {
             "/_peer/join",
             &envelope(
                 source,
-                json!({"type":"RelayJoin", "relay_id":source.id, "url":source.url}),
+                json!({"type":"RelayJoin", "relay_id":source.id, "address":{"http_url":source.url}}),
             ),
         );
         assert_eq!(
@@ -853,7 +853,7 @@ fn run_unavailable_case(explicit: bool, force_leave: bool) {
         let listed = routes(&b, &name);
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0]["relay_id"], a.id);
-        assert_eq!(listed[0]["relay_url"], owner_url);
+        assert_eq!(listed[0]["address"]["http_url"], owner_url);
         assert_eq!(listed[0]["relay_status"], status);
         unavailable(
             connect(&client_b, &release, &name, &b, explicit).unwrap_err(),

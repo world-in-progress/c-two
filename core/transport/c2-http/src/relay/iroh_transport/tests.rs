@@ -14,11 +14,11 @@ use crate::{
     bridge::BridgeServer,
     relay::{
         RelayServer,
-        peer::{PeerEnvelope, PeerMessage},
+        peer::{PROTOCOL_VERSION, PeerEnvelope, PeerMessage},
         router::build_mesh_router,
         stream_control::ResponseStreamControl,
         test_support::{TEST_ABI_HASH, TEST_SIGNATURE_HASH, test_state_for_client},
-        types::{Locality, RouteEntry},
+        types::{FullSyncEnvelope, Locality, PeerAddress, RouteEntry, ValidatedFullSync},
     },
 };
 
@@ -64,10 +64,25 @@ struct MeshNode {
 
 impl MeshNode {
     async fn start(config: &RelayConfig, relay_only: bool, router: Router) -> Self {
+        Self::start_with_key(
+            config,
+            relay_only,
+            [router.clone(), router],
+            SecretKey::generate(),
+        )
+        .await
+    }
+
+    async fn start_with_key(
+        config: &RelayConfig,
+        relay_only: bool,
+        [control, data]: [Router; 2],
+        key: SecretKey,
+    ) -> Self {
         let transport = Arc::new(
             IrohMeshTransport::bind_with(
                 config,
-                SecretKey::generate(),
+                key,
                 config.validate_with_bridge_spec().unwrap(),
                 relay_only,
             )
@@ -78,7 +93,7 @@ impl MeshNode {
         let task = {
             let transport = transport.clone();
             let stop = stop.clone();
-            tokio::spawn(async move { transport.serve(router, stop).await })
+            tokio::spawn(async move { transport.serve(control, data, stop).await })
         };
         if config.bridge.is_some() {
             bounded(transport.endpoint.online()).await;
@@ -99,6 +114,130 @@ impl MeshNode {
         self.stop.cancel();
         bounded(self.task).await.unwrap();
     }
+}
+
+#[tokio::test]
+async fn cold_mesh_lane_reauthenticates_after_remote_restart() {
+    let parent = tempfile::tempdir().unwrap();
+    let bridge = bridge(parent.path(), false).await;
+    let cfg = config(&bridge, "restart-proof");
+    let app = Router::new().route("/health", get(|| async { "ok" }));
+    let a = MeshNode::start(&cfg, true, app.clone()).await;
+    let b = MeshNode::start(&cfg, true, Router::new()).await;
+    let b_key = b.transport.endpoint.secret_key().clone();
+    let response = bounded(b.transport.send_request(
+        MeshLane::Control,
+        &a.relay_hint(),
+        get_request("/health"),
+    ))
+    .await
+    .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    bounded(response.into_body().collect()).await.unwrap();
+    let b_id = b.transport.endpoint_id();
+    assert!(a.transport.auth.peers.lock().contains(&b_id));
+    assert!(
+        !a.transport
+            .lanes
+            .lock()
+            .contains_key(&(b_id, MeshLane::Control))
+    );
+    b.done().await;
+
+    let b = MeshNode::start_with_key(&cfg, true, [app.clone(), app], b_key).await;
+    assert_eq!(b.transport.endpoint_id(), b_id);
+    let response = bounded(a.transport.send_request(
+        MeshLane::Control,
+        &b.relay_hint(),
+        get_request("/health"),
+    ))
+    .await
+    .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        bounded(response.into_body().collect())
+            .await
+            .unwrap()
+            .to_bytes(),
+        "ok"
+    );
+    a.done().await;
+    b.done().await;
+    bridge.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn dropping_mesh_probe_waiter_stops_origin_without_closing_control_lane() {
+    use tokio::sync::Notify;
+
+    struct DropSignal(Arc<Notify>);
+    impl Drop for DropSignal {
+        fn drop(&mut self) {
+            self.0.notify_one();
+        }
+    }
+
+    let parent = tempfile::tempdir().unwrap();
+    let bridge = bridge(parent.path(), false).await;
+    let cfg = config(&bridge, "cancel-proof");
+    let started = Arc::new(Notify::new());
+    let dropped = Arc::new(Notify::new());
+    let app = Router::new()
+        .route(
+            "/_probe",
+            get({
+                let started = started.clone();
+                let dropped = dropped.clone();
+                move || async move {
+                    let _signal = DropSignal(dropped);
+                    started.notify_one();
+                    std::future::pending::<StatusCode>().await
+                }
+            }),
+        )
+        .route("/health", get(|| async { "ok" }));
+    let a = MeshNode::start(&cfg, true, Router::new()).await;
+    let b = MeshNode::start(&cfg, true, app).await;
+    let address = b.relay_hint();
+    let probe = tokio::spawn({
+        let source = a.transport.clone();
+        let address = address.clone();
+        async move {
+            source
+                .send_request(MeshLane::Control, &address, get_request("/_probe"))
+                .await
+        }
+    });
+    bounded(started.notified()).await;
+    let lane = a
+        .transport
+        .connection(MeshLane::Control, &address)
+        .await
+        .unwrap();
+    probe.abort();
+    assert!(bounded(probe).await.unwrap_err().is_cancelled());
+    bounded(dropped.notified()).await;
+    let sibling = bounded(a.transport.send_request(
+        MeshLane::Control,
+        &address,
+        get_request("/health"),
+    ))
+    .await
+    .unwrap();
+    assert_eq!(sibling.status(), StatusCode::OK);
+    bounded(sibling.into_body().collect()).await.unwrap();
+    assert_eq!(
+        a.transport
+            .connection(MeshLane::Control, &address)
+            .await
+            .unwrap()
+            .stable_id(),
+        lane.stable_id(),
+    );
+    drop(lane);
+    a.done().await;
+    b.done().await;
+    bridge.stop().await.unwrap();
 }
 
 #[test]
@@ -395,7 +534,7 @@ async fn surface_c_isolated_and_refusals_finish_before_stopping_upload() {
         state.with_route_table_mut(|rt| rt.register_route(RouteEntry {
             name: "grid".into(),
             relay_id: state.relay_id().to_owned(),
-            relay_url: "http://localhost:8888".into(),
+            address: PeerAddress::http("http://localhost:8888"),
             server_id: Some("private-server-id".into()),
             server_instance_id: Some("private-server-instance".into()),
             ipc_address: Some("ipc://private-address".into()),
@@ -412,21 +551,34 @@ async fn surface_c_isolated_and_refusals_finish_before_stopping_upload() {
     );
 
     let a = MeshNode::start(&cfg, true, Router::new()).await;
-    let b = MeshNode::start(&cfg, true, build_mesh_router(state)).await;
+    let b = MeshNode::start_with_key(
+        &cfg,
+        true,
+        [
+            build_mesh_router(state.clone(), MeshLane::Control),
+            build_mesh_router(state.clone(), MeshLane::Data),
+        ],
+        SecretKey::generate(),
+    )
+    .await;
     let addr = b.relay_hint();
-    for (method, path, expected) in [
-        ("POST", "/_register", 404),
-        ("POST", "/_unregister", 404),
-        ("POST", "/_admin/force-leave", 404),
-        ("GET", "/_peers", 404),
-        ("GET", "/_resolve?route=grid", 404),
-        ("GET", "/_routes", 404),
-        ("GET", "/health", 200),
-        ("GET", "/_peer/sync", 200),
+    for (lane, method, path, expected) in [
+        (MeshLane::Control, "POST", "/_register", 404),
+        (MeshLane::Control, "POST", "/_unregister", 404),
+        (MeshLane::Control, "POST", "/_admin/force-leave", 404),
+        (MeshLane::Control, "GET", "/_peers", 404),
+        (MeshLane::Control, "GET", "/_resolve?route=grid", 404),
+        (MeshLane::Control, "GET", "/_routes", 404),
+        (MeshLane::Control, "GET", "/health", 200),
+        (MeshLane::Control, "GET", "/_peer/sync", 200),
+        (MeshLane::Control, "POST", crate::CALL_PATH, 404),
+        (MeshLane::Data, "GET", "/health", 404),
+        (MeshLane::Data, "GET", "/_peer/sync", 404),
+        (MeshLane::Data, "POST", "/_peer/join", 404),
     ] {
         let response = bounded(
             a.transport.send_request(
-                MeshLane::Control,
+                lane,
                 &addr,
                 Request::builder()
                     .method(method)
@@ -452,25 +604,102 @@ async fn surface_c_isolated_and_refusals_finish_before_stopping_upload() {
         }
     }
 
-    let sender = RelayConfig::derive_iroh_relay_id(a.transport.endpoint_id().as_bytes());
-    for (label, expected) in [("different-relay", 403), (sender.as_str(), 200)] {
+    let other_endpoint = MeshNode::start(&cfg, true, Router::new()).await;
+    let sender = "explicit-relay-label";
+    let heartbeat = PeerEnvelope::new(
+        sender,
+        PeerMessage::Heartbeat {
+            relay_id: sender.into(),
+            route_count: 2,
+        },
+    );
+    let digest = PeerEnvelope::new(sender, PeerMessage::DigestExchange { digest: vec![] });
+    let announce = PeerEnvelope::new(
+        sender,
+        PeerMessage::RouteAnnounce {
+            name: "peer-grid".into(),
+            relay_id: sender.into(),
+            address: PeerAddress::iroh(a.relay_hint(), None),
+            crm_ns: "test.echo".into(),
+            crm_name: "Echo".into(),
+            crm_ver: "0.1.0".into(),
+            abi_hash: TEST_ABI_HASH.into(),
+            signature_hash: TEST_SIGNATURE_HASH.into(),
+            max_payload_size: 4,
+            registered_at: 2.0,
+        },
+    );
+    let peer_requests = [
+        ("/_peer/announce", &announce),
+        ("/_peer/digest", &digest),
+        ("/_peer/heartbeat", &heartbeat),
+    ];
+    for (path, envelope) in peer_requests {
+        assert_eq!(
+            mesh_peer_request(&a, &addr, path, envelope).await.0,
+            StatusCode::FORBIDDEN
+        );
+    }
+    for (source, label, advertised, expected) in [
+        (&a, "different-relay", a.relay_hint(), StatusCode::FORBIDDEN),
+        (
+            &a,
+            sender,
+            other_endpoint.relay_hint(),
+            StatusCode::FORBIDDEN,
+        ),
+        (&a, sender, a.relay_hint(), StatusCode::OK),
+        (
+            &other_endpoint,
+            sender,
+            other_endpoint.relay_hint(),
+            StatusCode::FORBIDDEN,
+        ),
+    ] {
         let message = PeerEnvelope::new(
-            label,
+            sender,
             PeerMessage::RelayJoin {
                 relay_id: label.into(),
-                url: "http://127.0.0.1:8080".into(),
+                address: PeerAddress::iroh(advertised, None),
             },
         );
-        let request = Request::post("/_peer/join")
-            .header("content-type", "application/json")
-            .body(Body::from(serde_json::to_vec(&message).unwrap()))
-            .unwrap();
-        let response = bounded(a.transport.send_request(MeshLane::Control, &addr, request))
-            .await
-            .unwrap();
-        assert_eq!(response.status().as_u16(), expected);
-        bounded(response.into_body().collect()).await.unwrap();
+        let (status, body) = mesh_peer_request(source, &addr, "/_peer/join", &message).await;
+        assert_eq!(status, expected);
+        if status == StatusCode::OK {
+            let envelope: FullSyncEnvelope = serde_json::from_slice(&body).unwrap();
+            assert_eq!(envelope.protocol_version, PROTOCOL_VERSION);
+            let snapshot = ValidatedFullSync::try_from(envelope).unwrap();
+            let membership = snapshot
+                .peers()
+                .iter()
+                .find(|peer| peer.relay_id == sender)
+                .unwrap();
+            assert_eq!(
+                membership.address.endpoint_id(),
+                Some(a.transport.endpoint_id())
+            );
+        }
     }
+    for (path, envelope) in peer_requests {
+        assert_eq!(
+            mesh_peer_request(&other_endpoint, &addr, path, envelope)
+                .await
+                .0,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            mesh_peer_request(&a, &addr, path, envelope).await.0,
+            StatusCode::OK
+        );
+    }
+    assert_eq!(state.list_peers()[0].route_count, 2);
+    assert!(
+        state
+            .list_routes()
+            .iter()
+            .any(|route| route.name == "peer-grid")
+    );
+    other_endpoint.done().await;
 
     let data = bounded(a.transport.connection(MeshLane::Data, &addr))
         .await
@@ -525,6 +754,32 @@ async fn surface_c_isolated_and_refusals_finish_before_stopping_upload() {
     bridge.stop().await.unwrap();
 }
 
+async fn mesh_peer_request(
+    source: &MeshNode,
+    target: &EndpointAddr,
+    path: &str,
+    envelope: &PeerEnvelope,
+) -> (StatusCode, Bytes) {
+    let request = Request::post(path)
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_vec(envelope).unwrap()))
+        .unwrap();
+    let response = bounded(
+        source
+            .transport
+            .send_request(MeshLane::Control, target, request),
+    )
+    .await
+    .unwrap();
+    (
+        response.status(),
+        bounded(response.into_body().collect())
+            .await
+            .unwrap()
+            .to_bytes(),
+    )
+}
+
 #[test]
 fn relay_server_owns_mesh_lifetime_and_reuses_endpoint_identity() {
     let dir = tempfile::tempdir().unwrap();
@@ -543,6 +798,9 @@ fn relay_server_owns_mesh_lifetime_and_reuses_endpoint_identity() {
         relay.state_for_test().relay_id(),
         RelayConfig::derive_iroh_relay_id(id.as_bytes())
     );
+    let address = relay.state_for_test().local_peer_address();
+    assert!(address.http_url.is_none());
+    assert_eq!(address.endpoint_id(), Some(id));
     let endpoint = relay.iroh_transport().unwrap().endpoint.clone();
     relay.stop().unwrap();
     assert!(endpoint.is_closed());

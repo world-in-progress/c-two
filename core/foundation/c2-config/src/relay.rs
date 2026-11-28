@@ -131,9 +131,16 @@ impl RelayConfig {
         if self.bridge_token.is_some() && self.bridge_token == self.cluster_secret {
             return Err("--cluster-secret and --bridge-token must differ".into());
         }
-        for seed in self.seeds.iter().filter(|seed| seed.starts_with("iroh://")) {
-            if IrohSeedAddr::parse(seed)?.direct_addr.is_none() && self.bridge.is_none() {
-                return Err("iroh seeds without --bridge require a direct @<SocketAddr>".into());
+        if self.iroh_enabled() {
+            for seed in &self.seeds {
+                if !seed.starts_with("iroh://") {
+                    return Err("iroh relays require iroh:// --seeds".into());
+                }
+                if IrohSeedAddr::parse(seed)?.direct_addr.is_none() && self.bridge.is_none() {
+                    return Err(
+                        "iroh seeds without --bridge require a direct @<SocketAddr>".into(),
+                    );
+                }
             }
         }
         Ok(bridge)
@@ -291,7 +298,7 @@ impl RelayConfig {
         format!("{scheme}://{addr}")
     }
 
-    /// Mesh 8 control endpoints are served by the loopback listener.
+    /// Base URL used by HTTP mesh peers.
     pub fn mesh_url(&self) -> String {
         if self.edge_bind.is_none() {
             self.effective_advertise_url()
@@ -349,5 +356,19 @@ mod tests {
         assert!(!relay_id.contains('/'));
         assert!(!relay_id.contains('\n'));
         crate::validate_relay_id(&relay_id).unwrap();
+    }
+
+    #[test]
+    fn iroh_relay_rejects_http_seeds() {
+        let config = RelayConfig {
+            cluster_secret: Some("mesh-secret".into()),
+            seeds: vec!["http://127.0.0.1:8081".into()],
+            ..RelayConfig::default()
+        };
+
+        let err = config
+            .validate()
+            .expect_err("iroh relay should reject http:// seeds");
+        assert!(err.contains("iroh://"));
     }
 }

@@ -848,7 +848,9 @@ pub fn wait_relay_target(fixture: &Fixture, url: &str, owner: &str) {
             .unwrap()
             .block_on(control.resolve_matching_async(&expected));
         match resolved {
-            Ok(routes) => routes.iter().any(|route| route.relay_url == owner),
+            Ok(routes) => routes
+                .iter()
+                .any(|route| route.relay_url.as_deref() == Some(owner)),
             Err(c2_http::client::HttpError::ServerError(404, body)) => {
                 let envelope = serde_json::from_str(&body)
                     .expect("relay resolve must return a structured error");

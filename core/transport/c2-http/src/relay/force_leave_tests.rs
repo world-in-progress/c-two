@@ -12,8 +12,8 @@ use tower::ServiceExt;
 use super::authority::RouteAuthority;
 use super::disseminator::{Disseminator, FullBroadcast};
 use super::peer::{
-    DigestEntry, PROTOCOL_VERSION, PeerEnvelope, PeerMessage, ValidatedRouteStateEnvelope,
-    validate_route_state_envelope,
+    DigestEntry, PROTOCOL_VERSION, PeerEnvelope, PeerMessage, PeerSender,
+    ValidatedRouteStateEnvelope, validate_route_state_envelope,
 };
 use super::router::build_local_router;
 use super::state::RelayState;
@@ -51,7 +51,7 @@ fn state(id: &str) -> (Arc<RelayState>, Arc<RecordingDisseminator>) {
 fn peer(state: &RelayState, id: &str, status: PeerStatus) {
     state.register_peer(PeerInfo {
         relay_id: id.into(),
-        url: format!("http://{id}:8080"),
+        address: PeerAddress::http(format!("http://{id}:8080")),
         route_count: 0,
         last_heartbeat: Instant::now(),
         status,
@@ -62,7 +62,7 @@ fn route(name: &str, owner: &str, locality: Locality) -> RouteEntry {
     RouteEntry {
         name: name.into(),
         relay_id: owner.into(),
-        relay_url: format!("http://{owner}:8080"),
+        address: PeerAddress::http(format!("http://{owner}:8080")),
         server_id: (locality == Locality::Local).then(|| format!("server-{owner}")),
         server_instance_id: (locality == Locality::Local).then(|| format!("instance-{owner}")),
         ipc_address: (locality == Locality::Local).then(|| format!("ipc://{owner}")),
@@ -123,7 +123,7 @@ async fn post(state: Arc<RelayState>, path: &str, body: &str) -> (StatusCode, St
 }
 
 fn force_message(sender: &str, target: &str) -> String {
-    serde_json::json!({"protocol_version":8,"sender_relay_id":sender,
+    serde_json::json!({"protocol_version":9,"sender_relay_id":sender,
         "message":{"type":"RelayForceLeave","relay_id":target}})
     .to_string()
 }
@@ -252,7 +252,7 @@ async fn force_leave_admin_status_body_and_no_broadcast_on_rejection() {
 #[test]
 fn force_leave_wire_validation_distinguishes_deployer_from_graceful_leave() {
     let message: PeerEnvelope = serde_json::from_str(&force_message("relay-a", "relay-c")).unwrap();
-    assert_eq!(PROTOCOL_VERSION, 8);
+    assert_eq!(PROTOCOL_VERSION, 9);
     assert!(validate_route_state_envelope(message.clone(), Some("relay-a")).is_ok());
     let wire = serde_json::to_string(&message).unwrap();
     assert_eq!(
@@ -267,7 +267,7 @@ fn force_leave_wire_validation_distinguishes_deployer_from_graceful_leave() {
         let envelope = serde_json::from_str(&force_message(sender, target)).unwrap();
         assert!(validate_route_state_envelope(envelope, None).is_err());
     }
-    for version in [7, 9] {
+    for version in [8, 10] {
         let mut envelope = message.clone();
         envelope.protocol_version = version;
         assert!(validate_route_state_envelope(envelope, None).is_err());
@@ -387,13 +387,13 @@ async fn force_leave_digest_cannot_restore_state_from_another_owner() {
     post(a.clone(), "/_peer/digest", &body).await;
     // Even a peer that sends a third party's valid fields cannot restore it.
     let entry = route("grid", "relay-c", Locality::Peer);
-    let foreign = serde_json::json!({"protocol_version":8,"sender_relay_id":"relay-b","message":{
+    let foreign = serde_json::json!({"protocol_version":9,"sender_relay_id":"relay-b","message":{
         "type":"DigestDiff","entries":[{"state":"Active","name":entry.name,"relay_id":entry.relay_id,
-        "relay_url":entry.relay_url,"crm_ns":entry.crm_ns,"crm_name":entry.crm_name,"crm_ver":entry.crm_ver,
+        "address":entry.address,"crm_ns":entry.crm_ns,"crm_name":entry.crm_name,"crm_ver":entry.crm_ver,
         "abi_hash":entry.abi_hash,"signature_hash":entry.signature_hash,"max_payload_size":1024,
-        "route_uid":entry.route_uid,"registered_at":1000.0}]}});
+        "registered_at":1000.0}]}});
     post(a.clone(), "/_peer/digest", &foreign.to_string()).await;
-    let deleted = serde_json::json!({"protocol_version":8,"sender_relay_id":"relay-b","message":{
+    let deleted = serde_json::json!({"protocol_version":9,"sender_relay_id":"relay-b","message":{
         "type":"DigestDiff","entries":[{"state":"Deleted","name":"gone","relay_id":"relay-c","removed_at":1001.0}]}});
     post(a.clone(), "/_peer/digest", &deleted.to_string()).await;
     post(
@@ -677,9 +677,9 @@ async fn force_leave_three_relay_mesh(c_has_seed: bool) {
     })
     .await;
     let mut grid = route("grid", "relay-c", Locality::Local);
-    grid.relay_url = c.url.clone();
+    grid.address = PeerAddress::http(&c.url);
     let mut still = route("still", "relay-c", Locality::Local);
-    still.relay_url = c.url.clone();
+    still.address = PeerAddress::http(&c.url);
     c.state.with_route_table_mut(|table| {
         table.register_route(grid.clone());
         table.register_route(still.clone());
@@ -834,7 +834,7 @@ async fn force_leave_three_relay_mesh(c_has_seed: bool) {
         };
         for entry in entries {
             RouteAuthority::new(&node.state)
-                .apply_digest_diff("relay-c", entry)
+                .apply_digest_diff(PeerSender::http("relay-c"), entry)
                 .unwrap();
         }
     }
@@ -856,7 +856,8 @@ async fn force_leave_three_relay_mesh(c_has_seed: bool) {
             .iter()
             .find(|peer| peer.relay_id == "relay-c")
             .unwrap()
-            .url,
+            .address
+            .display_target(),
         c.url
     );
     assert!(
@@ -885,19 +886,30 @@ async fn force_leave_dead_peer_probe_rejoins_before_digest_without_merging_snaps
         Json, Router,
         routing::{get, post},
     };
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = PeerAddress::http(format!("http://{}", listener.local_addr().unwrap()));
     let order = Arc::new(Mutex::new(Vec::new()));
     let digest_received = Arc::new(tokio::sync::Semaphore::new(0));
     let snapshot = FullSyncEnvelope {
         protocol_version: PROTOCOL_VERSION,
+        sender_relay_id: "relay-b".into(),
         snapshot: FullSyncSnapshot {
             routes: vec![],
             tombstones: vec![],
-            peers: vec![PeerSnapshot {
-                relay_id: "relay-foreign".into(),
-                url: "http://relay-foreign:8080".into(),
-                route_count: 0,
-                status: PeerStatus::Alive,
-            }],
+            peers: vec![
+                PeerSnapshot {
+                    relay_id: "relay-b".into(),
+                    address: PeerAddress::http("http://changed-address:8080"),
+                    route_count: 99,
+                    status: PeerStatus::Alive,
+                },
+                PeerSnapshot {
+                    relay_id: "relay-foreign".into(),
+                    address: PeerAddress::http("http://relay-foreign:8080"),
+                    route_count: 0,
+                    status: PeerStatus::Alive,
+                },
+            ],
         },
     };
     // The response really is a valid bootstrap snapshot; failure to learn this
@@ -927,8 +939,8 @@ async fn force_leave_dead_peer_probe_rejoins_before_digest_without_merging_snaps
                     assert_eq!(envelope.sender_relay_id, "relay-c");
                     assert_eq!(envelope.protocol_version, PROTOCOL_VERSION);
                     assert!(
-                        matches!(envelope.message, PeerMessage::RelayJoin { relay_id, url }
-                    if relay_id == "relay-c" && url == "http://relay-c:8080")
+                        matches!(envelope.message, PeerMessage::RelayJoin { relay_id, address }
+                    if relay_id == "relay-c" && address.display_target() == "http://relay-c:8080")
                     );
                     order.lock().unwrap().push("join");
                     Json(snapshot)
@@ -955,8 +967,6 @@ async fn force_leave_dead_peer_probe_rejoins_before_digest_without_merging_snaps
                 }
             }),
         );
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let url = format!("http://{}", listener.local_addr().unwrap());
     let http = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     let state = Arc::new(RelayState::new(
         Arc::new(RelayConfig {
@@ -970,7 +980,7 @@ async fn force_leave_dead_peer_probe_rejoins_before_digest_without_merging_snaps
     ));
     state.register_peer(PeerInfo {
         relay_id: "relay-b".into(),
-        url,
+        address: address.clone(),
         route_count: 0,
         last_heartbeat: Instant::now(),
         status: PeerStatus::Dead,
@@ -986,9 +996,12 @@ async fn force_leave_dead_peer_probe_rejoins_before_digest_without_merging_snaps
     for task in tasks {
         task.await.unwrap();
     }
-    assert_eq!(*order.lock().unwrap(), ["health", "join", "digest"]);
+    assert_eq!(*order.lock().unwrap(), ["join", "digest"]);
     assert!(state.peer_is_alive("relay-b"));
     assert!(!state.has_peer("relay-foreign"));
+    let peers = state.list_peers();
+    assert_eq!(peers[0].route_count, 0);
+    assert_eq!(peers[0].address, address);
     http.abort();
     assert!(http.await.unwrap_err().is_cancelled());
 }

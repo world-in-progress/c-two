@@ -445,7 +445,8 @@ fn local_candidate(
 ) -> RelayRouteInfo {
     RelayRouteInfo {
         name: expected.route_name.clone(),
-        relay_url: "http://127.0.0.1:9".to_string(),
+        relay_url: Some("http://127.0.0.1:9".to_string()),
+        proxy_via_anchor: false,
         ipc_address: Some(address),
         server_id: Some(server_id),
         server_instance_id: Some(server_instance_id),
@@ -622,7 +623,7 @@ fn explicit_relay_uses_the_http_data_plane_even_when_local_ipc_is_valid() {
         identity.server_id,
         identity.server_instance_id,
     );
-    route.relay_url = data_plane.url.clone();
+    route.relay_url = Some(data_plane.url.clone());
     let registry = registry_server(route, resolve_count.clone());
 
     let client = runtime
@@ -900,7 +901,8 @@ fn relay_aware_selects_an_independent_http_path_when_no_local_candidate_exists()
     let registry = registry_server(
         RelayRouteInfo {
             name: expected.route_name.clone(),
-            relay_url: data_plane.url.clone(),
+            relay_url: Some(data_plane.url.clone()),
+            proxy_via_anchor: false,
             ipc_address: None,
             server_id: None,
             server_instance_id: None,
@@ -942,7 +944,8 @@ fn a_not_found_post_is_pre_dispatch_and_the_next_call_refreshes_the_route() {
     let registry = registry_server(
         RelayRouteInfo {
             name: expected.route_name.clone(),
-            relay_url: data_plane.url.clone(),
+            relay_url: Some(data_plane.url.clone()),
+            proxy_via_anchor: false,
             ipc_address: None,
             server_id: None,
             server_instance_id: None,
@@ -1042,9 +1045,8 @@ fn assert_http_refusal_reacquisition(code: ErrorCode) {
                                 (
                                     match code {
                                         ErrorCode::ResourceRemoved => StatusCode::GONE,
-                                        ErrorCode::ContractMismatch | ErrorCode::IdentityMismatch => {
-                                            StatusCode::CONFLICT
-                                        }
+                                        ErrorCode::ContractMismatch
+                                        | ErrorCode::IdentityMismatch => StatusCode::CONFLICT,
                                         ErrorCode::ProtocolViolation => StatusCode::BAD_GATEWAY,
                                         _ => StatusCode::SERVICE_UNAVAILABLE,
                                     },
@@ -1080,7 +1082,8 @@ fn assert_http_refusal_reacquisition(code: ErrorCode) {
     let registry = registry_server(
         RelayRouteInfo {
             name: expected.route_name.clone(),
-            relay_url: data.url.clone(),
+            relay_url: Some(data.url.clone()),
+            proxy_via_anchor: false,
             ipc_address: None,
             server_id: None,
             server_instance_id: None,
@@ -1454,7 +1457,8 @@ fn http_probe_refusals_do_not_use_the_runtime_payload_budget() {
     let registry = registry_server(
         RelayRouteInfo {
             name: expected.route_name.clone(),
-            relay_url: data_plane.url.clone(),
+            relay_url: Some(data_plane.url.clone()),
+            proxy_via_anchor: false,
             ipc_address: None,
             server_id: None,
             server_instance_id: None,

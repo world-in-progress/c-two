@@ -2,7 +2,7 @@
 
 C3 **0.8.0** accompanies C-Two **0.12.x**, sharing its IPC 17, SHM 4, C/FFI ABI 9, relay mesh 7, Unix namespace format 3 and endpoint maintenance behavior. See the [0.12.0 release notes](../docs/releases/0.12.0.md).
 
-Current source builds use IPC 18, C/FFI ABI 10 and relay mesh 8. `c3 relay` forwards keyed unary submission, recovery and outcome queries over the fixed HTTP endpoints defined in [ADR 0007](../docs/decisions/0007-call-metadata-and-admission-hooks.md).
+Current source builds use IPC 18, C/FFI ABI 10 and relay mesh 9. `c3 relay` forwards keyed unary submission, recovery and outcome queries over the fixed HTTP endpoints defined in [ADR 0007](../docs/decisions/0007-call-metadata-and-admission-hooks.md).
 
 Python does not own CLI behavior; do not add command behavior under `sdk/python/src/c_two`. `cli/` contains the Rust crate for `c3`, the native C-Two command-line interface. It starts relay servers and inspects relay registry state for C-Two deployments.
 
@@ -102,7 +102,7 @@ Start a relay:
 c3 relay --bind 127.0.0.1:8080
 ```
 
-The loopback listener serves Host registration, administration, local Mesh 8 peers, discovery and RPC. Add `--edge-bind` for external clients or a reverse proxy. The edge listener serves discovery and RPC without exposing local IPC addresses or server instance identity, even on a loopback bind.
+The loopback listener serves Host registration, administration, local Mesh 9 peers, discovery and RPC. Add `--edge-bind` for external clients or a reverse proxy. The edge listener serves discovery and RPC without exposing local IPC addresses or server instance identity, even on a loopback bind.
 
 Useful options:
 
@@ -115,7 +115,7 @@ Useful options:
 | `--tls-san` | `C2_RELAY_TLS_SAN` | empty | Comma-separated additional DNS names and IP addresses for automatic TLS. |
 | `--state-dir` | `C2_RELAY_STATE_DIR` | `~/.c3-relay` | Private directory for generated edge TLS credentials and the mesh endpoint key. Create its parent before startup. |
 | `--insecure-plaintext` | `C2_RELAY_INSECURE_PLAINTEXT` | false | Explicitly allow a non-loopback plaintext edge. |
-| `--seeds`, `-s` | `C2_RELAY_SEEDS` | empty | Comma-separated HTTP URLs or iroh seed addresses. |
+| `--seeds`, `-s` | `C2_RELAY_SEEDS` | empty | Comma-separated loopback HTTP URLs or `iroh://<endpoint-id>[@<ip:port>]` seed addresses. |
 | `--bridge` | `C2_RELAY_BRIDGE` | unset | Private HTTPS bridge URL with optional certificate pin and QUIC address discovery port. |
 | `--bridge-token` | `C2_RELAY_BRIDGE_TOKEN` | unset | Required with a bridge. Printable ASCII without whitespace. |
 | `--cluster-secret` | `C2_RELAY_CLUSTER_SECRET` | unset | Shared secret for iroh peer authentication. Required with a bridge or iroh seed and distinct from the bridge token. |
@@ -176,7 +176,11 @@ Start the bridge, copy the printed `--bridge` URL, replace `<HOST>` with a reach
 
 A relay uses `--bridge 'https://host:8443?pin=<64-lower-hex>&quic=off'` with the bridge token. Omit `pin` for a publicly trusted certificate. The default address discovery port is 7842. Set `quic=<port>` for another port or `quic=off` to disable it. Keep the cluster secret on the relays so they can authenticate each other end to end. Relay dry-run reports both credentials as set or unset.
 
-Relay startup stores `mesh-key.ed25519` in its private state directory and prints an `iroh://<endpoint-id>` seed. A direct seed without a bridge requires `@<ip:port>`. The endpoint serves authenticated control and data requests on separate QUIC connections. The current Mesh 8 route table still bootstraps and exchanges routes over HTTP seeds. Mesh 8 peer messages over iroh must use the sender ID derived from the endpoint key.
+Relay startup stores `mesh-key.ed25519` in its private state directory and prints an `iroh://<endpoint-id>` seed for other relays. With a shared bridge, the endpoint ID is sufficient to reach a relay behind NAT. For a direct seed without a bridge, append a reachable `@<ip:port>` hint. The default relay ID derives from the persistent endpoint key, so keep the state directory across restarts.
+
+Mesh 9 bootstraps and exchanges routes over authenticated iroh connections across machines. Relays use their shared cluster secret to authenticate each other and keep peer control and RPC data on separate QUIC connections. iroh prefers a direct UDP path and forwards encrypted traffic through the bridge over HTTPS/WebSocket when direct connectivity fails. HTTP seeds and `/_peer/*` are available on the loopback control listener for local meshes. [ADR 0008](../docs/decisions/0008-relay-tls-http2-and-iroh-mesh.md)
+
+SDK clients need only the HTTP(S) URL of a relay anchor. If a route is reachable only over iroh, or the edge directs the client through the anchor, discovery sets `proxy_via_anchor: true`. The client uses its configured anchor URL, including any reverse proxy path prefix and TLS trust. The anchor forwards to the route owner, which connects to the Host over IPC. [Relay discovery and forwarding](../docs/reference/contracts-and-routing.md#relay-discovery-and-forwarding)
 
 ## Local endpoint maintenance
 
@@ -206,13 +210,15 @@ List registered routes:
 c3 registry list-routes --relay http://127.0.0.1:8080
 ```
 
-Each line names one registration: the route name, the relay that holds it and its URL, the registration time, and that relay's status as this relay sees it (Alive, Suspect or Dead). A line ends with `route conflict` when more than one live registration of the name exists; new acquisitions of such a name fail with `RouteConflict` until the deployer unregisters one copy. A name whose registrations are all on Suspect or Dead relays stays held: it does not resolve and cannot be registered elsewhere until that relay comes back and withdraws it, or the deployer force-leaves the relay below. A Host that ended without unregistering keeps its name at its relay; withdraw it there with `POST /_admin/unregister` and a JSON body with `name` and `server_id`, and the relay passes the withdrawal on to its peers.
+Each line names one registration: the route name, the relay that holds it and its address, the registration time, and that relay's status as this relay sees it (Alive, Suspect or Dead). A line ends with `route conflict` when more than one live registration of the name exists; new acquisitions of such a name fail with `RouteConflict` until the deployer unregisters one copy. A name whose registrations are all on Suspect or Dead relays stays held: it does not resolve and cannot be registered elsewhere until that relay comes back and withdraws it, or the deployer force-leaves the relay below. A Host that ended without unregistering keeps its name at its relay; withdraw it there with `POST /_admin/unregister` and a JSON body with `name` and `server_id`, and the relay passes the withdrawal on to its peers.
 
 List known mesh peers:
 
 ```bash
 c3 registry peers --relay http://127.0.0.1:8080
 ```
+
+Both listings display the relay’s HTTP URL when available, or `iroh://<endpoint-id>` for an iroh-only address. The iroh address is for relay peering. Use the anchor’s HTTP(S) URL for SDK clients.
 
 Force an unreachable relay to leave the mesh:
 

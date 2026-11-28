@@ -230,7 +230,8 @@ fn loopback_edge_omits_local_control_and_ipc_discovery() {
                 .send().await.unwrap().error_for_status().unwrap();
             let routes: Vec<crate::client::RelayRouteInfo> = response.json().await.unwrap();
             assert_eq!(routes.len(), 1);
-            assert_eq!(routes[0].relay_url, base);
+            assert_eq!(routes[0].relay_url.as_deref(), expose.then_some(base.as_str()));
+            assert_eq!(routes[0].proxy_via_anchor, !expose);
             assert_eq!(routes[0].ipc_address.as_deref(), expose.then_some("ipc://grid"));
             assert_eq!(routes[0].server_id.as_deref(), expose.then_some("grid"));
             assert_eq!(routes[0].server_instance_id.as_deref(), expose.then_some("test-instance"));

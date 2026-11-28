@@ -31,7 +31,7 @@ The capacity variables apply independently to each active role domain. `M` is th
 | `C2_RELAY_INSECURE_PLAINTEXT` | `false` | `--insecure-plaintext` |
 | `C2_RELAY_ID` | Generated | `c3 relay --relay-id` |
 | `C2_RELAY_ADVERTISE_URL` | Derived from the active listener and transport | `c3 relay --advertise-url` |
-| `C2_RELAY_SEEDS` | Empty | `c3 relay --seeds` / `-s`, comma-separated HTTP URLs or iroh seed addresses |
+| `C2_RELAY_SEEDS` | Empty | `c3 relay --seeds` / `-s`, comma-separated loopback HTTP URLs or iroh seed addresses |
 | `C2_RELAY_BRIDGE` | Unset | `c3 relay --bridge`, private HTTPS bridge URL |
 | `C2_RELAY_BRIDGE_TOKEN` | Unset | `c3 relay --bridge-token`, required with a bridge |
 | `C2_RELAY_CLUSTER_SECRET` | Unset | `c3 relay --cluster-secret`, required with iroh |
@@ -70,7 +70,7 @@ The control listener accepts loopback addresses only. The optional edge listener
 
 `c3 bridge` provides rendezvous and encrypted packet forwarding over HTTPS, with QUIC address discovery on UDP port 7842 by default. It stores its generated certificate `bridge-cert.pem`, key `bridge-key.pem` and `bridge-token` in a private state directory. The bridge token grants access to the bridge. The distinct cluster secret stays on the relay endpoints for mutual authentication. Startup prints the bridge URL and token. Dry-run reports whether credentials were configured and creates no files or sockets. [c3 bridge](../../cli/README.md#bridge)
 
-A bridge URL looks like `https://host:8443?pin=<64-lower-hex>&quic=off`. Pin generated certificates by their SHA-256 leaf DER fingerprint. Omitting the pin uses WebPKI trust. Omitting `quic` selects 7842. Set another port or `off` as needed. A bridge, cluster secret or `iroh://` seed enables iroh. A seed without a bridge needs an `@<ip:port>` hint. The relay stores `mesh-key.ed25519` under `~/.c3-relay` or the configured state directory and derives an ID from the endpoint key unless a relay ID was explicitly configured. iroh control and data requests use independent QUIC connections. The current Mesh 8 route table still bootstraps and exchanges routes over HTTP seeds. Mesh 8 peer messages over iroh must use the sender ID derived from the endpoint key.
+A bridge URL looks like `https://host:8443?pin=<64-lower-hex>&quic=off`. Pin generated certificates by their SHA-256 leaf DER fingerprint. Omitting the pin uses WebPKI trust. Omitting `quic` selects 7842. Set another port or `off` as needed. A bridge, cluster secret or `iroh://` seed enables iroh. A seed without a bridge needs an `@<ip:port>` hint. The relay stores `mesh-key.ed25519` under `~/.c3-relay` or the configured state directory and derives an ID from the endpoint key unless a relay ID was explicitly configured. iroh control and data requests use independent QUIC connections. Relays use Mesh 9 to join and exchange routes over iroh across machines. Use the printed `iroh://<endpoint-id>` seed with the same bridge, or `iroh://<endpoint-id>@<ip:port>` with a reachable address for direct dialing. HTTP seeds serve loopback meshes. Configure SDKs with an HTTP(S) relay anchor. When discovery returns `proxy_via_anchor: true`, SDKs retain that URL and its TLS trust while the anchor forwards to the route owner. [ADR 0008](../decisions/0008-relay-tls-http2-and-iroh-mesh.md)
 
 ## Fixed transport constants
 

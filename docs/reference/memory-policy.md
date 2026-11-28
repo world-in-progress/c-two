@@ -87,6 +87,8 @@ c3 relay --memory-budget-bytes 134217728 --file-spill-budget-bytes 268435456 --c
 
 The relay reserves its input and both windows in one admission step. The entry reservation supplies a `ReusableWindow` for the response. Each slice keeps its portion of the window until its `Bytes` owner releases it, and the next slice can reuse that space without taking a fresh reservation from the shared domain. This applies to multi-chunk unary responses and stream items. The full window reservation returns to `M` once the response and its outstanding slices release it. This allows download to progress while the forward still owns the upstream response. [Relay forwarding](contracts-and-routing.md#relay-payload-forwarding)
 
+When an anchor forwards a peer call, its streaming upload and download windows charge the anchor’s own relay domain. Each window bounds how far that hop can read ahead. The source relay admits the call against its own domain before reaching the Host. [Relay forwarding](contracts-and-routing.md#relay-payload-forwarding)
+
 A relay's topic hub composes each upstream frame once into a single shared immutable frame, charged once to the relay domain's `M` and `F` regardless of how many downstream subscribers fan out from it; the upstream is one shared IPC 18 subscription with the internal `skip` policy, so a slow downstream never withholds upstream progress. Under budget pressure the hub sheds disposable history first, then skips frames no downstream has begun, and only then terminates a stalled TCP downstream singly at a record boundary. [Relay topic forwarding](contracts-and-routing.md#relay-topic-forwarding)
 
 ## Statistics and payload lifetime

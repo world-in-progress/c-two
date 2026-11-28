@@ -12,13 +12,12 @@ use tokio_util::sync::CancellationToken;
 
 use crate::relay::authority::RouteAuthority;
 use crate::relay::peer::{
-    DigestEntry, PeerEnvelope, PeerMessage, ValidatedRouteStateEnvelope,
+    DigestEntry, PeerEnvelope, PeerMessage, PeerSender, ValidatedRouteStateEnvelope,
     validate_route_state_envelope,
 };
 use crate::relay::route_table::TombstoneGcEntry;
 use crate::relay::state::RelayState;
 use crate::relay::types::*;
-use crate::relay::url::peer_endpoint_url;
 
 /// Spawn all periodic background tasks based on config.
 /// Returns handles so the caller can await them on shutdown.
@@ -53,7 +52,7 @@ pub fn spawn_background_tasks(
         handles.push(tokio::spawn(dead_peer_probe_loop(s, c)));
     }
 
-    if config.seeds.iter().any(|seed| !seed.starts_with("iroh://")) {
+    if !config.seeds.is_empty() {
         let s = state.clone();
         let c = cancel.clone();
         handles.push(tokio::spawn(seed_retry_loop(s, c)));
@@ -177,61 +176,36 @@ async fn failure_detection_loop(state: Arc<RelayState>, cancel: CancellationToke
 
 /// Round-robin anti-entropy digest exchange with one alive peer per tick.
 async fn anti_entropy_loop(state: Arc<RelayState>, cancel: CancellationToken) {
-    let interval = c2_config::RELAY_ANTI_ENTROPY_INTERVAL;
-    let mut ticker = tokio::time::interval(interval);
+    let mut ticker = tokio::time::interval(c2_config::RELAY_ANTI_ENTROPY_INTERVAL);
     ticker.tick().await;
     let mut round_robin_idx: usize = 0;
 
-    let client = crate::relay_client_builder(&c2_config::ResolvedRelayClientConfig {
-        use_proxy: state.config().use_proxy,
-        ..Default::default()
-    })
-    .expect("system relay TLS configuration")
-    .timeout(Duration::from_secs(5))
-    .build()
-    .expect("c-two: failed to build reqwest Client for relay traffic");
-
     loop {
         tokio::select! {
-            _ = cancel.cancelled() => break,
+            _ = cancel.cancelled() => return,
             _ = ticker.tick() => {}
         }
 
-        let alive: Vec<(String, String)> = state.with_route_table(|rt| {
-            rt.alive_peers()
-                .iter()
-                .map(|p| (p.relay_id.clone(), p.url.clone()))
-                .collect()
+        let peer = state.with_route_table(|rt| {
+            let alive = rt.alive_peers();
+            if alive.is_empty() {
+                return None;
+            }
+            let peer = alive[round_robin_idx % alive.len()];
+            Some((peer.relay_id.clone(), peer.address.clone()))
         });
-        if alive.is_empty() {
-            continue;
-        }
-
-        let idx = round_robin_idx % alive.len();
-        round_robin_idx = round_robin_idx.wrapping_add(1);
-        let (peer_id, peer_url) = &alive[idx];
-
-        let digest = build_digest(&state);
-        let envelope = PeerEnvelope::new(state.relay_id(), PeerMessage::DigestExchange { digest });
-
-        let url = peer_endpoint_url(peer_url, "/_peer/digest");
-        if let Ok(resp) = client.post(&url).json(&envelope).send().await
-            && let Ok(resp_env) = resp.json::<PeerEnvelope>().await
-        {
-            let Ok(ValidatedRouteStateEnvelope::DigestDiff(entries)) =
-                validate_route_state_envelope(resp_env, Some(peer_id.as_str()))
-            else {
-                continue;
-            };
-            for diff_entry in entries {
-                let _ = RouteAuthority::new(&state).apply_digest_diff(peer_id, diff_entry);
+        if let Some((peer_id, address)) = peer {
+            round_robin_idx = round_robin_idx.wrapping_add(1);
+            tokio::select! {
+                _ = cancel.cancelled() => return,
+                _ = exchange_digest(&state, &peer_id, &address) => {}
             }
         }
     }
 }
 
-fn build_digest(state: &RelayState) -> Vec<DigestEntry> {
-    state
+async fn exchange_digest(state: &RelayState, peer_id: &str, address: &PeerAddress) {
+    let digest = state
         .route_digest()
         .into_iter()
         .map(|((name, relay_id, deleted), hash)| DigestEntry {
@@ -240,139 +214,168 @@ fn build_digest(state: &RelayState) -> Vec<DigestEntry> {
             deleted,
             hash,
         })
-        .collect()
+        .collect();
+    let envelope = PeerEnvelope::new(state.relay_id(), PeerMessage::DigestExchange { digest });
+    let Some(response) = state
+        .peer_client()
+        .exchange_control(address, "/_peer/digest", &envelope)
+        .await
+    else {
+        return;
+    };
+    let Ok(ValidatedRouteStateEnvelope::DigestDiff(entries)) =
+        validate_route_state_envelope(response, Some(peer_id))
+    else {
+        return;
+    };
+    let sender = PeerSender {
+        relay_id: peer_id,
+        endpoint_id: address.endpoint_id(),
+    };
+    let authority = RouteAuthority::new(state);
+    for entry in entries {
+        let _ = authority.apply_digest_diff(sender, entry);
+    }
 }
 
-/// Probe dead peers with health checks; rejoin and exchange digest on recovery.
+fn join_envelope(state: &RelayState) -> PeerEnvelope {
+    PeerEnvelope::new(
+        state.relay_id(),
+        PeerMessage::RelayJoin {
+            relay_id: state.relay_id().to_string(),
+            address: state.local_peer_address(),
+        },
+    )
+}
+
+async fn request_join(state: &RelayState, address: &PeerAddress) -> Option<ValidatedFullSync> {
+    let response: FullSyncEnvelope = state
+        .peer_client()
+        .exchange_control(address, "/_peer/join", &join_envelope(state))
+        .await?;
+    ValidatedFullSync::try_from(response).ok()
+}
+
+/// Re-establish membership with a dead peer before applying its digest.
+async fn recover_dead_peer(state: &RelayState, relay_id: &str, address: &PeerAddress) {
+    let Some(snapshot) = request_join(state, address).await else {
+        return;
+    };
+    let accepted = snapshot.sender_relay_id() == relay_id
+        && snapshot
+            .peers()
+            .iter()
+            .any(|peer| matches_recovered_peer(peer, relay_id, address));
+    if accepted && state.with_route_table_mut(|rt| rt.record_peer_probe_success(relay_id, address))
+    {
+        exchange_digest(state, relay_id, address).await;
+    }
+}
+
+fn matches_recovered_peer(peer: &PeerSnapshot, relay_id: &str, address: &PeerAddress) -> bool {
+    peer.relay_id == relay_id
+        && peer.status == PeerStatus::Alive
+        && address
+            .endpoint_id_str()
+            .is_none_or(|endpoint_id| peer.address.endpoint_id_str() == Some(endpoint_id))
+}
+
 async fn dead_peer_probe_loop(state: Arc<RelayState>, cancel: CancellationToken) {
-    let interval = state.config().dead_peer_probe_interval;
-    let mut ticker = tokio::time::interval(interval);
+    let mut ticker = tokio::time::interval(state.config().dead_peer_probe_interval);
     ticker.tick().await;
-
-    let client = crate::relay_client_builder(&c2_config::ResolvedRelayClientConfig {
-        use_proxy: state.config().use_proxy,
-        ..Default::default()
-    })
-    .expect("system relay TLS configuration")
-    .timeout(Duration::from_secs(5))
-    .build()
-    .expect("c-two: failed to build reqwest Client for relay traffic");
-
     loop {
         tokio::select! {
-            _ = cancel.cancelled() => break,
+            _ = cancel.cancelled() => return,
             _ = ticker.tick() => {}
         }
 
-        let dead: Vec<(String, String)> = state.with_route_table(|rt| {
+        let dead: Vec<_> = state.with_route_table(|rt| {
             rt.dead_peers()
                 .iter()
-                .map(|p| (p.relay_id.clone(), p.url.clone()))
+                .map(|peer| (peer.relay_id.clone(), peer.address.clone()))
                 .collect()
         });
-
-        for (relay_id, url) in dead {
-            let health_url = peer_endpoint_url(&url, "/health");
-            let probe_ok = match client.get(&health_url).send().await {
-                Ok(resp) => resp.status().is_success(),
-                Err(_) => false,
-            };
-            if probe_ok {
-                // The peer may have forgotten us through force-leave. Rejoin
-                // before exchanging state; its snapshot is for seed bootstrap
-                // only and must not be merged on this recovery path.
-                let join = PeerEnvelope::new(
-                    state.relay_id(),
-                    PeerMessage::RelayJoin {
-                        relay_id: state.relay_id().to_string(),
-                        url: state.config().mesh_url(),
-                    },
-                );
-                let join_url = peer_endpoint_url(&url, "/_peer/join");
-                if !matches!(client.post(&join_url).json(&join).send().await,
-                    Ok(response) if response.status().is_success())
-                {
-                    continue;
-                }
-                // Peer is back — mark alive
-                state.with_route_table_mut(|rt| {
-                    rt.record_peer_probe_success(&relay_id);
-                });
-
-                // Immediate digest exchange with recovered peer
-                let digest = build_digest(&state);
-                let envelope =
-                    PeerEnvelope::new(state.relay_id(), PeerMessage::DigestExchange { digest });
-                let digest_url = peer_endpoint_url(&url, "/_peer/digest");
-                if let Ok(resp) = client.post(&digest_url).json(&envelope).send().await
-                    && let Ok(resp_env) = resp.json::<PeerEnvelope>().await
-                {
-                    let Ok(ValidatedRouteStateEnvelope::DigestDiff(entries)) =
-                        validate_route_state_envelope(resp_env, Some(relay_id.as_str()))
-                    else {
-                        continue;
-                    };
-                    for diff_entry in entries {
-                        let _ =
-                            RouteAuthority::new(&state).apply_digest_diff(&relay_id, diff_entry);
-                    }
-                }
+        for (relay_id, address) in dead {
+            tokio::select! {
+                _ = cancel.cancelled() => return,
+                _ = recover_dead_peer(&state, &relay_id, &address) => {}
             }
         }
     }
 }
 
+fn seed_address(seed: &str, bridge_url: Option<&str>) -> Option<PeerAddress> {
+    let address = if seed.starts_with("iroh://") {
+        let seed = c2_config::IrohSeedAddr::parse(seed).ok()?;
+        PeerAddress {
+            http_url: None,
+            iroh: Some(IrohPeerAddr {
+                endpoint_id: hex::encode(seed.endpoint_id),
+                bridge_url: bridge_url.map(ToOwned::to_owned),
+                direct_addrs: seed.direct_addr.iter().map(ToString::to_string).collect(),
+            }),
+        }
+    } else {
+        PeerAddress::http(seed)
+    };
+    address.is_valid().then_some(address)
+}
+
+async fn join_seed(state: &RelayState, address: &PeerAddress) -> bool {
+    let Some(snapshot) = request_join(state, address).await else {
+        return false;
+    };
+    let sender_relay_id = snapshot.sender_relay_id();
+    if sender_relay_id == state.relay_id()
+        || !snapshot.peers().iter().any(|peer| {
+            peer.status == PeerStatus::Alive
+                && peer.relay_id == sender_relay_id
+                && peer.address.endpoint_id_str() == address.endpoint_id_str()
+        })
+        || !state.merge_snapshot(snapshot)
+    {
+        return false;
+    }
+
+    state
+        .disseminator()
+        .broadcast(join_envelope(state), &state.list_peers());
+    true
+}
+
 /// Join seeds immediately, then retry while no alive peers exist.
 async fn seed_retry_loop(state: Arc<RelayState>, cancel: CancellationToken) {
     let interval = state.config().seed_retry_interval;
-    let seeds = state.config().seeds.clone();
-    let client = crate::relay_client_builder(&c2_config::ResolvedRelayClientConfig {
-        use_proxy: state.config().use_proxy,
-        ..Default::default()
-    })
-    .expect("system relay TLS configuration")
-    .timeout(Duration::from_secs(5))
-    .build()
-    .expect("c-two: failed to build reqwest Client for relay traffic");
+    let local_address = state.local_peer_address();
+    let bridge_url = local_address
+        .iroh
+        .as_ref()
+        .and_then(|address| address.bridge_url.as_deref());
+    let seeds: Vec<_> = state
+        .config()
+        .seeds
+        .iter()
+        .filter_map(|seed| seed_address(seed, bridge_url))
+        .collect();
 
     loop {
-        // The first join and later retries use the same path.
         let has_alive = state.with_route_table(|rt| !rt.alive_peers().is_empty());
         if !has_alive {
-            for seed_url in seeds.iter().filter(|seed| !seed.starts_with("iroh://")) {
-                let join_url = peer_endpoint_url(seed_url, "/_peer/join");
-                let envelope = PeerEnvelope::new(
-                    state.relay_id(),
-                    PeerMessage::RelayJoin {
-                        relay_id: state.relay_id().to_string(),
-                        url: state.config().mesh_url(),
-                    },
-                );
-                if let Ok(resp) = client.post(&join_url).json(&envelope).send().await
-                    && let Ok(envelope) = resp.json::<FullSyncEnvelope>().await
-                {
-                    let Ok(snapshot) = ValidatedFullSync::try_from(envelope) else {
-                        continue;
-                    };
-                    state.merge_snapshot(snapshot);
-                    let peers = state.list_peers();
-                    let announce = PeerEnvelope::new(
-                        state.relay_id(),
-                        PeerMessage::RelayJoin {
-                            relay_id: state.relay_id().to_string(),
-                            url: state.config().mesh_url(),
-                        },
-                    );
-                    state.disseminator().broadcast(announce, &peers);
+            for address in &seeds {
+                let joined = tokio::select! {
+                    _ = cancel.cancelled() => return,
+                    result = join_seed(&state, address) => result,
+                };
+                if joined {
                     break;
                 }
             }
         }
         if interval.is_zero() {
-            break;
+            return;
         }
         tokio::select! {
-            _ = cancel.cancelled() => break,
+            _ = cancel.cancelled() => return,
             _ = tokio::time::sleep(interval) => {}
         }
     }
@@ -381,7 +384,109 @@ async fn seed_retry_loop(state: Arc<RelayState>, cancel: CancellationToken) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::relay::peer::PROTOCOL_VERSION;
     use crate::relay::route_table::{TombstoneGcEntry, TombstoneGcReason};
+
+    #[test]
+    fn dead_probe_rejects_a_different_iroh_endpoint() {
+        let address = |key: u8| PeerAddress {
+            http_url: None,
+            iroh: Some(IrohPeerAddr {
+                endpoint_id: hex::encode(
+                    iroh::SecretKey::from_bytes(&[key; 32]).public().as_bytes(),
+                ),
+                bridge_url: None,
+                direct_addrs: Vec::new(),
+            }),
+        };
+        let original = address(1);
+        let mut peer = PeerSnapshot {
+            relay_id: "target".into(),
+            address: address(2),
+            route_count: 0,
+            status: PeerStatus::Alive,
+        };
+        assert!(!matches_recovered_peer(&peer, "target", &original));
+        peer.address = original.clone();
+        assert!(matches_recovered_peer(&peer, "target", &original));
+        peer.status = PeerStatus::Dead;
+        assert!(!matches_recovered_peer(&peer, "target", &original));
+    }
+
+    #[tokio::test]
+    async fn dead_probe_requires_200_with_current_snapshot_and_target_relay() {
+        use axum::{Json, Router, http::StatusCode, routing::post};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = PeerAddress::http(format!("http://{}", listener.local_addr().unwrap()));
+        let target = "relay-probe-target";
+        let snapshot = |version, sender_relay_id: &str, peer_relay_id: &str| {
+            serde_json::json!({
+                "protocol_version": version,
+                "sender_relay_id": sender_relay_id,
+                "snapshot": {
+                    "routes": [],
+                    "peers": [{
+                        "relay_id": peer_relay_id, "address": address, "status": "Alive", "route_count": 0
+                    }]
+                }
+            })
+        };
+        let replies = Arc::new(parking_lot::Mutex::new(std::collections::VecDeque::from([
+            (StatusCode::OK, serde_json::json!({"status": "ignored"})),
+            (
+                StatusCode::CREATED,
+                snapshot(PROTOCOL_VERSION, target, target),
+            ),
+            (
+                StatusCode::OK,
+                snapshot(PROTOCOL_VERSION - 1, target, target),
+            ),
+            (
+                StatusCode::OK,
+                snapshot(PROTOCOL_VERSION, "relay-someone-else", "relay-someone-else"),
+            ),
+            // Impostor at the old address whose snapshot still lists target as Alive.
+            (
+                StatusCode::OK,
+                snapshot(PROTOCOL_VERSION, "relay-impostor", target),
+            ),
+            (StatusCode::OK, {
+                let mut body = snapshot(PROTOCOL_VERSION, target, target);
+                body["snapshot"]["peers"][0]["status"] = serde_json::json!("Dead");
+                body
+            }),
+        ])));
+        let app = Router::new().route(
+            "/_peer/join",
+            post({
+                let replies = replies.clone();
+                move || async move {
+                    let (status, body) = replies
+                        .lock()
+                        .pop_front()
+                        .expect("one response per attempt");
+                    (status, Json(body))
+                }
+            }),
+        );
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let state = crate::relay::test_support::test_state_for_client();
+        state.register_peer(PeerInfo {
+            relay_id: target.into(),
+            address: address.clone(),
+            route_count: 3,
+            last_heartbeat: std::time::Instant::now(),
+            status: PeerStatus::Dead,
+        });
+        for _ in 0..6 {
+            recover_dead_peer(&state, target, &address).await;
+            assert_eq!(state.list_peers()[0].status, PeerStatus::Dead);
+        }
+        assert!(replies.lock().is_empty());
+        server.abort();
+        assert!(server.await.unwrap_err().is_cancelled());
+    }
 
     #[tokio::test]
     async fn seed_bootstrap_runs_once_when_retries_are_disabled() {
@@ -469,7 +574,7 @@ mod tests {
         ));
         state.register_peer(crate::relay::types::PeerInfo {
             relay_id: "relay-peer".into(),
-            url: "http://relay-peer:8080".into(),
+            address: PeerAddress::http("http://relay-peer:8080"),
             route_count: 1,
             last_heartbeat: std::time::Instant::now() - Duration::from_secs(1),
             status: PeerStatus::Alive,
@@ -478,7 +583,7 @@ mod tests {
             assert!(table.register_route(crate::relay::types::RouteEntry {
                 name: "grid".into(),
                 relay_id: "relay-peer".into(),
-                relay_url: "http://relay-peer:8080".into(),
+                address: PeerAddress::http("http://relay-peer:8080"),
                 server_id: None,
                 server_instance_id: None,
                 ipc_address: None,

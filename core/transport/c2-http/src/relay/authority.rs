@@ -11,7 +11,7 @@ use c2_ipc::IpcClient;
 use crate::relay::conn_pool::{
     CachedClient, OwnerReplaceError, OwnerReplacementEvidence, OwnerToken,
 };
-use crate::relay::peer::ValidatedDigestDiffEntry;
+use crate::relay::peer::{PeerSender, ValidatedDigestDiffEntry};
 use crate::relay::route_table::{
     ForceLeaveError, valid_route_name, validate_server_instance_id_value,
 };
@@ -709,7 +709,7 @@ impl<'a> RouteAuthority<'a> {
         let entry = RouteEntry {
             name: name.clone(),
             relay_id: self.state.relay_id().to_string(),
-            relay_url: self.state.config().effective_advertise_url(),
+            address: self.state.local_peer_address(),
             server_id: Some(server_id),
             server_instance_id: Some(server_instance_id),
             ipc_address: Some(address.clone()),
@@ -898,28 +898,26 @@ impl<'a> RouteAuthority<'a> {
 
     pub(crate) fn apply_digest_diff(
         &self,
-        sender_relay_id: &str,
+        sender: PeerSender<'_>,
         diff: ValidatedDigestDiffEntry,
     ) -> Result<(), ControlError> {
         match diff {
-            ValidatedDigestDiffEntry::Active(entry) => {
-                self.announce_peer(sender_relay_id.to_string(), entry)
-            }
+            ValidatedDigestDiffEntry::Active(entry) => self.announce_peer(sender, entry),
             ValidatedDigestDiffEntry::Deleted {
                 name,
                 relay_id,
                 removed_at,
-            } => self.withdraw_peer(sender_relay_id.to_string(), name, relay_id, removed_at),
+            } => self.withdraw_peer(sender, name, relay_id, removed_at),
         }
     }
 
     pub(crate) fn announce_peer(
         &self,
-        sender_relay_id: String,
+        sender: PeerSender<'_>,
         mut entry: RouteEntry,
     ) -> Result<(), ControlError> {
         self.validate_route_name(&entry.name)?;
-        self.validate_relay_id(&sender_relay_id)?;
+        self.validate_relay_id(sender.relay_id)?;
         self.validate_relay_id(&entry.relay_id)?;
         self.validate_crm_tag(&entry.crm_ns, &entry.crm_name, &entry.crm_ver)?;
         c2_contract::validate_contract_hash("abi_hash", &entry.abi_hash).map_err(|err| {
@@ -937,18 +935,15 @@ impl<'a> RouteAuthority<'a> {
                 reason: "route registered_at must be finite".to_string(),
             });
         }
-        if !self.trusted_peer_owner(&sender_relay_id, &entry.relay_id) {
-            return Err(ControlError::OwnerMismatch);
-        }
         let mut route_table = self.state.route_table_write();
-        if entry.relay_id == route_table.relay_id() {
+        if sender.relay_id != entry.relay_id || !route_table.matches_sender(sender, true) {
             return Err(ControlError::OwnerMismatch);
         }
-        let peer_url = route_table
+        let peer_address = route_table
             .get_peer(&entry.relay_id)
-            .map(|peer| peer.url.clone())
+            .map(|peer| peer.address.clone())
             .ok_or(ControlError::OwnerMismatch)?;
-        entry.relay_url = peer_url;
+        entry.address = peer_address;
         entry.server_id = None;
         entry.server_instance_id = None;
         entry.ipc_address = None;
@@ -959,23 +954,19 @@ impl<'a> RouteAuthority<'a> {
 
     pub(crate) fn withdraw_peer(
         &self,
-        sender_relay_id: String,
+        sender: PeerSender<'_>,
         name: String,
         relay_id: String,
         removed_at: f64,
     ) -> Result<(), ControlError> {
         self.validate_route_name(&name)?;
-        self.validate_relay_id(&sender_relay_id)?;
+        self.validate_relay_id(sender.relay_id)?;
         self.validate_relay_id(&relay_id)?;
-        if !self.trusted_peer_owner(&sender_relay_id, &relay_id) {
+        let mut table = self.state.route_table_write();
+        if sender.relay_id != relay_id || !table.matches_sender(sender, true) {
             return Err(ControlError::OwnerMismatch);
         }
-        if relay_id == self.state.relay_id() {
-            return Err(ControlError::OwnerMismatch);
-        }
-        self.state
-            .route_table_write()
-            .unregister_route_with_tombstone(&name, &relay_id, removed_at);
+        table.unregister_route_with_tombstone(&name, &relay_id, removed_at);
         Ok(())
     }
 
@@ -985,18 +976,12 @@ impl<'a> RouteAuthority<'a> {
     }
 
     /// IDs and sender/target distinction were checked by the peer wire boundary.
-    pub(crate) fn force_leave_from_peer(&self, sender: &str, relay_id: &str) -> bool {
+    pub(crate) fn force_leave_from_peer(&self, sender: PeerSender<'_>, relay_id: &str) -> bool {
         let mut table = self.state.route_table_write();
-        if sender == table.relay_id() || !table.peer_is_alive(sender) {
+        if !table.matches_sender(sender, true) {
             return false;
         }
         table.force_leave_peer(relay_id).is_ok()
-    }
-
-    fn trusted_peer_owner(&self, sender_relay_id: &str, relay_id: &str) -> bool {
-        sender_relay_id == relay_id
-            && sender_relay_id != self.state.relay_id()
-            && self.state.peer_is_alive(sender_relay_id)
     }
 
     async fn probe_captured_owner(&self, replacement: &OwnerReplacementCandidate) -> OwnerProbe {
@@ -1065,7 +1050,7 @@ mod tests {
     use c2_config::RelayConfig;
 
     use crate::relay::peer::PeerEnvelope;
-    use crate::relay::types::{PeerInfo, PeerSnapshot, PeerStatus};
+    use crate::relay::types::{PeerAddress, PeerInfo, PeerSnapshot, PeerStatus};
 
     struct NullDisseminator;
 
@@ -1206,7 +1191,7 @@ mod tests {
         RouteEntry {
             name: name.into(),
             relay_id: relay_id.into(),
-            relay_url: format!("http://{relay_id}:8080"),
+            address: PeerAddress::http(format!("http://{relay_id}:8080")),
             server_id: None,
             server_instance_id: None,
             ipc_address: None,
@@ -1228,14 +1213,16 @@ mod tests {
         let state = test_state();
         state.register_peer(PeerInfo {
             relay_id: "bad/relay".into(),
-            url: "http://bad-relay:8080".into(),
+            address: PeerAddress::http("http://bad-relay:8080"),
             route_count: 0,
             last_heartbeat: Instant::now(),
             status: PeerStatus::Alive,
         });
 
-        let result = RouteAuthority::new(&state)
-            .announce_peer("bad/relay".into(), peer_route("grid", "bad/relay"));
+        let result = RouteAuthority::new(&state).announce_peer(
+            PeerSender::http("bad/relay"),
+            peer_route("grid", "bad/relay"),
+        );
 
         match result {
             Err(ControlError::OwnerMismatch) => {}

@@ -322,6 +322,9 @@ struct HubState {
     retired: Vec<Weak<Subscriber>>,
     terminal: Option<C2Error>,
     closing: bool,
+    close_cause: Option<CancelCause>,
+    /// Whether the subscriber holding the final slot gave up delivery.
+    last_abandoned: bool,
     /// Set once `run_source` finished the real upstream cleanup. Distinct
     /// from `terminal`: a confirm refusal may make the hub terminal for
     /// downstream readers long before the old upstream has drained, and the
@@ -423,8 +426,8 @@ pub(crate) fn closed_confirmation() -> C2Error {
     )
 }
 
-/// Cancellation of one hub's upstream, uniform over the IPC and cross-relay
-/// HTTP transports. Both exercise the source's cancel channel exactly once.
+/// Cancellation of one hub's upstream. Either transport can abandon delivery
+/// with Consumer after it has sent Lifecycle.
 #[derive(Clone)]
 enum HubCancel {
     Ipc(c2_ipc::IpcForwardCancellation),
@@ -607,10 +610,36 @@ impl Hub {
         self.changed.notify_waiters();
     }
     fn detach(&self, id: u64, subscriber: &Arc<Subscriber>) {
+        self.detach_for(id, subscriber, CancelCause::Consumer, true);
+    }
+
+    fn detach_for(
+        &self,
+        id: u64,
+        subscriber: &Arc<Subscriber>,
+        cause: CancelCause,
+        abandoned: bool,
+    ) {
+        let mut state = self.inner.lock();
         if subscriber.detached.swap(true, Ordering::AcqRel) {
+            // A Lifecycle detach can still be waiting for its terminal. Only
+            // the subscriber whose departure stopped the source may abandon it.
+            if abandoned
+                && !state.last_abandoned
+                && state
+                    .last_hold
+                    .as_ref()
+                    .is_some_and(|last| Arc::ptr_eq(last, subscriber))
+            {
+                state.last_abandoned = true;
+                if let Some(cancel) = &state.source_cancel {
+                    cancel.cancel(CancelCause::Consumer);
+                }
+                drop(state);
+                self.changed.notify_waiters();
+            }
             return;
         }
-        let mut state = self.inner.lock();
         state.subscribers.remove(&id);
         if let Some(token) = subscriber.origin_token.get() {
             state.origin_subscribers.remove(token);
@@ -625,14 +654,27 @@ impl Hub {
         if state.terminal.is_some() && state.latest_eligible.is_empty() {
             state.latest.take();
         }
-        if state.subscribers.is_empty() && state.joiners == 0 && !state.upstream_done {
+        let last = state.subscribers.is_empty() && state.joiners == 0 && !state.upstream_done;
+        if last {
             // Hold the last subscriber (and its admission slot) until the
             // upstream drain finishes, even when a confirm refusal already
             // made the hub terminal for downstream readers.
             state.closing = true;
+            state.close_cause = Some(cause);
+            state.last_abandoned = abandoned;
             state.last_hold = Some(subscriber.clone());
             state.history.clear();
             state.latest.take();
+            if let Some(cancel) = &state.source_cancel {
+                // Publish the two intents in order before another observer
+                // can act on this hub's closing state.
+                if cause == CancelCause::Lifecycle {
+                    cancel.cancel(cause);
+                }
+                if abandoned {
+                    cancel.cancel(CancelCause::Consumer);
+                }
+            }
             state.upstream_wait.cancel();
         }
         drop(state);
@@ -689,8 +731,15 @@ impl Hub {
             .collect();
         state.incoming = Some((seq, eligible));
     }
-    fn stopped(&self) -> bool {
-        self.inner.lock().closing
+    fn stop_cause(&self) -> Option<CancelCause> {
+        let state = self.inner.lock();
+        state
+            .closing
+            .then(|| state.close_cause.unwrap_or(CancelCause::Consumer))
+    }
+    fn consumer_stopped(&self) -> bool {
+        let state = self.inner.lock();
+        state.last_abandoned || (state.closing && state.close_cause != Some(CancelCause::Lifecycle))
     }
     fn evict_history(&self) -> bool {
         let old = {
@@ -934,6 +983,7 @@ where
         inflight_chunks: AtomicUsize::new(0),
         changed: Notify::new(),
     });
+    let shutdown = state.forwarding.shutdown_token();
     let (hub, guard, opened) = loop {
         let (hub, leader, guard) = state.topics.join(key.clone(), subscriber.clone()).await;
         if leader {
@@ -953,7 +1003,12 @@ where
                 continue;
             }
         };
-        match source.confirm(&metadata).await {
+        let confirmation = tokio::select! {
+            biased;
+            _ = shutdown.cancelled() => return Err(cancellation("relay_shutdown")),
+            result = source.confirm(&metadata) => result,
+        };
+        match confirmation {
             Ok(head_seq) => {
                 let opened = LeaderOpened {
                     head_seq,
@@ -986,7 +1041,7 @@ where
             state.forwarding.remove_stream(&token);
             return Err(error.clone());
         }
-        if inner.closing {
+        if inner.closing || shutdown.is_cancelled() {
             state.forwarding.remove_stream(&token);
             return Err(cancellation("relay_shutdown"));
         }
@@ -1036,13 +1091,13 @@ where
                 tokio::select! {
                     cause = monitor_control.requested(), if !cancellation_seen => {
                         cancellation_seen = true;
-                        consumer_seen = cause == CancelCause::Consumer;
-                        if consumer_seen { monitor_hub.detach(id, &monitor_sub); }
+                        consumer_seen = cause == CancelCause::Consumer || monitor_control.is_consumer_requested();
+                        if consumer_seen { monitor_hub.detach_for(id, &monitor_sub, cause, true); }
                         else { monitor_hub.changed.notify_waiters(); }
                     },
                     _ = monitor_control.wait_consumer_requested(), if cancellation_seen && !consumer_seen => {
                         consumer_seen = true;
-                        monitor_hub.detach(id, &monitor_sub);
+                        monitor_hub.detach_for(id, &monitor_sub, CancelCause::Lifecycle, true);
                     },
                     _ = monitor_done.cancelled(), if !body_done => body_done = true,
                     _ = stream_control.changed.notified() => monitor_hub.changed.notify_waiters(),
@@ -1052,13 +1107,13 @@ where
                 tokio::select! {
                     cause = monitor_control.requested(), if !cancellation_seen => {
                         cancellation_seen = true;
-                        consumer_seen = cause == CancelCause::Consumer;
-                        if consumer_seen { monitor_hub.detach(id, &monitor_sub); }
+                        consumer_seen = cause == CancelCause::Consumer || monitor_control.is_consumer_requested();
+                        if consumer_seen { monitor_hub.detach_for(id, &monitor_sub, cause, true); }
                         else { monitor_hub.changed.notify_waiters(); }
                     },
                     _ = monitor_control.wait_consumer_requested(), if cancellation_seen && !consumer_seen => {
                         consumer_seen = true;
-                        monitor_hub.detach(id, &monitor_sub);
+                        monitor_hub.detach_for(id, &monitor_sub, CancelCause::Lifecycle, true);
                     },
                     _ = monitor_done.cancelled(), if !body_done => body_done = true,
                     _ = monitor_sub.changed.notified() => {},
@@ -1072,6 +1127,7 @@ where
             hub,
             subscriber,
             control,
+            shutdown,
             done,
             id,
             next_seq: start_seq,
@@ -1124,6 +1180,7 @@ struct BodyState {
     hub: Arc<Hub>,
     subscriber: Arc<Subscriber>,
     control: Arc<StreamCancellation>,
+    shutdown: tokio_util::sync::CancellationToken,
     done: tokio_util::sync::CancellationToken,
     id: u64,
     next_seq: u64,
@@ -1170,16 +1227,28 @@ impl Drop for OwnedBytes {
 }
 impl Drop for BodyState {
     fn drop(&mut self) {
-        self.done.cancel();
         self.subscriber.selected.store(false, Ordering::Release);
         self.subscriber
             .frame_started
             .store(false, Ordering::Release);
         self.subscriber.unsent.lock().clear();
-        self.hub.detach(self.id, &self.subscriber);
+        self.detach(!matches!(self.phase, BodyPhase::Ended));
+        self.done.cancel();
     }
 }
 impl BodyState {
+    fn detach(&self, abandoned: bool) {
+        let cause = self.control.cause().unwrap_or_else(|| {
+            if self.shutdown.is_cancelled() {
+                CancelCause::Lifecycle
+            } else {
+                CancelCause::Consumer
+            }
+        });
+        self.hub
+            .detach_for(self.id, &self.subscriber, cause, abandoned);
+    }
+
     fn held(&self, bytes: Bytes, data: bool) -> Bytes {
         if data {
             self.subscriber
@@ -1214,6 +1283,7 @@ impl BodyState {
                         self.subscriber
                             .frame_started
                             .store(false, Ordering::Release);
+                        self.detach(true);
                         self.phase = BodyPhase::Ended;
                         return Some(Err(std::io::ErrorKind::ConnectionAborted.into()));
                     }
@@ -1289,12 +1359,15 @@ impl BodyState {
                 }
                 BodyPhase::Ended => return None,
                 BodyPhase::Selecting => {
-                    if self.control.is_consumer_requested() {
-                        self.hub.detach(self.id, &self.subscriber);
-                    }
                     let notified = self.hub.changed.notified();
                     tokio::pin!(notified);
                     notified.as_mut().enable();
+                    let abandoned = self.control.is_consumer_requested();
+                    let lifecycle = self.control.cause() == Some(CancelCause::Lifecycle);
+                    let cancelled = abandoned || (lifecycle && !self.shutdown.is_cancelled());
+                    if cancelled {
+                        self.detach(abandoned);
+                    }
                     enum Selection {
                         Frame(Arc<HubFrame>),
                         End(C2Error),
@@ -1312,7 +1385,7 @@ impl BodyState {
                             } else {
                                 Selection::End(error.clone())
                             }
-                        } else if self.control.is_consumer_requested() {
+                        } else if cancelled {
                             let last_is_pending = state
                                 .last_hold
                                 .as_ref()
@@ -1320,7 +1393,11 @@ impl BodyState {
                             if last_is_pending && state.terminal.is_none() {
                                 Selection::Wait
                             } else {
-                                Selection::End(cancellation("consumer_cancelled"))
+                                Selection::End(cancellation(if lifecycle {
+                                    "relay_shutdown"
+                                } else {
+                                    "consumer_cancelled"
+                                }))
                             }
                         } else if self.control.cause() == Some(CancelCause::Lifecycle)
                             && !state.latest_eligible.contains(&self.id)
@@ -1412,7 +1489,7 @@ impl BodyState {
                                 self.subscriber.selected.store(false, Ordering::Release);
                                 self.pending_terminal =
                                     Some(capacity("topic subscriber metadata size overflow"));
-                                self.hub.detach(self.id, &self.subscriber);
+                                self.detach(true);
                                 continue;
                             };
                             let reservation = match self.budget.try_reserve_memory(metadata_bytes) {
@@ -1420,7 +1497,7 @@ impl BodyState {
                                 Err(error) => {
                                     self.subscriber.selected.store(false, Ordering::Release);
                                     self.pending_terminal = Some(capacity(error.to_string()));
-                                    self.hub.detach(self.id, &self.subscriber);
+                                    self.detach(true);
                                     continue;
                                 }
                             };
@@ -1447,7 +1524,7 @@ impl BodyState {
                                     self.subscriber.selected.store(false, Ordering::Release);
                                     self.pending_terminal =
                                         Some(capacity("no memory for a topic transport fragment"));
-                                    self.hub.detach(self.id, &self.subscriber);
+                                    self.detach(true);
                                     continue;
                                 };
                                 self.staging = Some(Arc::new(reservation.into_reusable_window()));
@@ -1479,7 +1556,7 @@ impl BodyState {
                             )));
                         }
                         Selection::End(error) => {
-                            self.hub.detach(self.id, &self.subscriber);
+                            self.detach(false);
                             let wait_for_source = {
                                 let state = self.hub.inner.lock();
                                 state.terminal.is_none()
@@ -1529,7 +1606,7 @@ impl BodyState {
         self.subscriber
             .frame_started
             .store(false, Ordering::Release);
-        self.hub.detach(self.id, &self.subscriber);
+        self.detach(true);
         self.phase = BodyPhase::Ended;
         Some(Err(std::io::Error::other(message.into())))
     }
@@ -1575,8 +1652,8 @@ async fn wait_stop(hub: &Hub, shutdown: &tokio_util::sync::CancellationToken) ->
         if shutdown.is_cancelled() {
             return CancelCause::Lifecycle;
         }
-        if hub.stopped() {
-            return CancelCause::Consumer;
+        if let Some(cause) = hub.stop_cause() {
+            return cause;
         }
         tokio::select! { _ = notified => {}, _ = shutdown.cancelled() => return CancelCause::Lifecycle }
     }
@@ -1587,14 +1664,14 @@ async fn wait_consumer_stop(hub: &Hub) -> CancelCause {
         let notified = hub.changed.notified();
         tokio::pin!(notified);
         notified.as_mut().enable();
-        if hub.stopped() {
+        if hub.consumer_stopped() {
             return CancelCause::Consumer;
         }
         notified.await;
     }
 }
 
-async fn wait_frame_stop(
+async fn wait_source_stop(
     hub: &Hub,
     shutdown: &tokio_util::sync::CancellationToken,
     lifecycle: bool,
@@ -1603,6 +1680,19 @@ async fn wait_frame_stop(
         wait_consumer_stop(hub).await
     } else {
         wait_stop(hub, shutdown).await
+    }
+}
+
+async fn wait_open_cancel(
+    upstream_wait: &tokio_util::sync::CancellationToken,
+    shutdown: &tokio_util::sync::CancellationToken,
+) -> CancelCause {
+    // A subscription can be admitted before close and create its hub after
+    // the shutdown scan. Check the relay-wide token even for those hubs.
+    tokio::select! {
+        biased;
+        _ = shutdown.cancelled() => CancelCause::Lifecycle,
+        _ = upstream_wait.cancelled() => CancelCause::Consumer,
     }
 }
 
@@ -1623,15 +1713,13 @@ async fn drive(
         start: WireTopicStart::Latest,
         on_lag: WireLagPolicy::Skip,
     };
-    // A hub still opening has no source handle to cancel, so its OPEN and
-    // attestation waits select on the hub's wait token: shutdown, the last
-    // downstream leaving, or a terminal outcome unblocks a stalled source.
     let source = match tokio::select! {
-        source = client.forward_subscribe_bound(&binding, &topic_name, options, &metadata) => source,
-        _ = upstream_wait.cancelled() => {
-            finish_failed_open(&relay.topics, &hub, leader_result, cancelled_open(&shutdown));
+        biased;
+        cause = wait_open_cancel(&upstream_wait, &shutdown) => {
+            finish_failed_open(&relay.topics, &hub, leader_result, cancelled_open(cause));
             return;
-        }
+        },
+        source = client.forward_subscribe_bound(&binding, &topic_name, options, &metadata) => source,
     } {
         Ok(source) => source,
         Err(error) => {
@@ -1650,13 +1738,14 @@ async fn drive(
         signature_hash: route.signature_hash.clone(),
     };
     let attestation = tokio::select! {
-        attestation = client.attest_route_for_registration(&attestation_expected) => attestation,
-        _ = upstream_wait.cancelled() => {
-            let _ = source.cancellation().cancel(CancelCause::Consumer);
+        biased;
+        cause = wait_open_cancel(&upstream_wait, &shutdown) => {
+            let _ = source.cancellation().cancel(cause);
             let _ = source.completion().await;
-            finish_failed_open(&relay.topics, &hub, leader_result, cancelled_open(&shutdown));
+            finish_failed_open(&relay.topics, &hub, leader_result, cancelled_open(cause));
             return;
-        }
+        },
+        attestation = client.attest_route_for_registration(&attestation_expected) => attestation,
     };
     let valid = attestation
         .as_ref()
@@ -1723,12 +1812,11 @@ fn finish_failed_open(
     let _ = leader_result.send(Err(error));
 }
 
-fn cancelled_open(shutdown: &tokio_util::sync::CancellationToken) -> C2Error {
-    if shutdown.is_cancelled() {
-        cancellation("relay_shutdown")
-    } else {
-        cancellation("consumer_cancelled")
-    }
+fn cancelled_open(cause: CancelCause) -> C2Error {
+    cancellation(match cause {
+        CancelCause::Lifecycle => "relay_shutdown",
+        CancelCause::Consumer => "consumer_cancelled",
+    })
 }
 
 /// Open the single cross-relay upstream for a hub whose route this relay knows
@@ -1746,29 +1834,16 @@ async fn drive_remote(
 ) {
     let shutdown = relay.forwarding.shutdown_token();
     let upstream_wait = hub.inner.lock().upstream_wait.clone();
-    let policy = c2_config::ResolvedRelayClientConfig {
-        use_proxy: relay.config().use_proxy,
-        ..Default::default()
-    };
-    let build_client = || {
-        crate::relay_client_builder(&policy)
-            .expect("system relay TLS configuration")
-            .retry(reqwest::retry::never())
-            .build()
-            .expect("c-two: failed to build reqwest Client for relay traffic")
-    };
-    let data_client = build_client();
-    let control_client = build_client();
-    // A hub still opening has no source handle to cancel, so the cross-relay
-    // subscription request selects on the hub's wait token.
+    let client = relay.peer_client().clone();
     let opened = match tokio::select! {
-        opened = open_remote_upstream(
-            data_client, control_client.clone(), &entry.relay_url, &expected, &topic_name, &metadata
-        ) => opened,
-        _ = upstream_wait.cancelled() => {
-            finish_failed_open(&relay.topics, &hub, leader_result, cancelled_open(&shutdown));
+        biased;
+        cause = wait_open_cancel(&upstream_wait, &shutdown) => {
+            finish_failed_open(&relay.topics, &hub, leader_result, cancelled_open(cause));
             return;
-        }
+        },
+        opened = open_remote_upstream(
+            client.clone(), &entry.address, &expected, &topic_name, &metadata
+        ) => opened,
     } {
         Ok(opened) => opened,
         Err(error) => {
@@ -1788,8 +1863,8 @@ async fn drive_remote(
         return;
     }
     let confirm = Arc::new(RemoteConfirm::new(
-        control_client,
-        &entry.relay_url,
+        client,
+        &entry.address,
         &expected,
         &topic_name,
         &opened.registration,
@@ -1818,17 +1893,13 @@ async fn run_source(relay: Arc<RelayState>, hub: Arc<Hub>, mut source: TopicSour
     let mut cancelled = None;
     let mut pending_error = None;
     loop {
-        let record = if cancelled.is_some() {
-            source.next_record().await
-        } else {
-            tokio::select! {
-                result = source.next_record() => result,
-                cause = wait_stop(&hub, &shutdown) => {
-                    source.cancellation().cancel(cause);
-                    cancelled = Some(cause);
-                    if cause == CancelCause::Consumer { break; }
-                    continue;
-                }
+        let record = tokio::select! {
+            result = source.next_record() => result,
+            cause = wait_source_stop(&hub, &shutdown, cancelled == Some(CancelCause::Lifecycle)) => {
+                source.cancellation().cancel(cause);
+                cancelled = Some(cause);
+                if cause == CancelCause::Consumer { break; }
+                continue;
             }
         };
         match record {
@@ -1871,7 +1942,8 @@ async fn run_source(relay: Arc<RelayState>, hub: Arc<Hub>, mut source: TopicSour
                         hub.changed.notify_waiters();
                     }
                     Ok(None) => {
-                        source.cancellation().cancel(CancelCause::Consumer);
+                        // receive_frame already cancelled the interrupted copy.
+                        cancelled = Some(CancelCause::Consumer);
                         break;
                     }
                     Err(error) => {
@@ -2019,7 +2091,9 @@ async fn receive_frame(
             // No downstream has begun this source frame. Do not wait for an
             // un-evicted stopped reader to release its earlier frame before
             // cancelling the shared upstream and letting the Host drain.
-            source.cancellation().cancel(CancelCause::Consumer);
+            let cancellation = source.cancellation();
+            cancellation.cancel(CancelCause::Lifecycle);
+            cancellation.cancel(CancelCause::Consumer);
             return Ok(None);
         }
         if topics.evict_stalled_across(hub, shutdown) {
@@ -2065,11 +2139,12 @@ async fn receive_frame(
             },
             _ = notified => {},
             _ = budget_notified => {},
-            cause = wait_frame_stop(hub, shutdown, lifecycle) => {
-                if cause == CancelCause::Lifecycle {
-                    source.cancellation().cancel(CancelCause::Consumer);
-                    return Ok(None);
-                } else { return Ok(None); }
+            cause = wait_source_stop(hub, shutdown, lifecycle) => {
+                let cancel = source.cancellation();
+                cancel.cancel(cause);
+                // No window is available and no subscriber has selected this copy.
+                cancel.cancel(CancelCause::Consumer);
+                return Ok(None);
             },
         }
     };
@@ -2123,9 +2198,9 @@ async fn receive_frame(
                     Ok(None) => return Err(C2Error::new(ErrorCode::ResourceUnavailable, "upstream ended during topic frame")),
                     Err(error) => return Err(error),
                 },
-                cause = wait_frame_stop(hub, shutdown, lifecycle) => {
+                cause = wait_source_stop(hub, shutdown, lifecycle) => {
+                    cancellation.cancel(cause);
                     if cause == CancelCause::Lifecycle {
-                        cancellation.cancel(cause);
                         lifecycle = true;
                     } else { return Ok(None); }
                 },
@@ -2194,7 +2269,278 @@ fn frame_metadata_bytes(total: u64, width: u64) -> Result<u64, C2Error> {
 #[cfg(test)]
 mod tests {
     use super::super::forwarding::ForwardingDomain;
+    use super::super::test_support::{TEST_ABI_HASH, TEST_SIGNATURE_HASH, test_state_for_client};
+    use super::super::types::{Locality, PeerAddress};
     use super::*;
+    use c2_contract::ExpectedRouteContract;
+    use futures::StreamExt;
+    use std::net::SocketAddr;
+    use std::time::Duration;
+
+    fn remote_test_route(address: SocketAddr) -> (RouteEntry, ExpectedRouteContract) {
+        let expected = ExpectedRouteContract {
+            route_name: "grid".into(),
+            crm_ns: "test.echo".into(),
+            crm_name: "Echo".into(),
+            crm_ver: "0.1.0".into(),
+            abi_hash: TEST_ABI_HASH.into(),
+            signature_hash: TEST_SIGNATURE_HASH.into(),
+        };
+        let route = RouteEntry {
+            name: expected.route_name.clone(),
+            relay_id: "origin".into(),
+            address: PeerAddress::http(format!("http://{address}")),
+            server_id: None,
+            server_instance_id: None,
+            ipc_address: None,
+            crm_ns: expected.crm_ns.clone(),
+            crm_name: expected.crm_name.clone(),
+            crm_ver: expected.crm_ver.clone(),
+            abi_hash: expected.abi_hash.clone(),
+            signature_hash: expected.signature_hash.clone(),
+            max_payload_size: 1024,
+            route_uid: None,
+            locality: Locality::Peer,
+            registered_at: 1.0,
+        };
+        (route, expected)
+    }
+
+    async fn remote_test_subscription(
+        state: Arc<RelayState>,
+        route: RouteEntry,
+        expected: ExpectedRouteContract,
+        admitted: (OperationPermit, TaskTrackerToken),
+    ) -> Result<Response, C2Error> {
+        subscribe_remote(
+            state,
+            route,
+            expected,
+            "state".into(),
+            WireSubscribeOptions {
+                start: WireTopicStart::Latest,
+                on_lag: WireLagPolicy::Skip,
+            },
+            CallMetadata::default(),
+            admitted.0,
+            admitted.1,
+            None,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn shutdown_drains_a_remote_subscription_admitted_before_its_hub_exists() {
+        // The origin accepts the TCP handshake but withholds all HTTP response bytes.
+        let origin = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (route, expected) = remote_test_route(origin.local_addr().unwrap());
+        let state = test_state_for_client();
+        let admitted = state.forwarding.admit_subscription().unwrap();
+        state.forwarding.close();
+        state.topics.cancel_sources_for_shutdown();
+
+        let (result, ()) = tokio::time::timeout(Duration::from_secs(2), async {
+            tokio::join!(
+                remote_test_subscription(state.clone(), route, expected, admitted),
+                state.forwarding.drain(),
+            )
+        })
+        .await
+        .expect("shutdown must drain a hub missed by the cancellation scan");
+        let error = result.expect_err("the subscription must observe relay shutdown");
+        assert_eq!(error.code, ErrorCode::CallCancelled);
+        assert_eq!(error.details["cause"], "relay_shutdown");
+        assert!(state.topics.hubs.lock().is_empty());
+        assert_eq!(state.forwarding.snapshot().used_operations, 0);
+    }
+
+    #[tokio::test]
+    async fn only_the_last_topic_subscriber_can_abandon_a_lifecycle_cancelled_source() {
+        use axum::extract::{Path, RawQuery};
+        use axum::routing::{delete, post};
+
+        const UPSTREAM_TOKEN: &str = "0123456789abcdef0123456789abcdef";
+        const WAIT: Duration = Duration::from_secs(2);
+        for drop_body in [false, true] {
+            let host = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let (route, expected) = remote_test_route(host.local_addr().unwrap());
+            let (sent, mut requests) = tokio::sync::mpsc::unbounded_channel();
+            let finish = Arc::new(Notify::new());
+            let acknowledge_lifecycle = Arc::new(Notify::new());
+            let origin = axum::Router::new()
+                .route(
+                    crate::TOPIC_SUBSCRIBE_PATH,
+                    post({
+                        let finish = finish.clone();
+                        move || async {
+                            let terminal = futures::stream::once(async move {
+                                finish.notified().await;
+                                let mut bytes = topic_wire::ready(1).unwrap();
+                                bytes.extend(topic_wire::terminal(&Terminal {
+                                    status: Status::Failed,
+                                    complete_items: 0,
+                                    error: cancellation("relay_shutdown"),
+                                }));
+                                Ok::<_, std::io::Error>(Bytes::from(bytes))
+                            });
+                            Response::builder()
+                                .header(header::CONTENT_TYPE, topic_wire::MEDIA_TYPE)
+                                .header("x-c2-call-token", UPSTREAM_TOKEN)
+                                .header(
+                                    super::super::topic_remote::REGISTRATION_HEADER,
+                                    "a".repeat(64),
+                                )
+                                .header(TOPIC_ADMISSION_REQUIRED_HEADER, "0")
+                                .header(TOPIC_HEAD_SEQ_HEADER, "0")
+                                .body(Body::from_stream(terminal))
+                                .unwrap()
+                        }
+                    }),
+                )
+                .route(
+                    crate::TOPIC_CONFIRM_PATH,
+                    post(|| async { r#"{"head_seq":0}"# }),
+                )
+                .route(
+                    "/_calls/{token}",
+                    delete({
+                        let acknowledge_lifecycle = acknowledge_lifecycle.clone();
+                        let lifecycle_attempted = Arc::new(AtomicBool::new(false));
+                        move |Path(token): Path<String>, RawQuery(query): RawQuery| async move {
+                            let query = query.unwrap();
+                            let lifecycle = query == "cause=lifecycle";
+                            sent.send((token, query)).unwrap();
+                            if lifecycle {
+                                if !lifecycle_attempted.swap(true, Ordering::AcqRel) {
+                                    return StatusCode::SERVICE_UNAVAILABLE;
+                                }
+                                acknowledge_lifecycle.notified().await;
+                            }
+                            StatusCode::NO_CONTENT
+                        }
+                    }),
+                );
+            let origin_task = tokio::spawn(async move { axum::serve(host, origin).await.unwrap() });
+            let state = test_state_for_client();
+            state.with_route_table_mut(|table| assert!(table.register_route(route.clone())));
+            let subscribe = || {
+                remote_test_subscription(
+                    state.clone(),
+                    route.clone(),
+                    expected.clone(),
+                    state.forwarding.admit_subscription().unwrap(),
+                )
+            };
+            let first = tokio::time::timeout(WAIT, subscribe())
+                .await
+                .unwrap()
+                .unwrap();
+            let last = tokio::time::timeout(WAIT, subscribe())
+                .await
+                .unwrap()
+                .unwrap();
+            let first_token = first.headers()["x-c2-call-token"]
+                .to_str()
+                .unwrap()
+                .to_owned();
+            let last_token = last.headers()["x-c2-call-token"]
+                .to_str()
+                .unwrap()
+                .to_owned();
+            let mut last = last.into_body().into_data_stream();
+
+            assert!(
+                state
+                    .forwarding
+                    .cancel_stream(&first_token, CancelCause::Lifecycle)
+            );
+            drop(first);
+            let hub = state
+                .topics
+                .hubs
+                .lock()
+                .values()
+                .next()
+                .unwrap()
+                .upgrade()
+                .unwrap();
+            assert_eq!(hub.stop_cause(), None);
+            let source_cancel = hub.inner.lock().source_cancel.clone().unwrap();
+            assert!(
+                tokio::time::timeout(Duration::from_millis(50), requests.recv())
+                    .await
+                    .is_err()
+            );
+            let ready = tokio::time::timeout(WAIT, last.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            assert_eq!(ready.as_ref(), topic_wire::ready(1).unwrap());
+            drop(ready);
+
+            assert!(
+                state
+                    .forwarding
+                    .cancel_stream(&last_token, CancelCause::Lifecycle)
+            );
+            assert!(futures::poll!(last.next()).is_pending());
+            assert_eq!(
+                tokio::time::timeout(WAIT, requests.recv()).await.unwrap(),
+                Some((UPSTREAM_TOKEN.into(), "cause=lifecycle".into()))
+            );
+            source_cancel.cancel(CancelCause::Lifecycle);
+            let mut last = Some(last);
+            if drop_body {
+                drop(last.take());
+            } else {
+                assert!(
+                    state
+                        .forwarding
+                        .cancel_stream(&last_token, CancelCause::Consumer)
+                );
+            }
+            assert_eq!(
+                tokio::time::timeout(WAIT, requests.recv()).await.unwrap(),
+                Some((UPSTREAM_TOKEN.into(), "cause=lifecycle".into())),
+                "a transient control failure must retry the first cause on the pinned source",
+            );
+            assert!(
+                tokio::time::timeout(Duration::from_millis(50), requests.recv())
+                    .await
+                    .is_err()
+            );
+            acknowledge_lifecycle.notify_one();
+            assert_eq!(
+                tokio::time::timeout(WAIT, requests.recv()).await.unwrap(),
+                Some((UPSTREAM_TOKEN.into(), "cause=consumer".into()))
+            );
+            source_cancel.cancel(CancelCause::Consumer);
+            assert!(
+                tokio::time::timeout(Duration::from_millis(50), requests.recv())
+                    .await
+                    .is_err()
+            );
+            finish.notify_one();
+            if let Some(mut last) = last {
+                let terminal = tokio::time::timeout(WAIT, last.next())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap();
+                let terminal =
+                    topic_wire::decode_terminal(&terminal[topic_wire::RECORD_HEADER_LEN..])
+                        .unwrap();
+                assert_eq!(terminal.error.code, ErrorCode::CallCancelled);
+                assert_eq!(terminal.error.details["cause"], "relay_shutdown");
+            }
+            state.forwarding.close();
+            tokio::time::timeout(WAIT, state.forwarding.drain())
+                .await
+                .unwrap();
+            origin_task.abort();
+        }
+    }
 
     fn body(hub: Arc<Hub>, domain: &ForwardingDomain, id: u64, lag: WireLagPolicy) -> BodyState {
         let (permit, tracked) = domain.admit_subscription().unwrap();
@@ -2222,6 +2568,7 @@ mod tests {
             hub,
             subscriber,
             control,
+            shutdown: domain.shutdown_token(),
             done: tokio_util::sync::CancellationToken::new(),
             id,
             next_seq: 1,
@@ -2235,6 +2582,60 @@ mod tests {
             selection_charge: None,
             staging: None,
         }
+    }
+
+    #[tokio::test]
+    async fn lifecycle_cancel_ends_only_the_selected_topic_subscriber() {
+        let domain = ForwardingDomain::new(DomainBudget::from_limits(
+            &c2_config::DomainLimits::default(),
+        ));
+        let hub = Arc::new(Hub {
+            key: HubKey {
+                scope: HubScope::Local {
+                    instance: "i".into(),
+                    route_uid: "r".into(),
+                },
+                topic: "state".into(),
+            },
+            inner: Mutex::new(HubState::default()),
+            changed: Arc::new(Notify::new()),
+            budget_changed: Arc::new(Notify::new()),
+            file_segments: Arc::new(AtomicUsize::new(0)),
+            latest_budgets: Arc::new(LatestBudgets::default()),
+        });
+        let mut leaving = body(hub.clone(), &domain, 1, WireLagPolicy::Skip);
+        let mut sibling = body(hub.clone(), &domain, 2, WireLagPolicy::Skip);
+        hub.inner.lock().latest = Some(LatestFrame::new(
+            HubFrame {
+                seq: 1,
+                total: 3,
+                chunks: vec![Bytes::from_static(b"abc")],
+                memory_bytes: 0,
+                file_bytes: 0,
+                _metadata: Arc::new(domain.budget().try_reserve_memory(0).unwrap()),
+            },
+            hub.latest_budgets.clone(),
+        ));
+        let _ready = leaving.next().await.unwrap().unwrap();
+        let _begin = leaving.next().await.unwrap().unwrap();
+        leaving.control.cancel(CancelCause::Lifecycle);
+        let _data_header = leaving.next().await.unwrap().unwrap();
+        assert_eq!(leaving.next().await.unwrap().unwrap(), "abc");
+        let terminal = tokio::time::timeout(std::time::Duration::from_secs(1), leaving.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let terminal =
+            topic_wire::decode_terminal(&terminal[topic_wire::RECORD_HEADER_LEN..]).unwrap();
+        assert_eq!(terminal.complete_items, 1);
+        assert_eq!(terminal.error.code, ErrorCode::CallCancelled);
+        assert_eq!(terminal.error.details["cause"], "relay_shutdown");
+        assert_eq!(hub.stop_cause(), None);
+        let _ready = sibling.next().await.unwrap().unwrap();
+        let _begin = sibling.next().await.unwrap().unwrap();
+        let _data_header = sibling.next().await.unwrap().unwrap();
+        assert_eq!(sibling.next().await.unwrap().unwrap(), "abc");
     }
 
     #[tokio::test]

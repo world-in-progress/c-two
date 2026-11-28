@@ -3,7 +3,10 @@ use predicates::prelude::*;
 use std::io::{BufRead, BufReader, Write};
 use std::net::TcpListener;
 
-fn relay_returning(body: &'static str) -> String {
+const ENDPOINT_ID: &str = "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a";
+
+fn relay_returning(body: &str) -> String {
+    let body = body.to_owned();
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
     std::thread::spawn(move || {
@@ -28,7 +31,7 @@ fn relay_returning(body: &'static str) -> String {
     format!("http://{address}")
 }
 
-fn registry_command(subcommand: &str, body: &'static str) -> Command {
+fn registry_command(subcommand: &str, body: &str) -> Command {
     let relay = relay_returning(body);
     let mut cmd = Command::cargo_bin("c3").unwrap();
     cmd.args(["registry", subcommand, "--relay", &relay])
@@ -100,9 +103,9 @@ fn list_routes_rejects_missing_route_metadata() {
 #[test]
 fn list_routes_rejects_missing_new_route_fields() {
     for body in [
-        r#"{"routes":[{"name":"grid","relay_id":"relay-a","relay_url":"http://relay-a:8080","locality":"local","crm_ns":"example","crm_name":"Grid","crm_ver":"1","abi_hash":"abc","signature_hash":"def","relay_status":"Alive","conflict":false}]}"#,
-        r#"{"routes":[{"name":"grid","relay_id":"relay-a","relay_url":"http://relay-a:8080","locality":"local","crm_ns":"example","crm_name":"Grid","crm_ver":"1","abi_hash":"abc","signature_hash":"def","registered_at":1234.5,"conflict":false}]}"#,
-        r#"{"routes":[{"name":"grid","relay_id":"relay-a","relay_url":"http://relay-a:8080","locality":"local","crm_ns":"example","crm_name":"Grid","crm_ver":"1","abi_hash":"abc","signature_hash":"def","registered_at":1234.5,"relay_status":"Alive"}]}"#,
+        r#"{"routes":[{"name":"grid","relay_id":"relay-a","address":{"http_url":"http://relay-a:8080"},"locality":"local","crm_ns":"example","crm_name":"Grid","crm_ver":"1","abi_hash":"abc","signature_hash":"def","relay_status":"Alive","conflict":false}]}"#,
+        r#"{"routes":[{"name":"grid","relay_id":"relay-a","address":{"http_url":"http://relay-a:8080"},"locality":"local","crm_ns":"example","crm_name":"Grid","crm_ver":"1","abi_hash":"abc","signature_hash":"def","registered_at":1234.5,"conflict":false}]}"#,
+        r#"{"routes":[{"name":"grid","relay_id":"relay-a","address":{"http_url":"http://relay-a:8080"},"locality":"local","crm_ns":"example","crm_name":"Grid","crm_ver":"1","abi_hash":"abc","signature_hash":"def","registered_at":1234.5,"relay_status":"Alive"}]}"#,
     ] {
         registry_command("list-routes", body)
             .assert()
@@ -114,8 +117,8 @@ fn list_routes_rejects_missing_new_route_fields() {
 #[test]
 fn list_routes_rejects_invalid_status_and_timestamp() {
     for body in [
-        r#"{"routes":[{"name":"grid","relay_id":"relay-a","relay_url":"http://relay-a:8080","locality":"local","crm_ns":"example","crm_name":"Grid","crm_ver":"1","abi_hash":"abc","signature_hash":"def","registered_at":1234.5,"relay_status":"Unknown","conflict":false}]}"#,
-        r#"{"routes":[{"name":"grid","relay_id":"relay-a","relay_url":"http://relay-a:8080","locality":"local","crm_ns":"example","crm_name":"Grid","crm_ver":"1","abi_hash":"abc","signature_hash":"def","registered_at":"yesterday","relay_status":"Dead","conflict":false}]}"#,
+        r#"{"routes":[{"name":"grid","relay_id":"relay-a","address":{"http_url":"http://relay-a:8080"},"locality":"local","crm_ns":"example","crm_name":"Grid","crm_ver":"1","abi_hash":"abc","signature_hash":"def","registered_at":1234.5,"relay_status":"Unknown","conflict":false}]}"#,
+        r#"{"routes":[{"name":"grid","relay_id":"relay-a","address":{"http_url":"http://relay-a:8080"},"locality":"local","crm_ns":"example","crm_name":"Grid","crm_ver":"1","abi_hash":"abc","signature_hash":"def","registered_at":"yesterday","relay_status":"Dead","conflict":false}]}"#,
     ] {
         registry_command("list-routes", body)
             .assert()
@@ -128,7 +131,7 @@ fn list_routes_rejects_invalid_status_and_timestamp() {
 fn list_routes_prints_each_conflicting_and_unreachable_registration() {
     registry_command(
         "list-routes",
-        r#"{"routes":[{"name":"grid","relay_id":"relay-a","relay_url":"http://relay-a:8080","locality":"local","crm_ns":"example","crm_name":"Grid","crm_ver":"1","abi_hash":"abc","signature_hash":"def","registered_at":1234.5,"relay_status":"Alive","conflict":true},{"name":"grid","relay_id":"relay-b","relay_url":"http://relay-b:8080","locality":"peer","crm_ns":"example","crm_name":"Grid","crm_ver":"1","abi_hash":"abc","signature_hash":"def","registered_at":1235.5,"relay_status":"Alive","conflict":true},{"name":"old","relay_id":"relay-c","relay_url":"http://relay-c:8080","locality":"peer","crm_ns":"example","crm_name":"Grid","crm_ver":"1","abi_hash":"abc","signature_hash":"def","registered_at":1200.0,"relay_status":"Dead","conflict":false}]}"#,
+        r#"{"routes":[{"name":"grid","relay_id":"relay-a","address":{"http_url":"http://relay-a:8080"},"locality":"local","crm_ns":"example","crm_name":"Grid","crm_ver":"1","abi_hash":"abc","signature_hash":"def","registered_at":1234.5,"relay_status":"Alive","conflict":true},{"name":"grid","relay_id":"relay-b","address":{"http_url":"http://relay-b:8080"},"locality":"peer","crm_ns":"example","crm_name":"Grid","crm_ver":"1","abi_hash":"abc","signature_hash":"def","registered_at":1235.5,"relay_status":"Alive","conflict":true},{"name":"old","relay_id":"relay-c","address":{"http_url":"http://relay-c:8080"},"locality":"peer","crm_ns":"example","crm_name":"Grid","crm_ver":"1","abi_hash":"abc","signature_hash":"def","registered_at":1200.0,"relay_status":"Dead","conflict":false}]}"#,
     )
     .assert()
     .success()
@@ -155,7 +158,7 @@ fn peers_rejects_missing_peer_fields() {
 fn peers_rejects_malformed_peer_status() {
     registry_command(
         "peers",
-        r#"[{"relay_id":"relay-a","url":"http://relay-a:8080","route_count":0,"status":"Unknown"}]"#,
+        r#"[{"relay_id":"relay-a","address":{"http_url":"http://relay-a:8080"},"route_count":0,"status":"Unknown"}]"#,
     )
     .assert()
     .failure()
@@ -166,7 +169,7 @@ fn peers_rejects_malformed_peer_status() {
 fn registry_displays_valid_responses() {
     registry_command(
         "list-routes",
-        r#"{"routes":[{"name":"grid","relay_id":"relay-a","relay_url":"http://relay-a:8080","locality":"local","crm_ns":"example","crm_name":"Grid","crm_ver":"1","abi_hash":"abc","signature_hash":"def","registered_at":1234.5,"relay_status":"Alive","conflict":false}]}"#,
+        r#"{"routes":[{"name":"grid","relay_id":"relay-a","address":{"http_url":"http://relay-a:8080"},"locality":"local","crm_ns":"example","crm_name":"Grid","crm_ver":"1","abi_hash":"abc","signature_hash":"def","registered_at":1234.5,"relay_status":"Alive","conflict":false}]}"#,
     )
     .assert()
     .success()
@@ -174,11 +177,94 @@ fn registry_displays_valid_responses() {
 
     registry_command(
         "peers",
-        r#"[{"relay_id":"relay-b","url":"http://relay-b:8080","route_count":1,"status":"Alive"}]"#,
+        r#"[{"relay_id":"relay-b","address":{"http_url":"http://relay-b:8080"},"route_count":1,"status":"Alive"}]"#,
     )
     .assert()
     .success()
     .stdout("relay-b (http://relay-b:8080) - Alive\n");
+}
+
+#[test]
+fn registry_displays_iroh_only_routes_and_prefers_http_for_dual_address_peers() {
+    let route = serde_json::json!({
+        "name": "grid", "relay_id": "nat-relay", "locality": "peer",
+        "address": {"iroh": {
+            "endpoint_id": ENDPOINT_ID,
+            "bridge_url": "https://bridge.example:8443",
+            "direct_addrs": ["[2001:db8::1]:5000", "192.0.2.1:5000"]
+        }},
+        "crm_ns": "example", "crm_name": "Grid", "crm_ver": "1",
+        "abi_hash": "abc", "signature_hash": "def", "registered_at": 1234.5,
+        "relay_status": "Alive", "conflict": false
+    });
+    registry_command(
+        "list-routes",
+        &serde_json::json!({"routes": [route]}).to_string(),
+    )
+    .assert()
+    .success()
+    .stdout(format!(
+        "grid (nat-relay, iroh://{ENDPOINT_ID}) - registered_at=1234.5 - Alive\n"
+    ));
+
+    let peers = serde_json::json!([
+        {"relay_id": "nat-relay", "address": {"iroh": {"endpoint_id": ENDPOINT_ID}},
+         "route_count": 1, "status": "Alive"},
+        {"relay_id": "dual-relay", "address": {
+            "http_url": "http://relay.example:8080",
+            "iroh": {"endpoint_id": ENDPOINT_ID}
+        }, "route_count": 0, "status": "Suspect"}
+    ]);
+    registry_command("peers", &peers.to_string())
+        .assert()
+        .success()
+        .stdout(format!(
+            "nat-relay (iroh://{ENDPOINT_ID}) - Alive\ndual-relay (http://relay.example:8080) - Suspect\n"
+        ));
+}
+
+#[test]
+fn registry_rejects_retired_url_fields() {
+    for (command, body) in [
+        (
+            "list-routes",
+            r#"{"routes":[{"name":"grid","relay_id":"relay-a","relay_url":"http://relay-a:8080","locality":"local","crm_ns":"example","crm_name":"Grid","crm_ver":"1","abi_hash":"abc","signature_hash":"def","registered_at":1234.5,"relay_status":"Alive","conflict":false}]}"#,
+        ),
+        (
+            "peers",
+            r#"[{"relay_id":"relay-a","url":"http://relay-a:8080","route_count":0,"status":"Alive"}]"#,
+        ),
+        (
+            "peers",
+            r#"[{"relay_id":"relay-a","url":"http://relay-a:8080","address":{"http_url":"http://relay-a:8080"},"route_count":0,"status":"Alive"}]"#,
+        ),
+    ] {
+        registry_command(command, body)
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains("invalid JSON"));
+    }
+}
+
+#[test]
+fn peers_rejects_invalid_mesh_addresses() {
+    for address in [
+        serde_json::json!({}),
+        serde_json::json!({"http_url": "iroh://wrong-field"}),
+        serde_json::json!({"iroh": {}}),
+        serde_json::json!({"iroh": {"endpoint_id": ENDPOINT_ID.to_ascii_uppercase()}}),
+        serde_json::json!({"iroh": {"endpoint_id": "0123"}}),
+        serde_json::json!({"iroh": {"endpoint_id": ENDPOINT_ID, "bridge_url": "not a URL"}}),
+        serde_json::json!({"iroh": {"endpoint_id": ENDPOINT_ID, "direct_addrs": ["192.0.2.1"]}}),
+    ] {
+        let peers = serde_json::json!([
+            {"relay_id": "relay-a", "address": address, "route_count": 0, "status": "Alive"}
+        ]);
+        registry_command("peers", &peers.to_string())
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains("invalid JSON"));
+    }
 }
 
 fn force_leave_relay(status: u16, body: &str) -> (String, std::thread::JoinHandle<()>) {

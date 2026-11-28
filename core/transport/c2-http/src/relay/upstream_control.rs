@@ -216,7 +216,7 @@ fn expected_contract_for_route(route: &RouteEntry) -> c2_contract::ExpectedRoute
 mod tests {
     use super::*;
     use crate::relay::test_support::{TEST_ABI_HASH, TEST_SIGNATURE_HASH, reserve_echo_route};
-    use crate::relay::types::Locality;
+    use crate::relay::types::{Locality, PeerAddress};
     use futures::FutureExt;
 
     const STEP: Duration = Duration::from_secs(2);
@@ -226,7 +226,7 @@ mod tests {
         RouteEntry {
             name: ROUTE_NAME.into(),
             relay_id: "test-relay".into(),
-            relay_url: "http://127.0.0.1:1".into(),
+            address: PeerAddress::http("http://127.0.0.1:1"),
             server_id: Some(server_id.into()),
             server_instance_id: Some(format!("{server_id}-instance")),
             ipc_address: Some(address.into()),

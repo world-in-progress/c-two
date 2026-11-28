@@ -31,7 +31,7 @@ Rust Core 按 **显式代码或 CLI 覆盖 > 进程环境变量 > `.env` > 默�
 | `C2_RELAY_INSECURE_PLAINTEXT` | `false` | `--insecure-plaintext` |
 | `C2_RELAY_ID` | 自动生成 | `c3 relay --relay-id` |
 | `C2_RELAY_ADVERTISE_URL` | 由实际监听地址和承载推导 | `c3 relay --advertise-url` |
-| `C2_RELAY_SEEDS` | 空 | `c3 relay --seeds` / `-s`，逗号分隔的 HTTP URL 或 iroh seed 地址 |
+| `C2_RELAY_SEEDS` | 空 | `c3 relay --seeds` / `-s`，逗号分隔的回环 HTTP URL 或 iroh seed 地址 |
 | `C2_RELAY_BRIDGE` | 未设置 | `c3 relay --bridge`，私有 HTTPS 跳板 URL |
 | `C2_RELAY_BRIDGE_TOKEN` | 未设置 | `c3 relay --bridge-token`，使用跳板时必填 |
 | `C2_RELAY_CLUSTER_SECRET` | 未设置 | `c3 relay --cluster-secret`，启用 iroh 时必填 |
@@ -70,7 +70,7 @@ Python `cc.set_client` 与 `cc.set_server` 接受表中的三个容量字段。`
 
 `c3 bridge` 通过 HTTPS 提供节点会合与密文转发，默认在 UDP 7842 提供 QUIC 地址发现。它在私有状态目录中保存自签证书 `bridge-cert.pem`、私钥 `bridge-key.pem` 和自动生成的 `bridge-token`。跳板 token 仅用于准入，集群密钥只用于 relay 端点间互证，二者必须不同。启动输出包含可复制的跳板 URL 和 token。Dry-run 仅显示凭据的设置状态，且不创建文件或监听套接字。见 [c3 bridge](../../cli/README.md#bridge)。
 
-跳板 URL 形如 `https://host:8443?pin=<64-lower-hex>&quic=off`。自动生成的证书使用叶证书 DER 的 SHA-256 指纹校验，省略 `pin` 时按 WebPKI 验证。省略 `quic` 时采用 7842，或填写其他端口或 `off`。配置跳板、集群密钥或 `iroh://` seed 会启用 iroh。无跳板的 seed 必须附加 `@<ip:port>`。Relay 在 `~/.c3-relay` 或指定状态目录下持久化 `mesh-key.ed25519`，未显式指定 relay ID 时从端点身份派生。通过 iroh 的控制请求与数据请求使用独立的 QUIC 连接。当前 Mesh 8 路由表仍经 HTTP seed 引导和交换路由。Mesh 8 的 iroh 节点消息须使用从端点身份派生的发送方 ID。
+跳板 URL 形如 `https://host:8443?pin=<64-lower-hex>&quic=off`。自动生成的证书使用叶证书 DER 的 SHA-256 指纹校验，省略 `pin` 时按 WebPKI 验证。省略 `quic` 时采用 7842，或填写其他端口或 `off`。配置跳板、集群密钥或 `iroh://` seed 会启用 iroh。无跳板的 seed 必须附加 `@<ip:port>`。Relay 在 `~/.c3-relay` 或指定状态目录下持久化 `mesh-key.ed25519`，未显式指定 relay ID 时从端点身份派生。通过 iroh 的控制请求与数据请求使用独立的 QUIC 连接。跨机 relay 经 iroh 加入 Mesh 9 并交换路由。使用同一跳板时，可用启动时输出的 `iroh://<endpoint-id>` 作为 seed。直连时使用 `iroh://<endpoint-id>@<ip:port>`，其中地址必须可达。HTTP seed 用于回环组网。SDK 配置 HTTP(S) relay 锚点。发现响应返回 `proxy_via_anchor: true` 时，SDK 沿用该 URL 和 TLS 信任配置，由锚点转发到持有路由的 relay。见 [ADR 0008](../decisions/0008-relay-tls-http2-and-iroh-mesh.md)。
 
 ## 固定传输常量
 

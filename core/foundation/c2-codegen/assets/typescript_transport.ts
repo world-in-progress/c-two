@@ -3068,7 +3068,7 @@ async function resolveRelayRoutes(
     }
     let routes: C2RelayRouteInfo[];
     try {
-      routes = payload.map((route, index) => normalizeRelayRouteInfo(route, index));
+      routes = payload.map((route, index) => normalizeRelayRouteInfo(route, index, anchorUrl));
     } catch (error) {
       throw new C2HttpTransportError(`C-Two relay resolve payload shape invalid: ${formatCaughtError(error)}`, error, "pre_dispatch");
     }
@@ -3091,12 +3091,20 @@ async function resolveRelayRoutes(
   }, resolveTimeoutMs, "C-Two relay resolve");
 }
 
-function normalizeRelayRouteInfo(route: unknown, index: number): C2RelayRouteInfo {
+function normalizeRelayRouteInfo(route: unknown, index: number, anchorUrl: string): C2RelayRouteInfo {
   if (typeof route !== "object" || route === null) {
     throw new Error(`C-Two relay resolve route ${index} is not an object.`);
   }
   const item = route as Record<string, unknown>;
   if ("route_revision" in item) throw new Error(`C-Two relay resolve route ${index} contains unknown fields.`);
+  const proxyViaAnchor = item.proxy_via_anchor;
+  if (proxyViaAnchor !== undefined && typeof proxyViaAnchor !== "boolean") {
+    throw new Error(`C-Two relay resolve route ${index} has invalid boolean field proxy_via_anchor.`);
+  }
+  const resolvedRelayUrl = optionalStringField(item, "relay_url", index);
+  if (proxyViaAnchor !== true && resolvedRelayUrl === undefined) {
+    throw new Error(`C-Two relay resolve route ${index} is missing string field relay_url.`);
+  }
   const ipcAddress = optionalStringField(item, "ipc_address", index);
   const serverId = optionalStringField(item, "server_id", index);
   const serverInstanceId = optionalStringField(item, "server_instance_id", index);
@@ -3110,9 +3118,8 @@ function normalizeRelayRouteInfo(route: unknown, index: number): C2RelayRouteInf
   }
   return {
     name: stringField(item, "name", index),
-    relayUrl: normalizeRelayBaseUrl(
-      stringField(item, "relay_url", index),
-      `C-Two relay resolve route ${index} relay_url`,
+    relayUrl: proxyViaAnchor === true ? anchorUrl : normalizeRelayBaseUrl(
+      resolvedRelayUrl!, `C-Two relay resolve route ${index} relay_url`,
     ),
     ipcAddress,
     serverId,

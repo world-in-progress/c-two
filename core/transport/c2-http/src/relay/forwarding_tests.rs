@@ -526,7 +526,7 @@ mod early_rejection {
                 assert!(table.register_route(RouteEntry {
                     name: "grid".into(),
                     relay_id: "early-rejection".into(),
-                    relay_url: "http://127.0.0.1:9".into(),
+                    address: crate::relay::types::PeerAddress::http("http://127.0.0.1:9"),
                     server_id: Some("never-acquired".into()),
                     server_instance_id: Some("never-acquired-instance".into()),
                     ipc_address: Some("ipc://never-acquired".into()),
@@ -840,6 +840,7 @@ async fn capacity_rejection_case(kind: CapacityRequest) {
             .unwrap_or_else(|| "127.0.0.1:9".parse().unwrap());
         let state = Arc::new(RelayState::new_with_budget(
             Arc::new(RelayConfig {
+                bind: socket.to_string(),
                 relay_id: "capacity-http-test".into(),
                 ..RelayConfig::default()
             }),
@@ -855,7 +856,7 @@ async fn capacity_rejection_case(kind: CapacityRequest) {
         let entry = RouteEntry {
             name: "grid".into(),
             relay_id: state.config().relay_id.clone(),
-            relay_url: format!("http://{socket}"),
+            address: crate::relay::types::PeerAddress::http(format!("http://{socket}")),
             server_id: Some("capacity-server".into()),
             server_instance_id: Some("capacity-instance".into()),
             ipc_address: Some("ipc://capacity-must-not-dispatch".into()),
@@ -932,7 +933,7 @@ async fn capacity_rejection_case(kind: CapacityRequest) {
                 ..Default::default()
             };
             let client = crate::client::RelayAwareHttpClient::new(
-                &entry.relay_url,
+                entry.address.http_url.as_deref().unwrap(),
                 expected,
                 &Default::default(),
                 config,

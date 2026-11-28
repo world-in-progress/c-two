@@ -129,7 +129,8 @@ fn route_info(relay_url: &str) -> RelayRouteInfo {
     let expected = expected_contract();
     RelayRouteInfo {
         name: expected.route_name,
-        relay_url: relay_url.into(),
+        relay_url: Some(relay_url.into()),
+        proxy_via_anchor: false,
         ipc_address: None,
         server_id: None,
         server_instance_id: None,

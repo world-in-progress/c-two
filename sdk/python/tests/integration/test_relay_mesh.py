@@ -260,7 +260,9 @@ class TestTwoRelayMesh:
 
         # Both relays should see each other as peers.
         peers_a = _http_get_json(f"{url_a}/_peers")
-        assert any(p["relay_id"] == "relay-b" for p in peers_a)
+        peer_b = next(peer for peer in peers_a if peer["relay_id"] == "relay-b")
+        assert peer_b["address"] == {"http_url": url_b}
+        assert "url" not in peer_b
 
     def test_route_withdraw_propagation(self, start_c3_relay, route_scope_attestor_binary):
         relay_a = start_c3_relay(

@@ -63,7 +63,13 @@ pub(crate) mod gossip;
 pub mod iroh_transport;
 #[cfg(test)]
 mod memory_tests;
+#[cfg(test)]
+mod mesh_forward_tests;
+#[cfg(test)]
+mod mesh_stream_tests;
 pub(crate) mod peer;
+pub(crate) mod peer_client;
+pub(crate) mod peer_forward;
 pub(crate) mod peer_handlers;
 #[cfg(test)]
 mod route_identity_tests;
@@ -87,3 +93,4 @@ pub(crate) mod url;
 
 pub use c2_config::RelayConfig;
 pub use server::{RelayControlError, RelayServer, RelayServerOptions, RelayShutdownReceipt};
+pub use types::{IrohPeerAddr, PeerAddress};

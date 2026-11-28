@@ -566,6 +566,8 @@ class TestRelayControlPlane:
             routes = resp.json()['routes']
             assert any(r['name'] == 'hello' for r in routes)
             route = next(r for r in routes if r['name'] == 'hello')
+            assert route['address'] == {'http_url': relay_url}
+            assert 'relay_url' not in route
             assert 'server_id' not in route
             assert 'server_instance_id' not in route
             assert 'ipc_address' not in route

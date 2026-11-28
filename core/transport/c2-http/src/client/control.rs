@@ -117,7 +117,10 @@ struct AdminUnregisterRequest<'a> {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RelayRouteInfo {
     pub name: String,
-    pub relay_url: String,
+    #[serde(default)]
+    pub relay_url: Option<String>,
+    #[serde(default)]
+    pub proxy_via_anchor: bool,
     pub ipc_address: Option<String>,
     pub server_id: Option<String>,
     pub server_instance_id: Option<String>,

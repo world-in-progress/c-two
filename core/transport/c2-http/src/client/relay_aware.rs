@@ -578,7 +578,12 @@ impl RelayAwareHttpClient {
             }
 
             for route in ordered {
-                let relay_url = route.relay_url.trim_end_matches('/').to_string();
+                let relay_url = route
+                    .relay_url
+                    .as_deref()
+                    .expect("validated relay target")
+                    .trim_end_matches('/')
+                    .to_string();
                 let client =
                     match self.acquire_route_client_with_deadline(&relay_url, None, deadline) {
                         Ok(client) => client,
@@ -687,7 +692,7 @@ impl RelayAwareHttpClient {
             .await?;
         let raw_routes_non_empty = !routes.routes.is_empty();
         let local_endpoint_namespace = routes.local_endpoint_namespace;
-        let filtered = filter_routes_by_expected_contract(routes.routes, &self.expected);
+        let mut filtered = filter_routes_by_expected_contract(routes.routes, &self.expected);
         if raw_routes_non_empty && filtered.is_empty() {
             return Err(HttpError::ServerError(
                 409,
@@ -696,10 +701,11 @@ impl RelayAwareHttpClient {
         }
         let anchor_url = reqwest::Url::parse(self.control.base_url())
             .map_err(|_| HttpError::InvalidInput("invalid relay anchor URL".into()))?;
-        for route in &filtered {
-            validate_resolved_target(
+        for route in &mut filtered {
+            normalize_resolved_target(
                 &anchor_url,
-                &route.relay_url,
+                self.control.base_url(),
+                route,
                 &self.control.policy().tls_trust,
             )?;
         }
@@ -778,7 +784,13 @@ impl RelayAwareHttpClient {
         let mut preferred = Vec::new();
         let mut rest = Vec::new();
         for route in routes {
-            if route.relay_url.trim_end_matches('/') == current.relay_url {
+            if route
+                .relay_url
+                .as_deref()
+                .expect("validated relay target")
+                .trim_end_matches('/')
+                == current.relay_url
+            {
                 preferred.push(route);
             } else {
                 rest.push(route);
@@ -1027,6 +1039,24 @@ fn validate_resolved_target(
     Ok(())
 }
 
+fn normalize_resolved_target(
+    anchor: &reqwest::Url,
+    anchor_base: &str,
+    route: &mut RelayRouteInfo,
+    trust: &RelayTlsTrust,
+) -> Result<(), HttpError> {
+    if route.proxy_via_anchor {
+        route.relay_url = Some(anchor_base.to_owned());
+    } else {
+        let target = route
+            .relay_url
+            .as_deref()
+            .ok_or_else(|| HttpError::InvalidInput("resolved relay URL is required".into()))?;
+        validate_resolved_target(anchor, target, trust)?;
+    }
+    Ok(())
+}
+
 #[cfg(all(test, feature = "relay"))]
 mod tests {
     use super::*;
@@ -1268,7 +1298,8 @@ mod tests {
     fn route_info(name: String, relay_url: String) -> RelayRouteInfo {
         RelayRouteInfo {
             name,
-            relay_url,
+            relay_url: Some(relay_url),
+            proxy_via_anchor: false,
             ipc_address: None,
             server_id: None,
             server_instance_id: None,
@@ -1279,6 +1310,72 @@ mod tests {
             signature_hash: TEST_SIGNATURE_HASH.to_string(),
             max_payload_size: 1024,
         }
+    }
+
+    #[test]
+    fn anchor_proxy_uses_anchor_path_and_direct_targets_are_validated() {
+        let anchor_base = "https://lab.example.com/c2";
+        let anchor = reqwest::Url::parse(anchor_base).unwrap();
+        let trust = RelayTlsTrust::SystemDefault;
+        let mut route = route_info("grid".into(), "http://insecure.example".into());
+        route.relay_url = None;
+        route.proxy_via_anchor = true;
+        normalize_resolved_target(&anchor, anchor_base, &mut route, &trust).unwrap();
+        assert_eq!(route.relay_url.as_deref(), Some(anchor_base));
+        route.proxy_via_anchor = false;
+        route.relay_url = None;
+        assert!(normalize_resolved_target(&anchor, anchor_base, &mut route, &trust).is_err());
+        route.relay_url = Some("http://insecure.example".into());
+        assert!(normalize_resolved_target(&anchor, anchor_base, &mut route, &trust).is_err());
+        route.relay_url = Some("http://127.0.0.1:8080".into());
+        normalize_resolved_target(&anchor, anchor_base, &mut route, &trust).unwrap();
+
+        let mut value = serde_json::to_value(&route).unwrap();
+        let fields = value.as_object_mut().unwrap();
+        fields.remove("proxy_via_anchor");
+        fields.remove("relay_url");
+        let defaulted: RelayRouteInfo = serde_json::from_value(value.clone()).unwrap();
+        assert!(!defaulted.proxy_via_anchor);
+        assert!(defaulted.relay_url.is_none());
+        value["proxy_via_anchor"] = serde_json::json!("true");
+        assert!(serde_json::from_value::<RelayRouteInfo>(value).is_err());
+    }
+
+    #[tokio::test]
+    async fn proxy_resolution_and_probe_keep_anchor_path() {
+        let probes = Arc::new(AtomicUsize::new(0));
+        let observed = probes.clone();
+        let routes = Router::new()
+            .route(
+                "/_resolve/{route}",
+                get(|| async {
+                    let mut route = route_info("grid".into(), "http://unused.example".into());
+                    route.relay_url = None;
+                    route.proxy_via_anchor = true;
+                    Json(vec![route])
+                }),
+            )
+            .route(
+                "/_probe/{route}",
+                get(move || {
+                    observed.fetch_add(1, Ordering::SeqCst);
+                    async { StatusCode::OK }
+                }),
+            );
+        let (base, server) = spawn_app(Router::new().nest("/c2", routes)).await;
+        let anchor = format!("{base}/c2");
+        let client = RelayAwareHttpClient::new(
+            &anchor,
+            expected_contract(),
+            &Default::default(),
+            RelayAwareClientConfig::default(),
+        )
+        .unwrap()
+        .with_http_only();
+        let target = client.select_target_async(false).await;
+        server.abort();
+        assert_eq!(target.unwrap().as_url(), anchor);
+        assert_eq!(probes.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
@@ -1612,7 +1709,7 @@ mod tests {
         let body = Json(vec![
             route_info(name.clone(), state.live_url.clone()),
             RelayRouteInfo {
-                relay_url: state.stale_url.clone(),
+                relay_url: Some(state.stale_url.clone()),
                 ipc_address: Some("ipc://local-grid".to_string()),
                 server_id: Some("local-grid".to_string()),
                 server_instance_id: Some("inst-local-grid".to_string()),
@@ -1636,7 +1733,7 @@ mod tests {
     ) -> Response {
         state.resolve_count.fetch_add(1, Ordering::SeqCst);
         let body = Json(vec![RelayRouteInfo {
-            relay_url: state.stale_url.clone(),
+            relay_url: Some(state.stale_url.clone()),
             ipc_address: Some("ipc://local-grid".to_string()),
             server_id: Some("local-grid".to_string()),
             server_instance_id: Some("inst-local-grid".to_string()),
@@ -2439,7 +2536,7 @@ mod tests {
     #[test]
     fn local_ipc_selection_requires_loopback_anchor() {
         let routes = vec![RelayRouteInfo {
-            relay_url: "http://relay.example".to_string(),
+            relay_url: Some("http://relay.example".to_string()),
             ipc_address: Some("ipc://local-grid".to_string()),
             server_id: Some("local-grid".to_string()),
             server_instance_id: Some("inst-local-grid".to_string()),

@@ -48,7 +48,8 @@ fn route(url: &str) -> RelayRouteInfo {
     let contract = expected();
     RelayRouteInfo {
         name: contract.route_name,
-        relay_url: url.into(),
+        relay_url: Some(url.into()),
+        proxy_via_anchor: false,
         ipc_address: None,
         server_id: None,
         server_instance_id: None,

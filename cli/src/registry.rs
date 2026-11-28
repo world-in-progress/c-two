@@ -1,21 +1,25 @@
 use anyhow::{Result, anyhow};
 use c2_config::{ConfigResolver, ConfigSources, EnvCatalog, ResolvedRelayClientConfig};
+use c2_http::relay::PeerAddress;
 use clap::{Args, Subcommand};
-use serde::Deserialize;
 use serde::de::DeserializeOwned;
+use serde::{Deserialize, Deserializer};
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RoutesResponse {
     routes: Vec<RouteRecord>,
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 // Deserialize every endpoint field so a partial route cannot appear valid.
 #[allow(dead_code)]
 struct RouteRecord {
     name: String,
     relay_id: String,
-    relay_url: String,
+    #[serde(deserialize_with = "deserialize_peer_address")]
+    address: PeerAddress,
     locality: RouteLocality,
     crm_ns: String,
     crm_name: String,
@@ -35,12 +39,24 @@ enum RouteLocality {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 #[allow(dead_code)]
 struct PeerRecord {
     relay_id: String,
-    url: String,
+    #[serde(deserialize_with = "deserialize_peer_address")]
+    address: PeerAddress,
     route_count: u32,
     status: PeerStatus,
+}
+
+fn deserialize_peer_address<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<PeerAddress, D::Error> {
+    let address = PeerAddress::deserialize(deserializer)?;
+    if !address.is_valid() {
+        return Err(serde::de::Error::custom("invalid mesh address"));
+    }
+    Ok(address)
 }
 
 #[derive(Deserialize)]
@@ -184,7 +200,7 @@ fn list_routes(relay: &str) -> Result<()> {
             "{} ({}, {}) - registered_at={} - {}{}",
             route.name,
             route.relay_id,
-            route.relay_url,
+            route.address.display_target(),
             route.registered_at,
             route.relay_status.as_str(),
             if route.conflict {
@@ -207,7 +223,7 @@ fn peers(relay: &str) -> Result<()> {
         println!(
             "{} ({}) - {}",
             peer.relay_id,
-            peer.url,
+            peer.address.display_target(),
             peer.status.as_str()
         );
     }

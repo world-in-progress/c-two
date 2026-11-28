@@ -3,7 +3,10 @@
 use std::{
     collections::{HashMap, HashSet},
     fmt,
+    future::Future,
+    pin::Pin,
     sync::{Arc, OnceLock, Weak},
+    task::{Context, Poll},
     time::Duration,
 };
 
@@ -11,6 +14,7 @@ use axum::{Router, body::Body};
 use c2_config::{RelayBridgeSpec, RelayConfig, RelayTlsTrust};
 use http::{Request, Response};
 use hyper::body::Incoming;
+use hyper::client::conn::http1::SendRequest;
 use hyper_util::rt::TokioIo;
 use iroh::{
     Endpoint, EndpointAddr, EndpointId, RelayMode, SecretKey,
@@ -23,9 +27,9 @@ use iroh_relay::{RelayQuicConfig, tls::CaTlsConfig};
 use parking_lot::Mutex;
 use sha2::{Digest, Sha256};
 use tokio::{sync::OnceCell, task::JoinSet, time::timeout};
-use tokio_util::sync::CancellationToken;
+use tokio_util::{sync::CancellationToken, task::AbortOnDropHandle};
 
-use super::transport::IrohQuicBiStream;
+use super::{peer_client::PeerRequestError, transport::IrohQuicBiStream};
 use crate::{
     private_state::{constant_time_eq, persistent_hex32, state_dir},
     tls::relay_server_cert_verifier,
@@ -68,6 +72,36 @@ pub struct IrohMeshTransport {
     lanes: Mutex<HashMap<(EndpointId, MeshLane), LaneCell>>,
 }
 
+pub(super) struct PreparedIrohRequest {
+    sender: SendRequest<Body>,
+    request: Request<Body>,
+    driver: AbortOnDropHandle<()>,
+}
+
+impl PreparedIrohRequest {
+    pub(super) fn dispatch(
+        mut self,
+    ) -> impl Future<Output = Result<Response<Body>, PeerRequestError>> {
+        let response = self.sender.try_send_request(self.request);
+        let driver = self.driver;
+        async move {
+            let response = response.await.map_err(|error| {
+                if error.message().is_some() {
+                    PeerRequestError::before_dispatch(error.error())
+                } else {
+                    PeerRequestError::after_dispatch(error.error())
+                }
+            })?;
+            Ok(response.map(|body| {
+                Body::new(MeshResponseBody {
+                    body,
+                    _driver: driver,
+                })
+            }))
+        }
+    }
+}
+
 impl IrohMeshTransport {
     pub(super) fn load_identity(config: &RelayConfig) -> Result<SecretKey, String> {
         let dir = state_dir(config.state_dir.as_deref(), ".c3-relay")?;
@@ -75,22 +109,7 @@ impl IrohMeshTransport {
         Ok(SecretKey::from_bytes(&key))
     }
 
-    pub(super) async fn bind(
-        config: &RelayConfig,
-        key: SecretKey,
-        bridge: Option<RelayBridgeSpec>,
-    ) -> Result<Self, MeshError> {
-        Self::bind_with(
-            config,
-            key,
-            bridge,
-            #[cfg(test)]
-            false,
-        )
-        .await
-    }
-
-    async fn bind_with(
+    pub(super) async fn bind_with(
         config: &RelayConfig,
         key: SecretKey,
         bridge: Option<RelayBridgeSpec>,
@@ -183,25 +202,27 @@ impl IrohMeshTransport {
                 *current = Some(conn.clone());
                 return Ok(conn);
             }
-            // A restarted peer retains its endpoint key but loses its
-            // authenticated set. Re-prove membership before reconnecting.
-            self.auth.peers.lock().remove(&addr.id);
         }
         let conn = self.endpoint.connect(addr.clone(), lane.alpn()).await?;
         *current = Some(conn.clone());
         Ok(conn)
     }
 
-    /// Drive a single HTTP request over a bidirectional stream in the selected lane.
-    /// The caller can supply a relative URI. Stream failures are never replayed.
-    pub async fn send_request(
+    /// Open a lane stream and set up HTTP without submitting the request.
+    pub(super) async fn prepare_request(
         &self,
         lane: MeshLane,
         remote_addr: &EndpointAddr,
         mut request: Request<Body>,
-    ) -> Result<Response<Incoming>, MeshError> {
-        let conn = self.connection(lane, remote_addr).await?;
-        let (send, recv) = conn.open_bi().await?;
+    ) -> Result<PreparedIrohRequest, PeerRequestError> {
+        let conn = self
+            .connection(lane, remote_addr)
+            .await
+            .map_err(PeerRequestError::before_dispatch)?;
+        let (send, recv) = conn
+            .open_bi()
+            .await
+            .map_err(PeerRequestError::before_dispatch)?;
         request
             .headers_mut()
             .entry(http::header::HOST)
@@ -209,17 +230,39 @@ impl IrohMeshTransport {
         let (mut sender, driver) = hyper::client::conn::http1::handshake(TokioIo::new(
             IrohQuicBiStream::new(send, recv, None),
         ))
-        .await?;
-        tokio::spawn(async move {
+        .await
+        .map_err(PeerRequestError::before_dispatch)?;
+        let driver = AbortOnDropHandle::new(tokio::spawn(async move {
             // Keep the QUIC connection live for the entire response even if
             // the transport removes its cached lane.
             let _conn = conn;
             let _ = driver.await;
-        });
-        Ok(sender.send_request(request).await?)
+        }));
+        sender
+            .ready()
+            .await
+            .map_err(PeerRequestError::before_dispatch)?;
+        Ok(PreparedIrohRequest {
+            sender,
+            request,
+            driver,
+        })
     }
 
-    pub(super) async fn serve(&self, app: Router, stop: CancellationToken) {
+    #[cfg(test)]
+    async fn send_request(
+        &self,
+        lane: MeshLane,
+        remote_addr: &EndpointAddr,
+        request: Request<Body>,
+    ) -> Result<Response<Body>, PeerRequestError> {
+        self.prepare_request(lane, remote_addr, request)
+            .await?
+            .dispatch()
+            .await
+    }
+
+    pub(super) async fn serve(&self, control: Router, data: Router, stop: CancellationToken) {
         let mut connections = JoinSet::new();
         loop {
             tokio::select! {
@@ -228,7 +271,8 @@ impl IrohMeshTransport {
                 _ = connections.join_next(), if !connections.is_empty() => {}
                 incoming = self.endpoint.accept() => {
                     let Some(incoming) = incoming else { break; };
-                    let (app, auth, stop) = (app.clone(), self.auth.clone(), stop.clone());
+                    let (control, data, auth, stop) =
+                        (control.clone(), data.clone(), self.auth.clone(), stop.clone());
                     connections.spawn(async move {
                         let connection = tokio::select! {
                             _ = stop.cancelled() => return,
@@ -243,7 +287,8 @@ impl IrohMeshTransport {
                                     connection.close(AUTH_DENIED, AUTH_DENIED_REASON);
                                 }
                             }
-                            MESH_CTRL_ALPN | MESH_DATA_ALPN => serve_connection(connection, app).await,
+                            MESH_CTRL_ALPN => serve_connection(connection, control).await,
+                            MESH_DATA_ALPN => serve_connection(connection, data).await,
                             _ => unreachable!("mesh ALPNs are fixed at bind time"),
                         }
                     });
@@ -253,6 +298,33 @@ impl IrohMeshTransport {
         self.endpoint.close().await;
         connections.join_all().await;
         self.lanes.lock().clear();
+    }
+}
+
+struct MeshResponseBody {
+    body: Incoming,
+    // Dropping the response also drops the QUIC stream, even while Hyper's
+    // driver is waiting for network data and has nothing to write.
+    _driver: AbortOnDropHandle<()>,
+}
+
+impl http_body::Body for MeshResponseBody {
+    type Data = bytes::Bytes;
+    type Error = hyper::Error;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+        Pin::new(&mut self.get_mut().body).poll_frame(cx)
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.body.is_end_stream()
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        self.body.size_hint()
     }
 }
 
@@ -321,15 +393,11 @@ impl MeshAuth {
     }
 
     async fn authenticate(&self, addr: &EndpointAddr) -> bool {
-        if self.peers.lock().contains(&addr.id) {
-            return true;
-        }
+        // A new connection proves both sides again. A remote restart can
+        // discard its authentication state without changing its endpoint ID.
         let attempt = self.attempts.lock().entry(addr.id).or_default().clone();
         let result = *attempt
             .get_or_init(|| async {
-                if self.peers.lock().contains(&addr.id) {
-                    return true;
-                }
                 let Some(endpoint) = self.endpoint.get().and_then(Weak::upgrade) else {
                     return false;
                 };

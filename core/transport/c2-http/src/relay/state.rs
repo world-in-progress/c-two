@@ -24,6 +24,8 @@ use crate::relay::conn_pool::{
     AcquireError as PoolAcquireError, CachedClient, ConnectionPool, OwnerReplaceError,
     OwnerReplacementEvidence, OwnerToken, UpstreamLease,
 };
+use crate::relay::peer::PeerSender;
+use crate::relay::peer_client::PeerHttpClient;
 use crate::relay::route_table::{RouteTable, TombstoneGcEntry};
 use crate::relay::types::*;
 use crate::relay::upstream_control::{self, UpstreamControlTask, UpstreamOwnerKey};
@@ -98,6 +100,7 @@ pub struct RelayState {
     endpoint_context: LocalEndpointContext,
     default_endpoint_namespace: bool,
     disseminator: Arc<dyn crate::relay::disseminator::Disseminator>,
+    peer_client: Arc<PeerHttpClient>,
     /// One shared role domain for the whole relay: the forwarding admission
     /// slots and memory buffers plus every data-plane upstream `IpcClient`'s
     /// request and reassembly pools charge this same budget, so opening more
@@ -232,9 +235,30 @@ impl RelayState {
         )
     }
 
+    #[cfg(test)]
     pub(crate) fn new_with_budget(
         config: Arc<RelayConfig>,
         disseminator: Arc<dyn crate::relay::disseminator::Disseminator>,
+        endpoint_context: LocalEndpointContext,
+        budget: DomainBudget,
+        owner_idle_timeout: Duration,
+    ) -> Self {
+        let peer_client =
+            Arc::new(PeerHttpClient::new(&config, None, None).expect("test peer HTTP client"));
+        Self::new_with_peer_client(
+            config,
+            disseminator,
+            peer_client,
+            endpoint_context,
+            budget,
+            owner_idle_timeout,
+        )
+    }
+
+    pub(super) fn new_with_peer_client(
+        config: Arc<RelayConfig>,
+        disseminator: Arc<dyn crate::relay::disseminator::Disseminator>,
+        peer_client: Arc<PeerHttpClient>,
         endpoint_context: LocalEndpointContext,
         budget: DomainBudget,
         owner_idle_timeout: Duration,
@@ -256,6 +280,7 @@ impl RelayState {
             #[cfg(test)]
             peer_removal_seam: parking_lot::Mutex::new(None),
             disseminator,
+            peer_client,
             config,
             endpoint_context,
             default_endpoint_namespace,
@@ -291,6 +316,14 @@ impl RelayState {
 
     pub fn disseminator(&self) -> &Arc<dyn crate::relay::disseminator::Disseminator> {
         &self.disseminator
+    }
+
+    pub(crate) fn peer_client(&self) -> &Arc<PeerHttpClient> {
+        &self.peer_client
+    }
+
+    pub(super) fn local_peer_address(&self) -> PeerAddress {
+        self.peer_client.local_address(&self.config)
     }
 
     pub fn config(&self) -> &RelayConfig {
@@ -1062,13 +1095,17 @@ impl RelayState {
         self.route_table_write().register_peer(info);
     }
 
-    pub fn unregister_peer(&self, relay_id: &str) -> Option<PeerInfo> {
+    pub(super) fn unregister_peer(&self, sender: PeerSender<'_>) -> Option<PeerInfo> {
         #[cfg(test)]
         if let Some((entered, resume)) = self.peer_removal_seam.lock().take() {
             entered.send(()).unwrap();
             resume.recv_timeout(Duration::from_secs(5)).unwrap();
         }
-        self.route_table_write().unregister_peer(relay_id)
+        let mut table = self.route_table_write();
+        if !table.matches_sender(sender, true) {
+            return None;
+        }
+        table.unregister_peer(sender.relay_id)
     }
 
     #[cfg(test)]
@@ -1081,10 +1118,12 @@ impl RelayState {
         (entered_rx, resume_tx)
     }
 
+    #[cfg(test)]
     pub fn has_peer(&self, relay_id: &str) -> bool {
         self.route_table.read().has_peer(relay_id)
     }
 
+    #[cfg(test)]
     pub fn peer_is_alive(&self, relay_id: &str) -> bool {
         self.route_table.read().peer_is_alive(relay_id)
     }
@@ -1096,7 +1135,7 @@ impl RelayState {
             .into_iter()
             .map(|p| PeerSnapshot {
                 relay_id: p.relay_id.clone(),
-                url: p.url.clone(),
+                address: p.address.clone(),
                 route_count: p.route_count,
                 status: p.status,
             })
@@ -1113,8 +1152,8 @@ impl RelayState {
         self.route_table.read().full_snapshot()
     }
 
-    pub fn merge_snapshot(&self, sync: ValidatedFullSync) {
-        self.route_table_write().merge_validated_snapshot(sync);
+    pub fn merge_snapshot(&self, sync: ValidatedFullSync) -> bool {
+        self.route_table_write().merge_validated_snapshot(sync)
     }
 
     pub fn route_digest(&self) -> HashMap<(String, String, bool), RouteDigestHash> {
@@ -1134,12 +1173,15 @@ impl RelayState {
 
     pub(crate) fn authoritative_missing_tombstone(
         &self,
+        sender: PeerSender<'_>,
         name: &str,
         relay_id: &str,
     ) -> Option<RouteTombstone> {
-        self.route_table
-            .write()
-            .authoritative_missing_tombstone(name, relay_id)
+        let mut table = self.route_table.write();
+        if !table.matches_sender(sender, true) {
+            return None;
+        }
+        table.authoritative_missing_tombstone(name, relay_id)
     }
 
     pub(crate) fn gc_tombstones(&self, retention: std::time::Duration) -> Vec<TombstoneGcEntry> {
@@ -2106,14 +2148,14 @@ mod tests {
     fn announce_peer_route(state: &RelayState, entry: RouteEntry) {
         let sender_relay_id = entry.relay_id.clone();
         RouteAuthority::new(state)
-            .announce_peer(sender_relay_id, entry)
+            .announce_peer(PeerSender::http(&sender_relay_id), entry)
             .unwrap();
     }
 
     fn withdraw_peer_route(state: &RelayState, name: &str, relay_id: &str) {
         RouteAuthority::new(state)
             .withdraw_peer(
-                relay_id.to_string(),
+                PeerSender::http(relay_id),
                 name.to_string(),
                 relay_id.to_string(),
                 1001.0,
@@ -2418,7 +2460,7 @@ mod tests {
         let state = RelayState::new(test_config(), null_disseminator());
         state.register_peer(PeerInfo {
             relay_id: "peer-1".into(),
-            url: "http://peer-1:8080".into(),
+            address: PeerAddress::http("http://peer-1:8080"),
             route_count: 0,
             last_heartbeat: std::time::Instant::now(),
             status: PeerStatus::Alive,
@@ -2428,7 +2470,7 @@ mod tests {
             RouteEntry {
                 name: "remote".into(),
                 relay_id: "peer-1".into(),
-                relay_url: "http://peer-1:8080".into(),
+                address: PeerAddress::http("http://peer-1:8080"),
                 server_id: None,
                 server_instance_id: None,
                 ipc_address: None,
@@ -2460,11 +2502,11 @@ mod tests {
 
         // Echo of our own route arriving via DigestDiff with our relay_id.
         let result = RouteAuthority::new(&state).announce_peer(
-            "test-relay".into(),
+            PeerSender::http("test-relay"),
             RouteEntry {
                 name: "grid".into(),
                 relay_id: "test-relay".into(),
-                relay_url: "http://elsewhere:8080".into(),
+                address: PeerAddress::http("http://elsewhere:8080"),
                 server_id: None,
                 server_instance_id: None,
                 ipc_address: None,
@@ -2496,7 +2538,7 @@ mod tests {
         register_local(&state, "grid", "server-grid", "ipc://grid", client);
 
         let result = RouteAuthority::new(&state).withdraw_peer(
-            "test-relay".into(),
+            PeerSender::http("test-relay"),
             "grid".into(),
             "test-relay".into(),
             1001.0,
@@ -2513,7 +2555,7 @@ mod tests {
         let client = Arc::new(IpcClient::new("ipc://grid").unwrap());
         register_local(&state, "grid", "server-grid", "ipc://grid", client);
 
-        state.unregister_peer("test-relay");
+        state.unregister_peer(PeerSender::http("test-relay"));
 
         let route = state.local_route("grid").unwrap().to_route_info();
         assert_eq!(route.ipc_address.as_deref(), Some("ipc://grid"));
@@ -2526,7 +2568,7 @@ mod tests {
             rt.register_route(RouteEntry {
                 name: "grid".into(),
                 relay_id: "test-relay".into(),
-                relay_url: "http://localhost:9999".into(),
+                address: PeerAddress::http("http://localhost:9999"),
                 server_id: Some("server-old".into()),
                 server_instance_id: Some("instance-old".into()),
                 ipc_address: Some("ipc://grid-old".into()),
@@ -2945,7 +2987,7 @@ mod tests {
         let stale_snapshot = RouteEntry {
             name: "grid".into(),
             relay_id: "test-relay".into(),
-            relay_url: "http://localhost:9999".into(),
+            address: PeerAddress::http("http://localhost:9999"),
             server_id: Some("server-old".into()),
             server_instance_id: Some("instance-old".into()),
             ipc_address: Some("ipc://same".into()),
