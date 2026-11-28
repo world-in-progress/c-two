@@ -180,9 +180,10 @@ fn wait_until(mut predicate: impl FnMut() -> bool) {
             "mesh state did not settle within {WAIT:?}"
         );
         // Most predicates open a new loopback TCP connection, and peer states
-        // follow heartbeats that take seconds. Polling without a pause used up
-        // Windows' ephemeral ports (WSAENOBUFS) while they settled.
-        std::thread::sleep(Duration::from_millis(10));
+        // follow heartbeats that take seconds. All four unavailable-case tests
+        // run concurrently and poll for tens of seconds, so polling every 10ms
+        // can exhaust Windows ephemeral ports (WSAENOBUFS).
+        std::thread::sleep(Duration::from_millis(100));
     }
 }
 
