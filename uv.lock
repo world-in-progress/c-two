@@ -43,7 +43,7 @@ wheels = [
 
 [[package]]
 name = "c-two"
-version = "0.13.0rc1"
+version = "0.13.0rc2"
 source = { editable = "sdk/python" }
 
 [package.optional-dependencies]
