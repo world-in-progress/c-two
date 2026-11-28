@@ -158,6 +158,68 @@ def test_rerun_selects_matching_latest_attempt_and_keeps_untouched_lanes(label):
 
 
 @pytest.mark.parametrize("label", evidence.FULL_LANES)
+def test_failed_rerun_maps_cloned_passing_jobs_back_to_execution_attempt(label):
+    """GitHub Actions --failed reruns clone untouched passing jobs into the
+    higher run_attempt with identical timestamps without re-uploading -a<N>."""
+    api = FakeApi()
+    for job in api.jobs[201]:
+        job["started_at"] = "2026-11-28T07:30:00Z"
+        job["completed_at"] = "2026-11-28T08:10:00Z"
+    rerun_name = f"source ({label}, py3.12)"
+    failing = next(j for j in api.jobs[201] if j["name"] == rerun_name)
+    failing["conclusion"] = "failure"
+    # Also model a lane that fails on attempt 1, succeeds on attempt 2, and is cloned into attempt 3.
+    second_lane = next(lane for lane in evidence.FULL_LANES if lane != label)
+    second_name = f"source ({second_lane}, py3.12)"
+    second = next(j for j in api.jobs[201] if j["name"] == second_name)
+    second["conclusion"] = "failure"
+    # Attempt 2: rerun_name still fails; second_name passes; untouched passing lanes are cloned.
+    for job in list(api.jobs[201]):
+        if job["name"] == rerun_name:
+            api.jobs[201].append({**job, "id": job["id"] + 200, "run_attempt": 2, "conclusion": "failure",
+                                  "started_at": "2026-11-28T08:20:00Z", "completed_at": "2026-11-28T08:50:00Z"})
+        elif job["name"] == second_name:
+            api.jobs[201].append({**job, "id": job["id"] + 200, "run_attempt": 2, "conclusion": "success",
+                                  "started_at": "2026-11-28T08:20:00Z", "completed_at": "2026-11-28T08:55:00Z"})
+        else:
+            api.jobs[201].append({**job, "id": job["id"] + 200, "run_attempt": 2})
+    # Attempt 3: rerun_name finally passes; second_name (from attempt 2) and untouched lanes (from attempt 1) are cloned.
+    for job in list(api.jobs[201]):
+        if job["run_attempt"] == 2 and job["name"] == second_name:
+            api.jobs[201].append({**job, "id": job["id"] + 100, "run_attempt": 3})
+        elif job["run_attempt"] == 1 and job["name"] == rerun_name:
+            api.jobs[201].append({**job, "id": job["id"] + 300, "run_attempt": 3, "conclusion": "success",
+                                  "started_at": "2026-11-28T09:00:00Z", "completed_at": "2026-11-28T09:30:00Z"})
+        elif job["run_attempt"] == 1 and job["name"] != second_name:
+            api.jobs[201].append({**job, "id": job["id"] + 300, "run_attempt": 3})
+    api.artifacts[201].extend([api.artifact(second_lane, 2), api.artifact(label, 2), api.artifact(label, 3)])
+
+    selected = evidence.find_source_evidence(api, SOURCE_SHA)
+    assert selected["job_attempts"][rerun_name] == 3
+    assert selected["job_attempts"][second_name] == 2
+    for lane in evidence.FULL_LANES:
+        expected = 3 if lane == label else 2 if lane == second_lane else 1
+        assert selected["artifacts"][lane]["run_attempt"] == expected
+        assert selected["artifacts"][lane]["name"].endswith(f"-a{expected}")
+
+
+def test_full_rerun_with_fresh_timestamps_requires_new_attempt_artifact():
+    api = FakeApi()
+    for job in api.jobs[201]:
+        job["started_at"] = "2026-11-28T07:30:00Z"
+        job["completed_at"] = "2026-11-28T08:10:00Z"
+    # Genuine full rerun of macos-15 produces fresh timestamps and must require -a2.
+    macos = next(j for j in api.jobs[201] if j["name"] == "source (macos-15, py3.12)")
+    api.jobs[201].append({**macos, "id": 200, "run_attempt": 2,
+                          "started_at": "2026-11-28T09:00:00Z", "completed_at": "2026-11-28T09:30:00Z"})
+    with pytest.raises(evidence.PromotionError, match="source-macos-15-py3.12-full-.*-a2"):
+        evidence.find_source_evidence(api, SOURCE_SHA)
+    api.artifacts[201].append(api.artifact("macos-15", 2))
+    selected = evidence.find_source_evidence(api, SOURCE_SHA)
+    assert selected["artifacts"]["macos-15"]["run_attempt"] == 2
+
+
+@pytest.mark.parametrize("label", evidence.FULL_LANES)
 @pytest.mark.parametrize("problem", ["missing", "old-attempt-only", "duplicate", "expired"])
 def test_latest_full_lane_requires_one_unexpired_matching_artifact(label, problem):
     api = FakeApi()

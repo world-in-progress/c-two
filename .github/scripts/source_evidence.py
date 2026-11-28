@@ -135,7 +135,25 @@ def _select_jobs(jobs: list[dict[str, Any]]) -> dict[str, int]:
         _require(latest.get("status") == "completed" and latest.get("conclusion") == "success",
                  f"required job {name!r} latest attempt {latest['run_attempt']} "
                  f"is {latest.get('status')}/{latest.get('conclusion')}")
-        attempts[name] = latest["run_attempt"]
+        # GitHub Actions --failed reruns clone untouched passing jobs into the
+        # newer run_attempt with identical started_at/completed_at timestamps
+        # without re-running them or uploading a newer -a<attempt> artifact.
+        # Map such cloned entries back to the earliest contiguous passing
+        # attempt that actually executed them; full reruns have fresh
+        # timestamps and keep their latest run_attempt.
+        started = latest.get("started_at")
+        completed = latest.get("completed_at")
+        selected_attempt = latest["run_attempt"]
+        if started and completed:
+            for job in sorted(matches, key=lambda entry: entry["run_attempt"], reverse=True):
+                if (job.get("status") == "completed"
+                        and job.get("conclusion") == "success"
+                        and job.get("started_at") == started
+                        and job.get("completed_at") == completed):
+                    selected_attempt = job["run_attempt"]
+                else:
+                    break
+        attempts[name] = selected_attempt
     return attempts
 
 
