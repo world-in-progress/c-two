@@ -57,6 +57,7 @@ checksum = "1e748733b7cbc798e1434b6ac524f0c1ff2ab456fe201501e6497c8417a4fc33"
 name = "c2-codegen"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
  "c2-contract",
  "c2-error",
  "fastdb",
@@ -354,17 +355,17 @@ dependencies = [
 
 [[package]]
 name = "fastdb"
-version = "0.3.0"
+version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fb03e5266cf463117540181d297ad5d20851d1eeffea7630b3972a0d15bff954"
+checksum = "6f109c6d26d45bf04eff8e70e66000e2a7e2b2f0ab179b3546496776cd059fe9"
 dependencies = [
  "fastdb-sys",
 ]
 
 [[package]]
 name = "fastdb-sys"
-version = "0.3.0"
-source = "git+https://github.com/world-in-progress/fastdb?rev=ff097cca9c29cadc289e2a437f4720ecc56015c4#ff097cca9c29cadc289e2a437f4720ecc56015c4"
+version = "0.4.0"
+source = "git+https://github.com/world-in-progress/fastdb?rev=af2790068d87d34f19061cb02f4d1c0e7ba224d0#af2790068d87d34f19061cb02f4d1c0e7ba224d0"
 
 [[package]]
 name = "fastrand"

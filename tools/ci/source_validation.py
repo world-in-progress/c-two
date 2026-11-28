@@ -51,7 +51,12 @@ STEP_TIMEOUT_S = 1200
 # bounded above the summed row budget (9 x 300 s) plus startup margin instead
 # of by the single-command default.
 IPC_MEMORY_STEP_TIMEOUT_S = 3600
-GATE_TIMEOUT_S = {IPC_MEMORY_GATE: IPC_MEMORY_STEP_TIMEOUT_S, "python-suite": 7200, "python310-suite": 7200}
+GATE_TIMEOUT_S = {
+    IPC_MEMORY_GATE: IPC_MEMORY_STEP_TIMEOUT_S,
+    "python-suite": 7200,
+    "python310-suite": 7200,
+    "java-validation": 1800,
+}
 # These write disjoint trees and never invoke Cargo. The FastDB Python wheel
 # can compile while Rust uses the shared target; consumers wait for its result.
 INDEPENDENT_SETUP_GATES = frozenset({
@@ -426,7 +431,7 @@ def gates(python: str, output: Path, scope: str = FULL_SCOPE, *, target_platform
                        "import subprocess,sys; [subprocess.run([sys.argv[1],*args],check=True) for args in "
                        "[ ['--version'], ['--help'], ['relay','--help'], ['registry','--help'] ]]", str(retained_cli)], ("cli-artifact",)),
         cargo("rust-sdk-test", "sdk/rust/Cargo.toml", "--all-features"),
-        ("fastdb-wheel-build", ["uv", "run", "--isolated", "--no-project", "--python", python, "--with", "pip", "python", "-m", "pip", "wheel", "--no-deps", "--wheel-dir", str(output / "wheels/fastdb"), "fastdb4py==0.3.0"], ()),
+        ("fastdb-wheel-build", ["uv", "run", "--isolated", "--no-project", "--python", python, "--with", "pip", "python", "-m", "pip", "wheel", "--no-deps", "--wheel-dir", str(output / "wheels/fastdb"), "fastdb4py==0.4.0"], ()),
         ("python-wheel-build", ["uv", "build", "--wheel", "--python", python, "--out-dir", str(output / "wheels/c-two"), "--no-create-gitignore", "sdk/python"], ()),
         ("wheel-consumer", [python, str(ROOT / "tools/ci/windows_wheel_smoke.py"),
                                     "--fastdb-wheel", str(output / "wheels/fastdb"),
@@ -477,6 +482,13 @@ def gates(python: str, output: Path, scope: str = FULL_SCOPE, *, target_platform
         selected = [gate for gate in selected if gate[0] != "windows-standard-user-consumer"]
     if scope == FULL_SCOPE:
         selected.extend(windows_identity)
+        if not (target_platform == "windows" and platform.machine().lower() in {"arm64", "aarch64"}):
+            selected.append(
+                ("java-validation", [python, str(ROOT / "tools/ci/test_java.py"),
+                                     "--python", str(venv_python), "--c3", str(retained_cli),
+                                     "--output", str(output / "java-validation")],
+                 ("python-build", "cli-artifact", "rust-sdk-test"))
+            )
         if target_platform == "linux" and platform.machine().lower() in {"x86_64", "amd64"}:
             python310 = output / ".venv-py310" / "bin/python"
             selected.extend([
@@ -502,7 +514,7 @@ def gates(python: str, output: Path, scope: str = FULL_SCOPE, *, target_platform
 def retained_artifacts(output: Path):
     # pytest's basetemp contains disposable npm installs and compiled harness
     # trees. Keep receipts, plans, node IDs, logs and JUnit, as in the old gates.
-    scratch_parents = {"python-suite/ordinary", "python-suite/portable", "python-suite/typescript", "python310-suite/ordinary"}
+    scratch_parents = {"python-suite/ordinary", "python-suite/portable", "python-suite/typescript", "python310-suite/ordinary", "java-validation"}
     for directory, children, files in os.walk(output):
         parent = Path(directory)
         if parent == output and ".venv-py310" in children:
@@ -589,6 +601,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             "swig": ["swig", "-version"], "node": ["node", "-p", "JSON.stringify({version:process.version,arch:process.arch})"],
             "npm": npm_command("--version"),
             "emscripten": [sys.executable, str(Path(os.environ.get("EMSDK", "../emsdk")) / "upstream/emscripten/emcc.py"), "--version"],
+        })
+    if any(name == "java-validation" for name, _, _ in selected_gates):
+        toolchains.update({
+            "java": ["java", "-version"],
+            "javac": ["javac", "-version"],
+            "mvn": [shutil.which("mvn.cmd" if os.name == "nt" else "mvn") or shutil.which("mvn") or "mvn", "--version"],
         })
     evidence: dict[str, Any] = {
         "schema": "c-two.source-run-evidence.v1",

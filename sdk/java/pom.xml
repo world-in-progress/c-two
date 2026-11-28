@@ -33,6 +33,7 @@
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
         <junit.version>5.10.2</junit.version>
         <c2.java.nativeResourcesDir>${project.build.directory}/native-resources</c2.java.nativeResourcesDir>
+        <c2.java.testReportsDir>${project.build.directory}/surefire-reports</c2.java.testReportsDir>
     </properties>
 
     <dependencies>
@@ -104,6 +105,7 @@
                 <artifactId>maven-surefire-plugin</artifactId>
                 <version>3.2.5</version>
                 <configuration>
+                    <reportsDirectory>${c2.java.testReportsDir}</reportsDirectory>
                     <argLine>-Xcheck:jni -Djava.awt.headless=true</argLine>
                 </configuration>
             </plugin>

@@ -12,7 +12,7 @@ uv pip install 'c-two==0.12.0'
 uv pip install 'c-two[fastdb]==0.12.0'
 ```
 
-The base package has no Python runtime dependencies. Ordinary CRM definition, registration, direct/IPC/relay calls and errors do not load FastDB or NumPy. The `fastdb` extra pins `fastdb4py==0.3.0`; using FastDB payloads without it reports the extra to install. The exact pin selects the validated 0.x binding instead of allowing an untested later native interface.
+The base package has no Python runtime dependencies. Ordinary CRM definition, registration, direct/IPC/relay calls and errors do not load FastDB or NumPy. The `fastdb` extra pins `fastdb4py==0.4.0`; using FastDB payloads without it reports the extra to install. The exact pin selects the validated 0.x binding instead of allowing an untested later native interface.
 
 Local IPC uses Unix domain sockets or TokenUser-scoped Windows Named Pipes. Unix roots select the final endpoint directory, with short names and directory-relative connections. Rust owns structured shutdown and scoped maintenance. Install matching builds across communicating clients, resource servers and c3. See the [lifecycle guide](https://github.com/world-in-progress/c-two/blob/main/docs/reference/local-endpoint-lifecycle.md).
 
@@ -56,9 +56,9 @@ Prerequisites:
 - Python 3.14.3t when testing free-threading support
 - Rust 1.95 or newer
 - `uv`
-- for full interoperability tests: the FastDB `v0.3.0` source checkout at `../fastdb`
+- for full interoperability tests: the FastDB `v0.4.0` source checkout at `../fastdb`
 
-The default workspace dev group selects `c-two[fastdb]` and resolves `fastdb4py==0.3.0` from PyPI. Bare package installation omits it. The Python native extension and c3 pin FastDB source `ff097cca9c29cadc289e2a437f4720ecc56015c4` for their source-mode static builds. Core and Rust SDK tests use the published Rust bindings with the matching [FastDB Core SDK](https://github.com/world-in-progress/fastdb/releases/tag/v0.3.0) in system link mode. Golden specs and TypeScript interoperability fixtures still need the sibling source checkout; it is not a Python package override.
+The default workspace dev group selects `c-two[fastdb]` and resolves `fastdb4py==0.4.0` from PyPI. Bare package installation omits it. The Python native extension and c3 pin FastDB source `af2790068d87d34f19061cb02f4d1c0e7ba224d0` for their source-mode static builds. Core and Rust SDK tests use the published Rust bindings with the matching [FastDB Core SDK](https://github.com/world-in-progress/fastdb/releases/tag/v0.4.0) in system link mode. Golden specs and TypeScript interoperability fixtures still need the sibling source checkout; it is not a Python package override.
 
 Install dependencies and build the Python native extension. This also compiles the required Rust core crates; no separate Rust prebuild step is needed:
 

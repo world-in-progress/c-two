@@ -373,11 +373,11 @@ publish = false
 
 [dependencies]
 c-two = {{ path = {json.dumps(str(REPOSITORY / "sdk/rust"))} }}
-fastdb = "=0.3.0"
+fastdb = "=0.4.0"
 serde_json = "1"
 
 [patch.crates-io]
-fastdb-sys = {{ git = "https://github.com/world-in-progress/fastdb", rev = "ff097cca9c29cadc289e2a437f4720ecc56015c4" }}
+fastdb-sys = {{ git = "https://github.com/world-in-progress/fastdb", rev = "af2790068d87d34f19061cb02f4d1c0e7ba224d0" }}
 ''', encoding="utf-8")
     target = REPOSITORY / "core/target"
     result = subprocess.run(

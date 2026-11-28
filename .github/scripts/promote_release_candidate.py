@@ -4,7 +4,7 @@ Only explicit successful canonical-main candidates qualify. Source Validation
 is selected by matching Git trees and checking the latest required jobs and
 attempt-bound artifacts. Candidate API digests, manifests, receipts and remote
 publication state are verified before staging; publication belongs to the
-calling workflow's environment-protected job.
+calling workflow's publish job.
 """
 from __future__ import annotations
 
@@ -12,6 +12,7 @@ import argparse
 import json
 import os
 import re
+import shutil
 import stat
 import sys
 import urllib.error
@@ -28,6 +29,7 @@ if str(SCRIPTS_DIR) not in sys.path:
 from safe_zip import CandidateError, checked_relative_path, sha256_bytes, zip_inventory  # noqa: E402
 from source_evidence import GitHubApi, PromotionError, find_source_evidence  # noqa: E402
 import release_candidate as rc_helper  # noqa: E402
+import maven_publish  # noqa: E402
 from packaging.utils import InvalidWheelFilename, parse_wheel_filename  # noqa: E402
 
 EXPECT_REPOSITORY = "world-in-progress/c-two"
@@ -68,6 +70,8 @@ PYTHON_ABI_PAIRS = {
 EXPECTED_ABI_ROWS = {(target, python) for target in CLI_TARGETS for python in EXPECTED_PYTHONS
                      if rc_helper.target_supports_python(target, python)}
 EXPECTED_RECEIPT_PREFIX_COUNTS = {
+    "java-inspect": 1,
+    "java-smoke-": 3,
     "rc-context": 1,
     "rc-fastdb-public": 1,
     "fastdb-": 7,
@@ -80,8 +84,8 @@ EXPECTED_RECEIPT_PREFIX_COUNTS = {
 # asset names; the promotion publishes those exact bytes under the same names.
 EXPECTED_INSTALLER_NAMES = ("c3-installer.sh", "c3-installer.ps1")
 FASTDB_LICENSE_ASSETS = ("fastdb-LICENSE", "fastdb-THIRD_PARTY_NOTICES.txt")
-FASTDB_CORE_VERSION = "0.3.0"
-FASTDB_SOURCE_REV = "ff097cca9c29cadc289e2a437f4720ecc56015c4"
+FASTDB_CORE_VERSION = "0.4.0"
+FASTDB_SOURCE_REV = "af2790068d87d34f19061cb02f4d1c0e7ba224d0"
 SMOKE_SCHEMA = "c-two.installed-wheel-smoke.v1"
 STANDARD_USER_WRAPPER_SCHEMA = "c-two.standard-user-wrapper.v1"
 SDIST_INSPECT_SCHEMA = "c-two.release-candidate.sdist-inspection.v1"
@@ -281,11 +285,13 @@ def verify_manifest_binding(
              f"rc-manifest ref {manifest.get('ref')!r} is not {EXPECT_REF}")
     meta = manifest.get("meta")
     _require(isinstance(meta, dict), "rc-manifest meta is missing")
-    for key in ("c_two_version", "c3_version", "fastdb_version",
+    for key in ("c_two_version", "c3_version", "java_version", "fastdb_version",
                 "fastdb_source_rev", "fastdb_sdist_sha256"):
         _require(isinstance(meta.get(key), str) and meta[key], f"rc-manifest meta.{key} is missing")
     _require(meta.get("fastdb_source_rev") == FASTDB_SOURCE_REV,
              "rc-manifest FastDB source differs from the verified source pair")
+    _require(meta["fastdb_version"] == FASTDB_CORE_VERSION,
+             "rc-manifest FastDB version differs from the pinned release")
     c_two_version, c3_version = meta["c_two_version"], meta["c3_version"]
     try:
         rc_helper.validate_c_two_version(c_two_version)
@@ -326,6 +332,14 @@ def verify_manifest_binding(
     fastdb_proof = rehash(manifest.get("fastdb_proof"), "fastdb_proof")
     installers = rehash(manifest.get("installers"), "installers")
     receipts = rehash(manifest.get("receipts"), "receipts")
+    java = rehash(manifest.get("java"), "java")
+    try:
+        java_receipts = {entry["name"]: _load_json_file(extraction / entry["name"])
+                         for entry in receipts
+                         if entry["name"].startswith(("java-inspect", "java-smoke-"))}
+        rc_helper.verify_java_receipts(java, java_receipts, meta, source_sha)
+    except rc_helper.HelperError as error:
+        raise PromotionError(str(error)) from error
 
     _require({entry["name"] for entry in cli} == set(EXPECTED_CLI_NAMES),
              f"CLI inventory is not exactly {sorted(EXPECTED_CLI_NAMES)}: "
@@ -363,6 +377,7 @@ def verify_manifest_binding(
 
     counts = manifest.get("counts")
     _require(isinstance(counts, dict), "rc-manifest counts are missing")
+    _require(counts.get("java") == len(java), "rc-manifest Java artifact count mismatch")
     _require(counts.get("receipts_by_prefix") == EXPECTED_RECEIPT_PREFIX_COUNTS,
              f"receipt prefix counts {counts.get('receipts_by_prefix')!r} do not match "
              f"{EXPECTED_RECEIPT_PREFIX_COUNTS}")
@@ -388,6 +403,7 @@ def verify_manifest_binding(
              f"rc-context ref {context.get('ref')!r} is not {EXPECT_REF}")
     _require(context.get("c_two_version") == c_two_version, "rc-context c_two_version mismatch")
     _require(context.get("c3_version") == c3_version, "rc-context c3_version mismatch")
+    _require(context.get("java_version") == meta["java_version"], "rc-context java_version mismatch")
     _require(context.get("fastdb_version") == meta["fastdb_version"],
              "rc-context fastdb_version mismatch")
     _require(context.get("fastdb_source_rev") == meta["fastdb_source_rev"],
@@ -396,6 +412,7 @@ def verify_manifest_binding(
              "rc-context records a pull_request_head_sha; only main dispatch candidates "
              "are promotable")
     versions = {"c_two_version": c_two_version, "c3_version": c3_version,
+                "java_version": meta["java_version"],
                 "fastdb_version": meta["fastdb_version"],
                 "fastdb_source_rev": meta["fastdb_source_rev"]}
     return versions
@@ -1164,6 +1181,40 @@ def pypi_state(
     }
 
 
+def maven_central_state(
+    extraction: Path, entries: list[dict[str, Any]], staging: Path, download_dir: Path,
+    version: str, resume_id: str | None,
+) -> dict[str, Any]:
+    if resume_id:
+        maven_publish.deployment_id(resume_id)
+    remote = {}
+    for entry in entries:
+        name = entry["name"]
+        digest = maven_publish.remote_digest(version, name)
+        _require(digest is None or digest == entry["sha256"],
+                 f"Maven Central file {name} differs from the retained candidate SHA-256")
+        remote[name] = digest
+    present = sum(digest is not None for digest in remote.values())
+    _require(present in {0, len(entries)}, f"Maven Central Java version {version} is partially published")
+    action = "noop" if present else "upload"
+    files = []
+    for entry in entries:
+        file = {**entry, "disposition": "verified-existing" if present else "upload"}
+        if action == "upload" or resume_id:
+            staging.mkdir(parents=True, exist_ok=True)
+            destination = staging / entry["name"]
+            shutil.copyfile(extraction / entry["name"], destination)
+            file["staged_path"] = destination.relative_to(download_dir).as_posix()
+        files.append(file)
+    return {
+        "action": action,
+        "version": version,
+        "coordinate": f"{rc_helper.MAVEN_GROUP}:{rc_helper.JAVA_ARTIFACT}",
+        "prerelease": rc_helper.validate_java_version(version),
+        "files": files,
+    }
+
+
 def write_release_body(path: Path, plan: dict[str, Any], manifest_sha: str) -> None:
     versions = plan["versions"]
     candidate = plan["candidate_run"]
@@ -1190,6 +1241,7 @@ def write_release_body(path: Path, plan: dict[str, Any], manifest_sha: str) -> N
         "",
         f"- Channel: `{'pre-release' if prerelease else 'stable'}`",
         f"- c3 version: `{versions['c3_version']}` (Python package `c-two=={versions['c_two_version']}`)",
+        f"- Java SDK candidate: `{rc_helper.MAVEN_GROUP}:{rc_helper.JAVA_ARTIFACT}:{versions['java_version']}`",
         f"- Source commit: `{plan['source_sha']}` (Release Candidate dispatch on canonical `main`)",
         f"- Native FastDB Core: `{FASTDB_CORE_VERSION}`, statically linked "
         f"from source `{versions['fastdb_source_rev']}`",
@@ -1224,7 +1276,7 @@ def write_release_body(path: Path, plan: dict[str, Any], manifest_sha: str) -> N
 
 def write_promotion_summary(path: Path, plan: dict[str, Any]) -> None:
     github_release = plan["target"] == "github-release"
-    group = plan["github_release"] if github_release else plan["pypi"]
+    group = plan[plan["target"].replace("-", "_")]
     entries = group["assets"] if github_release else group["files"]
     evidence = plan["source_validation"]
     channel = "pre-release" if group.get("prerelease") else "stable"
@@ -1342,7 +1394,7 @@ def command_prepare(options: argparse.Namespace) -> int:
             prerelease=c3_prerelease,
             c3_version=versions["c3_version"],
         )
-    else:
+    elif options.target == "pypi":
         files = stage_pypi_files(extraction, manifest, staging / "dist", download_dir)
         plan["pypi"] = pypi_state(options.pypi_project, versions["c_two_version"], files)
         # The publishing action consumes the staging directory directly, so it
@@ -1359,6 +1411,12 @@ def command_prepare(options: argparse.Namespace) -> int:
         _require(staged == expected,
                  f"PyPI staging holds {staged}, expected exactly the missing files {expected}")
 
+    else:
+        plan["maven_central"] = maven_central_state(
+            extraction, manifest["java"], staging / "maven", download_dir,
+            versions["java_version"], options.deployment_id,
+        )
+
     Path(options.plan_output).write_text(
         json.dumps(plan, indent=2, sort_keys=True) + "\n", encoding="utf-8"
     )
@@ -1366,7 +1424,7 @@ def command_prepare(options: argparse.Namespace) -> int:
         write_release_body(Path(options.release_body_output), plan, manifest_sha)
     if options.summary_output:
         write_promotion_summary(Path(options.summary_output), plan)
-    summary = plan.get("github_release") or plan.get("pypi")
+    summary = plan[options.target.replace("-", "_")]
     print(
         f"promotion plan {options.plan_output}: target={options.target} "
         f"source={source_sha[:12]} candidate_run={candidate.get('id')} action={summary['action']}"
@@ -1380,7 +1438,7 @@ def main(argv: list[str] | None = None) -> int:
     prepare = subparsers.add_parser(
         "prepare", help="Download, verify, and stage an exact-tested-candidate promotion"
     )
-    prepare.add_argument("--target", choices=("github-release", "pypi"), required=True)
+    prepare.add_argument("--target", choices=("github-release", "pypi", "maven-central"), required=True)
     prepare.add_argument("--candidate-run-id", type=int, required=True,
                          help="The exact successful Release Candidate workflow_dispatch run "
                               "on canonical main whose retained bytes are promoted")
@@ -1393,11 +1451,13 @@ def main(argv: list[str] | None = None) -> int:
     prepare.add_argument("--summary-output", default=None,
                          help="Append the publication plan summary as UTF-8 Markdown")
     prepare.add_argument("--pypi-project", default="c-two")
+    prepare.add_argument("--deployment-id", default=None,
+                         help="Stage verified Maven files when resuming a Central deployment")
     prepare.set_defaults(handler=command_prepare)
     options = parser.parse_args(argv)
     try:
         return options.handler(options)
-    except PromotionError as error:
+    except (PromotionError, maven_publish.MavenPublishError) as error:
         print(f"error: {error}", file=sys.stderr)
         return 1
 

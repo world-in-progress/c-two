@@ -14,7 +14,7 @@ if TYPE_CHECKING:
     from fastdb4py.payload import BuildPlan, Payload
 
 DEFAULT_PICKLE_PROTOCOL = 4
-# FDB_PAYLOAD_DIRECT_BUILD_ELIGIBLE in the FastDB 0.3.0 C ABI.
+# FDB_PAYLOAD_DIRECT_BUILD_ELIGIBLE in the FastDB 0.4.0 C ABI.
 _FASTDB_DIRECT_BUILD_ELIGIBLE = 1
 # Lift FastDB's default OpenOptions total-byte cap when C-Two has already
 # admitted a >256 MiB payload within max_payload_size and the role budget.

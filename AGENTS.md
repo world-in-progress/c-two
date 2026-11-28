@@ -10,9 +10,7 @@ Breaking API/ABI or protocol changes require GitHub Actions validation of the ex
 
 ## Project Overview
 
-C-Two is a resource-oriented RPC runtime that enables remote invocation of stateful resource classes across processes and machines. It is designed for distributed scientific computation, not traditional microservices.
-
-The core abstraction is resources, not services.
+C-Two invokes stateful resources across processes and machines for distributed scientific computation.
 
 - CRM (Core Resource Model): the contract class decorated with `@cc.crm(...)`. It declares remotely callable methods. Method bodies are `...`.
 - Resource: the stateful object implementing a CRM contract. It is a plain Python class, not decorated. Name it by domain semantics.
@@ -120,7 +118,7 @@ The language-neutral Cargo workspace is `core/`; the Python SDK owns its PyO3/ma
 | Layer | Crate | Purpose |
 | --- | --- | --- |
 | foundation | `c2-contract` | `c-two.contract.v2` validation, canonical descriptor hashing, release identity, and opaque nested-spec extraction |
-| foundation | `c2-codegen` | FastDB Core delegation plus deterministic multi-owner artifact composition and new-tree publication |
+| foundation | `c2-codegen` | FastDB Core delegation plus deterministic multi-owner artifact composition and artifact publication, including Java codegen |
 | foundation | `c2-config` | Unified IPC and relay configuration structs/resolvers |
 | foundation | `c2-error` | Canonical error registry and versioned `C2E1` wire codec |
 | foundation | `c2-local-security` | User-scoped security for local OS objects: Windows TokenUser identity, ACLs, pipe-owner checks and native peer identity failures |
@@ -133,6 +131,7 @@ The language-neutral Cargo workspace is `core/`; the Python SDK owns its PyO3/ma
 | transport | `c2-http` | HTTP client, relay-aware client, and HTTP relay server behind `relay` feature |
 | runtime | `c2-core` | Language-neutral runtime, route transactions, client pools, relay projection, and error normalization |
 | sdk/rust | `c-two` / `c_two` | User-facing Rust facade, FastDB adapter, and checked held/borrowed owners |
+| sdk/java | `c2-java-native` | Java 17 facade and JNI projection of Core |
 | sdk/python/native | `c2-python-native` | PyO3 bindings for `c_two._native` |
 
 - Rust Core owns generic runtime, transport, resolver, route, retry and error mechanisms; SDKs own language glue and domain authoring.

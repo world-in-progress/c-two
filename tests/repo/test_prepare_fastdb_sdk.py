@@ -39,6 +39,13 @@ def load_helper():
     return module
 
 
+def test_official_release_pins():
+    module = load_helper()
+    assert module.RELEASE_VERSION == "0.4.0"
+    assert module.EXPECTED_SOURCE_SHA == "af2790068d87d34f19061cb02f4d1c0e7ba224d0"
+    assert module.RELEASE_MANIFEST_SHA256 == "3cd45cff112e545006293986d9d52b51df6587c6b7fcdd74de8778d9a6444dc2"
+
+
 def sha256_bytes(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 

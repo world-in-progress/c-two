@@ -214,6 +214,8 @@ def test_full_scope_preserves_coverage_and_reuses_prepared_outputs(monkeypatch):
             assert not any("cli/Cargo.toml" in part for part in command), name
         dependencies = {name: set(required) for name, _, required in gates}
         assert dependencies["cli-artifact"] == {"cli-test"}
+        assert dependencies["java-validation"] == {"python-build", "cli-artifact", "rust-sdk-test"}
+        assert "java-validation" not in runner.SOURCE_MODE_GATES
         assert dependencies["fastdb-npm-build"] == {"fastdb-npm-install", "fastdb-wasm-build"}
         assert dependencies["c2-mem-node-tests"] == {"c2-mem-build"}
         assert dependencies["c2-mem-node-package"] == {"c2-mem-build"}
@@ -228,7 +230,7 @@ def test_full_scope_preserves_coverage_and_reuses_prepared_outputs(monkeypatch):
         assert "--all-targets" in commands["core-check"]
         assert "--all-features" in commands["rust-sdk-test"]
         assert "--all-features" in commands["fastdb-rust-test"]
-        assert "fastdb4py==0.3.0" in commands["fastdb-wheel-build"]
+        assert "fastdb4py==0.4.0" in commands["fastdb-wheel-build"]
         assert "../fastdb" not in commands["fastdb-wheel-build"]
         assert "--lib" not in commands["core-test"]
         assert all(not deps for name, _, deps in gates if name in runner.INDEPENDENT_SETUP_GATES)
@@ -248,7 +250,39 @@ def test_full_scope_preserves_coverage_and_reuses_prepared_outputs(monkeypatch):
     ]
     python = {name for name, _, _ in runner.gates(sys.executable, Path("evidence"), runner.PYTHON_SCOPE)}
     assert {"python-suite", "python-native-test", "python-build", "cli-artifact", "python310-install"} <= python
-    assert "core-test" not in python and "python-wheel-build" not in python
+    assert {"core-test", "python-wheel-build", "java-validation"}.isdisjoint(python)
+
+
+@pytest.mark.parametrize("target,machine,eligible", [
+    ("linux", "x86_64", True),
+    ("macos", "arm64", True),
+    ("windows", "AMD64", True),
+    ("windows", "ARM64", False),
+    ("windows", "aarch64", False),
+])
+def test_java_gate_targets_full_lanes(tmp_path, monkeypatch, target, machine, eligible):
+    runner = _runner()
+    monkeypatch.setattr(runner.platform, "machine", lambda: machine)
+    gates = runner.gates(sys.executable, tmp_path, target_platform=target)
+    java = [command for name, command, _ in gates if name == "java-validation"]
+    if eligible:
+        [command] = java
+        assert command[:2] == [sys.executable, str(runner.ROOT / "tools/ci/test_java.py")]
+        assert Path(command[command.index("--c3") + 1]).name == ("c3.exe" if target == "windows" else "c3")
+        assert command[-2:] == ["--output", str(tmp_path / "java-validation")]
+    else:
+        assert not java
+
+
+def test_retained_java_evidence_excludes_tmp(tmp_path):
+    evidence = tmp_path / "java-validation"
+    scratch = evidence / "tmp"
+    scratch.mkdir(parents=True)
+    receipt = evidence / "java-validation-receipt.v1.json"
+    log = evidence / "java.log"
+    for path in (scratch / "native.dll", receipt, log):
+        path.touch()
+    assert set(_runner().retained_artifacts(tmp_path)) == {receipt, log}
 
 
 @pytest.mark.parametrize("platform_name,architecture,scope,expected", [
