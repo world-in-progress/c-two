@@ -60,6 +60,12 @@ fn source<'a>(set: &'a c2_codegen::ContractArtifactSet, target: ContractCodegenT
         ContractCodegenTarget::Rust => "rust/c_two_contract.rs",
         ContractCodegenTarget::Python => "python/c_two_contract.py",
         ContractCodegenTarget::TypeScript => "typescript/c_two_contract.ts",
+        ContractCodegenTarget::Java => set
+            .artifacts()
+            .iter()
+            .map(|artifact| artifact.relative_path())
+            .find(|path| path.starts_with("java/src/main/java/io/ctwo/generated/"))
+            .expect("Java contract module"),
     };
     std::str::from_utf8(set.get(path).expect("target module").bytes()).expect("UTF-8 source")
 }
@@ -134,6 +140,10 @@ fn topics_only_contract_compiles_an_empty_method_surface_with_topics() {
     // An empty-methods ServiceDefinition still registers through the streamless
     // constructor with zero MethodDefinition entries.
     assert!(rust.contains("c_two::ServiceDefinition::new("));
+    let java_set = generate(&solo, ContractCodegenTarget::Java);
+    let java = source(&java_set, ContractCodegenTarget::Java);
+    assert!(java.contains("List<MethodBinding> METHODS = List.of();"));
+    assert!(java.contains("subscribe_topic_0_telemetry(SubscribeOptions options)"));
 }
 
 #[test]
@@ -291,6 +301,7 @@ fn topicless_contracts_omit_contract_topic_symbols_in_all_targets() {
             ContractCodegenTarget::Rust,
             ContractCodegenTarget::Python,
             ContractCodegenTarget::TypeScript,
+            ContractCodegenTarget::Java,
         ] {
             let set = generate(fixture.as_bytes(), target);
             let text = source(&set, target);

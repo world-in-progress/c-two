@@ -74,6 +74,8 @@ pub enum CodegenCommand {
     Python(CodegenTargetArgs),
     /// Generate a TypeScript contract project tree.
     Typescript(CodegenTargetArgs),
+    /// Generate a Java contract project tree.
+    Java(CodegenTargetArgs),
 }
 
 #[derive(Debug, Args)]
@@ -165,6 +167,7 @@ fn codegen(args: CodegenArgs) -> Result<()> {
         CodegenCommand::Rust(args) => (c2_codegen::ContractCodegenTarget::Rust, args),
         CodegenCommand::Python(args) => (c2_codegen::ContractCodegenTarget::Python, args),
         CodegenCommand::Typescript(args) => (c2_codegen::ContractCodegenTarget::TypeScript, args),
+        CodegenCommand::Java(args) => (c2_codegen::ContractCodegenTarget::Java, args),
     };
     let payload = read_payload(&args.path)?;
     let release = admit_contract_once(payload.as_bytes())?;

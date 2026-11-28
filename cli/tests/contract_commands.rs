@@ -36,6 +36,10 @@ fn contract_codegen_portable_project_tree() {
         ("rust", "rust/c_two_contract.rs"),
         ("python", "python/c_two_contract.py"),
         ("typescript", "typescript/c_two_contract.ts"),
+        (
+            "java",
+            "java/src/main/java/io/ctwo/generated/test/contract_release/PortableContract.java",
+        ),
     ] {
         let destination = tempdir.path().join(format!("generated-{target}"));
         let mut command = Command::cargo_bin("c3").unwrap();
@@ -64,7 +68,12 @@ fn contract_codegen_portable_project_tree() {
                 .is_file()
         );
         assert!(destination.join(module).is_file());
-        assert!(!walk_files(&destination.join(target).join("payloads")).is_empty());
+        let payloads = if target == "java" {
+            destination.join("java/src/main/java/io/fastdb/payload/generated")
+        } else {
+            destination.join(target).join("payloads")
+        };
+        assert!(!walk_files(&payloads).is_empty());
 
         let mut repeat = Command::cargo_bin("c3").unwrap();
         repeat
