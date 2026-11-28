@@ -45,6 +45,8 @@ def test_release_workflow_guards_publication_and_reuses_staging():
     assert prepare["permissions"] == {"contents": "read", "actions": "read"}
     assert publisher["needs"] == "prepare"
     assert "needs.prepare.outputs.action == 'upload' || inputs.deployment_id != ''" in publisher["if"]
+    assert any("github.run_attempt != '1' && inputs.deployment_id == ''" in step.get("if", "")
+               for step in publisher["steps"])
     commands = "\n".join(step.get("run", "") for step in publisher["steps"])
     assert "maven_publish.py --staging-dir staging/maven" in commands
     assert '--deployment-id "$DEPLOYMENT_ID"' in commands
@@ -112,11 +114,12 @@ def make_package(root, *, corrupt=None):
             jar.writestr("META-INF/native/", b"")
     with zipfile.ZipFile(javadoc, "w") as jar:
         jar.writestr("index.html", "<html></html>")
+    optional_tag = "<optional>true</optional>" if corrupt == "optional" else ""
     pom.write_text(f"""<project xmlns="http://maven.apache.org/POM/4.0.0">
         <groupId>{candidate.MAVEN_GROUP}</groupId><artifactId>c-two-sdk</artifactId>
         <version>{VERSION}</version><dependencies><dependency>
         <groupId>{candidate.MAVEN_GROUP}</groupId><artifactId>fastdb-java</artifactId>
-        <version>{"9.9.9" if corrupt == "pom" else FASTDB}</version>
+        <version>{"9.9.9" if corrupt == "pom" else FASTDB}</version>{optional_tag}
         </dependency></dependencies></project>""", encoding="utf-8")
 
 
@@ -127,6 +130,7 @@ def make_package(root, *, corrupt=None):
     ("windows-x86_64", "windows-x86_64 binary header"),
     ("sources", "sources JAR contains META-INF/native/"),
     ("pom", "fastdb-java:0.4.0"),
+    ("optional", "fastdb-java:0.4.0"),
 ])
 def test_inspect_java_seals_only_valid_maven_files(tmp_path, capsys, corrupt, error):
     make_package(tmp_path, corrupt=corrupt)
@@ -356,3 +360,25 @@ def test_signing_bundle_contains_detached_signatures_and_checksums(publication, 
             assert archive.read(entry + ".asc") == b"signature"
             assert archive.read(entry + ".md5").decode() == hashlib.md5(data).hexdigest()
             assert archive.read(entry + ".sha1").decode() == hashlib.sha1(data).hexdigest()
+
+
+def test_maven_central_resume_allows_partial_repo1_visibility(tmp_path, monkeypatch):
+    import promote_release_candidate as promote
+
+    extraction = tmp_path / "extracted"
+    extraction.mkdir()
+    make_package(extraction)
+    entries = [{"name": name, "bytes": (extraction / name).stat().st_size,
+                "sha256": candidate.sha256_file(extraction / name)}
+               for name in candidate.java_filenames(VERSION)]
+    first = entries[0]
+    monkeypatch.setattr(
+        promote.maven_publish, "remote_digest",
+        lambda version, name: first["sha256"] if name == first["name"] else None,
+    )
+    with pytest.raises(promote.PromotionError, match="partially published"):
+        promote.maven_central_state(extraction, entries, tmp_path / "s1/maven", tmp_path / "s1", VERSION, None)
+    resumed = promote.maven_central_state(extraction, entries, tmp_path / "s2/maven", tmp_path / "s2", VERSION, DEPLOYMENT)
+    assert resumed["action"] == "upload"
+    assert [f["disposition"] for f in resumed["files"]] == ["verified-existing", "upload", "upload", "upload"]
+    assert all((tmp_path / "s2/maven" / e["name"]).is_file() for e in entries)

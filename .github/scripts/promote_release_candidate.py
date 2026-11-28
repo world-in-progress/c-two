@@ -1195,11 +1195,13 @@ def maven_central_state(
                  f"Maven Central file {name} differs from the retained candidate SHA-256")
         remote[name] = digest
     present = sum(digest is not None for digest in remote.values())
-    _require(present in {0, len(entries)}, f"Maven Central Java version {version} is partially published")
-    action = "noop" if present else "upload"
+    _require(bool(resume_id) or present in {0, len(entries)},
+             f"Maven Central Java version {version} is partially published")
+    action = "noop" if present == len(entries) else "upload"
     files = []
     for entry in entries:
-        file = {**entry, "disposition": "verified-existing" if present else "upload"}
+        disposition = "verified-existing" if remote[entry["name"]] is not None else "upload"
+        file = {**entry, "disposition": disposition}
         if action == "upload" or resume_id:
             staging.mkdir(parents=True, exist_ok=True)
             destination = staging / entry["name"]

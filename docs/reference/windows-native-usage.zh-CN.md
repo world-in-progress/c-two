@@ -52,11 +52,11 @@ c3.exe --version
 
 ## 从源码构建
 
-源码开发使用规范的 main 分支。对应 c3 版本的 `rc-manifest.json` 标识发布源码；使用 main 是开发检出的约定。请使用面向原生 x64 或 ARM64 架构的 Developer PowerShell，并确保 MSVC C++ 工具链、CMake、Ninja、Git、Rust 1.95 或更新版本及 uv 可用。Python 和 Rust 从各自的注册源获取 FastDB 0.3.0；Python 需要可选的 `fastdb` extra。Python 扩展与 c3 使用源码模式的原生构建。Rust 绑定还需要匹配的 Core SDK：从该版本中解压 `fastdb-core-0.3.0-x86_64-pc-windows-msvc.tar.gz` 或 `fastdb-core-0.3.0-aarch64-pc-windows-msvc.tar.gz`，并如下配置其 `lib` 目录的绝对路径。完整的源码互操作检查还使用相邻的 FastDB 发布版本检出作为固定输入和 TypeScript 源码；Python 使用者使用已发布的 wheel：
+源码开发使用规范的 main 分支。对应 c3 版本的 `rc-manifest.json` 标识发布源码；使用 main 是开发检出的约定。请使用面向原生 x64 或 ARM64 架构的 Developer PowerShell，并确保 MSVC C++ 工具链、CMake、Ninja、Git、Rust 1.95 或更新版本及 uv 可用。Python 和 Rust 从各自的注册源获取 FastDB 0.4.0；Python 需要可选的 `fastdb` extra。Python 扩展与 c3 使用源码模式的原生构建。Rust 绑定还需要匹配的 Core SDK：从该版本中解压 `fastdb-core-0.4.0-x86_64-pc-windows-msvc.tar.gz` 或 `fastdb-core-0.4.0-aarch64-pc-windows-msvc.tar.gz`，并如下配置其 `lib` 目录的绝对路径。完整的源码互操作检查还使用相邻的 FastDB 发布版本检出作为固定输入和 TypeScript 源码；Python 使用者使用已发布的 wheel：
 
 ```powershell
 git clone https://github.com/world-in-progress/fastdb.git
-git -C fastdb checkout v0.3.0
+git -C fastdb checkout v0.4.0
 git clone https://github.com/world-in-progress/c-two.git
 Set-Location c-two
 $env:FASTDB_PAYLOAD_SYSTEM_LIB_DIR = 'C:\path\to\fastdb-core-sdk\lib'

@@ -249,7 +249,7 @@ jobs:
           path: fastdb-wasm
           key: source-fastdb-wasm-v2-${{ runner.os }}-${{ runner.arch }}-${{ env.FASTDB_SOURCE_SHA }}-${{ env.EMSDK_SOURCE_SHA }}-${{ env.EMSDK_VERSION }}
       - name: Run shared source validation
-        timeout-minutes: 50
+        timeout-minutes: 75
         env:
           C2_WORKFLOW_SHA: ${{ github.workflow_sha }}
           C2_RUNNER_LABEL: ${{ matrix.os }}
@@ -262,7 +262,7 @@ jobs:
           --expected-fastdb-sha "${{ env.FASTDB_SOURCE_SHA }}"
           --fastdb-system-lib-dir "${{ steps.fastdb_sdk.outputs.lib-dir }}"
           --scope "${{ matrix.scope }}"
-          --timeout 2700
+          --timeout 4200
           --output "artifacts/source"
       - name: Save shared Cargo outputs, including after test failures
         if: always() && !cancelled() && steps.cargo_cache.outputs.cache-hit != 'true' && steps.cargo_cache.outputs.cache-primary-key != ''

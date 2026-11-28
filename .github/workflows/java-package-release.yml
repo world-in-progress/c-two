@@ -97,6 +97,11 @@ jobs:
         with:
           name: promotion-plan
           path: .
+      - name: Refuse blind re-run of publish after attempt 1
+        if: github.run_attempt != '1' && inputs.deployment_id == ''
+        run: |
+          echo "error: refusing to re-run publish without deployment_id; recover the UUID from maven-deployment-state/deployment.json (or Central Portal) and dispatch a new run with deployment_id" >&2
+          exit 1
       - name: Sign and publish the verified Maven files
         env:
           DEPLOYMENT_ID: ${{ inputs.deployment_id }}

@@ -269,6 +269,8 @@ def validate(args, output, work, env, receipt):
     run([*maven, "test", java_flags(env)[-1], f"-Dc2.java.testReportsDir={reports}"],
         output / "java-junit.log", env, timeout)
     receipt["junit"], fastdb_jar = junit_evidence(reports)
+    for stale in (SDK / "target").glob("c-two-sdk-*.jar"):
+        stale.unlink()
     run([*maven, "-DskipTests", "package", "source:jar-no-fork"],
         output / "java-package.log", env, timeout)
     classpath = os.pathsep.join((verify_jars(), fastdb_jar))

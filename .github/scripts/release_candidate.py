@@ -155,8 +155,9 @@ def verify_fastdb_java(project: ET.Element, version: str) -> None:
               and dependency.findtext("m:artifactId", namespaces=POM_NAMESPACE) == "fastdb-java"]
     if (len(fastdb) != 1
             or fastdb[0].findtext("m:version", namespaces=POM_NAMESPACE) != version
-            or fastdb[0].findtext("m:scope", "compile", POM_NAMESPACE) != "compile"):
-        raise HelperError(f"POM must declare exactly one compile dependency on {MAVEN_GROUP}:fastdb-java:{version}")
+            or fastdb[0].findtext("m:scope", "compile", POM_NAMESPACE) != "compile"
+            or (fastdb[0].findtext("m:optional", "false", POM_NAMESPACE) or "false").strip().lower() != "false"):
+        raise HelperError(f"POM must declare exactly one non-optional compile dependency on {MAVEN_GROUP}:fastdb-java:{version}")
 
 
 def read_repo_versions(root: Path) -> tuple[str, str, str]:

@@ -10,12 +10,13 @@ Daily validation, release qualification and publication are separate stages. A n
 | Release Candidate | Explicit dispatch on canonical main | All package and installed-consumer receipts for the dispatch commit | No |
 | CLI Release | Explicit candidate run ID | Same-tree source validation, candidate inventory and hashes, remote-state checks, environment approval | c3 assets only |
 | Python Package Release | Explicit candidate run ID | The same source and candidate proof, all 36 Python distributions and hashes, environment approval | PyPI only |
+| Java Package Release | Explicit candidate run ID (and optional `deployment_id` resume) | The same source and candidate proof, all 4 Maven files (`.jar`, `-sources.jar`, `-javadoc.jar`, `.pom`), 3-OS zero-config smoke receipts | Maven Central only |
 
-Both publication workflows use one explicit dispatch followed by environment approval. They have no `push`, tag or `workflow_run` trigger. A source-test completion cannot start publication, and the two validation completions cannot create duplicate promotion runs.
+CLI and Python publication workflows use one explicit dispatch followed by environment approval; Java publication uses explicit `workflow_dispatch` restricted to `world-in-progress/c-two` `refs/heads/main` with Central Portal and GPG org secrets (and refuses blind `publish` re-runs without an explicit `deployment_id`). None has a `push`, tag or `workflow_run` trigger. A source-test completion cannot start publication, and validation completions cannot create duplicate promotion runs.
 
 ## Daily checks
 
-The scope selector reads the complete changed-file list: PR API results, push `before`/`after`, or merge-group base/head. Paths strictly under `.github/`, `tests/repo/`, `tools/ci/`, `tools/local_rc/`, `docs/`, or in `{README.md, README.zh-CN.md, AGENTS.md, CHANGELOG.md, LICENSE}` receive workflow policy checks without native compilation; all other paths (including runtime/build inputs, `CONTEXT.md`, `CONTRIBUTING.md`, package READMEs such as `sdk/rust/README.md`, and unclassified new paths) select the full source matrix. Mixed changes or an incomplete PR inventory also select full coverage.
+The scope selector reads the complete changed-file list: PR API results, push `before`/`after`, or merge-group base/head. Paths strictly under `.github/`, `tests/repo/`, `tools/ci/` (except `tools/ci/test_java.py`, which runs the live Java/cross-language gate), `tools/local_rc/`, `docs/`, or in `{README.md, README.zh-CN.md, AGENTS.md, CHANGELOG.md, LICENSE}` receive workflow policy checks without native compilation; all other paths (including runtime/build inputs, `tools/ci/test_java.py`, `CONTEXT.md`, `CONTRIBUTING.md`, package READMEs such as `sdk/rust/README.md`, and unclassified new paths) select the full source matrix. Mixed changes or an incomplete PR inventory also select full coverage.
 
 On a main push, the selector first applies the changed-path rules. Policy-only changes, including documentation, remain policy-only without an evidence lookup. When the paths require full source validation, it searches for successful full Source Validation of an associated merged PR head with the same Git tree as the pushed commit. If such evidence exists, it prints the selected run and runs only workflow policy; otherwise it keeps full source validation and prints the lookup result or error. Missing workflow environment variables for the evidence lookup fail scope selection. A push outside `world-in-progress/c-two`, such as a fork's main synchronized with upstream, runs workflow policy only: canonical pull requests and pushes validate that source, and a fork qualifies a branch by explicit dispatch. An explicit full dispatch always runs the source matrix.
 
@@ -33,7 +34,7 @@ Every required job's latest attempt must succeed: the four platform `source (<la
 
 Manual source qualification and daily checks use separate concurrency groups; a new push cannot cancel the explicitly requested qualification. Superseded daily runs on the same ref are cancelled. Cargo cache recovery is restricted by OS, architecture, runner, Python and toolchain. Lockfile/version changes may reuse unchanged dependencies, but Cargo revalidates fingerprints and all applicable tests still execute. Cache hits are never test evidence.
 
-Validation commands share one 45-minute aggregate budget. Each child command is bounded by the lesser of its phase limit and the remaining budget. A timeout first interrupts the driver and allows up to 40 seconds for its existing child cleanup before forcing the owned process group to stop. The validation step has a 50-minute limit; the job has a 90-minute limit to include native prerequisites, cleanup and evidence upload. A failure retains its real exit code and full log. Cargo panics and Python assertions are shown in the console and step summary even when later successful commands would otherwise push them out of the log tail.
+Validation commands share one 70-minute (4200 s) aggregate budget. Each child command is bounded by the lesser of its phase limit and the remaining budget. A timeout first interrupts the driver and allows up to 40 seconds for its existing child cleanup before forcing the owned process group to stop. The validation step has a 75-minute limit; the job has a 90-minute limit to include native prerequisites, cleanup and evidence upload. A failure retains its real exit code and full log. Cargo panics and Python assertions are shown in the console and step summary even when later successful commands would otherwise push them out of the log tail.
 
 ## Paired IPC benchmark
 
@@ -58,21 +59,22 @@ Every build and receipt uses the dispatch commit, not a later moving branch head
 - `c-two` (`sdk/python/pyproject.toml`): canonical ASCII PEP 440 `X.Y.Z` or pre-release `X.Y.Z{a,b,rc}N` (epoch 0, no `.dev`, `.post`, or `+local` segments; unnormalized forms such as `0.13.0-rc.1` fail closed so filenames match `rc-context.json`).
 - `c3` (`cli/Cargo.toml`): strict ASCII SemVer 2.0 `X.Y.Z` or pre-release `X.Y.Z-{alpha,beta,rc}.N` (no leading zeros, no build metadata).
 
-The existing Linux/native reusable workflows produce and verify 35 wheels, 6 c3 binaries, 1 sdist, 2 installers and 56 receipts. Windows ARM64 covers Python 3.11–3.14 and 3.14t; the other five targets also cover 3.10. Installed consumers validate native architecture, cross-language calls and cleanup, including standard-user checks on both Windows architectures.
+The Linux, native and Java candidate jobs produce and verify 35 wheels, 6 c3 binaries, 1 sdist, 4 Java Maven files (`c-two-sdk-<version>.jar`, `-sources.jar`, `-javadoc.jar`, `.pom`), 2 installers and 60 receipts (including `java-inspect.json` and 3 zero-config `java-smoke-<platform>.json` receipts). Windows ARM64 covers Python 3.11–3.14 and 3.14t; the other five targets also cover 3.10. Installed consumers validate native architecture, cross-language calls and cleanup, including standard-user checks on both Windows architectures.
 
-Only a successful candidate is eligible for promotion. Keep its run ID and use it for both publication destinations. Explicit candidate builds do not cancel each other. Publication requires retained, unexpired artifacts; an expired or failed candidate needs a new candidate build. Candidate artifact handling is separate from source-lane reruns: rebuild the complete candidate if candidate qualification fails.
+Only a successful candidate is eligible for promotion. Keep its run ID and use it for all publication destinations. Explicit candidate builds do not cancel each other. Publication requires retained, unexpired artifacts; an expired or failed candidate needs a new candidate build. Candidate artifact handling is separate from source-lane reruns: rebuild the complete candidate if candidate qualification fails.
 
 ## Pre-release (RC) qualification and promotion
 
 Pre-releases reuse the exact same immutable `Source Validation` → `Release Candidate` → approved promotion chain without weakening `main`-only or Trusted Publisher protections:
 
-1. Bump versions and refresh lockfiles together on `main` (`sdk/python/pyproject.toml`, `uv.lock`, `cli/Cargo.toml`, `cli/Cargo.lock`). While `cli/Cargo.toml` carries a pre-release version, root and CLI READMEs may keep referencing the latest stable `--version X.Y.Z` instead of churning on every `rcN`.
+1. Bump versions and refresh lockfiles together on `main` (`sdk/python/pyproject.toml`, `uv.lock`, `cli/Cargo.toml`, `cli/Cargo.lock`, `sdk/java/pom.xml`, `sdk/java/native/Cargo.toml`, `sdk/java/native/Cargo.lock`). While `cli/Cargo.toml` carries a pre-release version, root and CLI READMEs may keep referencing the latest stable `--version X.Y.Z` instead of churning on every `rcN`.
 2. Explicitly dispatch `release-candidate.yml` on `main`.
-3. Promote the verified candidate run ID to GitHub Releases and PyPI. Release channels are derived strictly from the validated versions—never from a manual checkbox:
+3. Promote the verified candidate run ID to GitHub Releases, PyPI and Maven Central. Release channels are derived strictly from the validated versions—never from a manual checkbox:
    - Pre-release `c3` versions (`X.Y.Z-{alpha,beta,rc}.N`) publish with `gh release create ... --prerelease --latest=false`, leaving `latest` and default installer users untouched.
    - Stable `c3` versions compare against the current stable GitHub `latest` release both at `prepare` and live inside `publish` right before `gh release create`, passing `--latest` only when monotonic (`>=` current latest, or when no stable release exists yet); backfilling or re-running an older stable candidate passes `--latest=false`.
    - Retries against an existing GitHub release require `draft == false` and an exact `prerelease` channel match before classifying assets; before creating a new release, `publish` also queries the full releases list with `contents: write` authority so any draft release carrying the target tag fails closed.
    - Pre-release `c-two` versions (`X.Y.Z{a,b,rc}N`) upload to PyPI as standard PEP 440 pre-releases (installable explicitly via `uv add "c-two==0.13.0rc1"` or `pip install --pre "c-two==0.13.0rc1"`; `c3` via `c3-installer.sh --version 0.9.0-rc.1`).
+   - Java `c-two-sdk` versions (`X.Y.Z` or `X.Y.Z-{alpha,beta,rc}.N`) publish the exact 4 signed Maven files to Maven Central via Sonatype Central Portal v1; interrupted polling can be resumed explicitly via `-f deployment_id=<UUID>` without re-uploading.
 4. Graduating from an RC to a stable release requires a new stable version bump commit, a new `release-candidate.yml` dispatch, and promotion of the new candidate artifacts.
 
 ## Promote the retained bytes
@@ -82,6 +84,9 @@ Trigger each destination once using the same successful candidate ID:
 ```bash
 gh workflow run cli-release.yml --ref main -f candidate_run_id=RUN_ID
 gh workflow run python-package-release.yml --ref main -f candidate_run_id=RUN_ID
+gh workflow run java-package-release.yml --ref main -f candidate_run_id=RUN_ID
+# Resume polling/verification after an interrupted Java Central Portal upload:
+gh workflow run java-package-release.yml --ref main -f candidate_run_id=RUN_ID -f deployment_id=UUID
 ```
 
 The prepare job verifies the canonical-main dispatch candidate, API artifact digests, manifest, receipt inventory and SHA-256 bindings, then selects same-tree source evidence for its source commit. Candidate publication bytes still come exclusively from the selected canonical-main Release Candidate run. PR source runs supply validation evidence only. Remote-state checks ensure same-byte retries can finish an interrupted publication and different bytes or source identities cannot overwrite an existing version, tag or asset.
